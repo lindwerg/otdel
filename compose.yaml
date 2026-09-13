@@ -28,6 +28,11 @@ services:
       # it connects as the restricted runtime role created by the init script below.
       POSTGRES_DB: otdel
       POSTGRES_INITDB_ARGS: "--data-checksums"
+    # One published port for every worktree. The integration suites are isolated from the
+    # pilot and from each other by *database name*, not by port: each worktree sets
+    # OTDEL_TEST_DB_NAME and scripts/dev-test-db.sh creates that database inside this same
+    # container. A worktree that genuinely needs its own container overrides the port with
+    # OTDEL_TEST_DB_HOST_PORT. See docs/development.md.
     ports:
       - "127.0.0.1:58432:5432"
     volumes:

@@ -1,4 +1,4 @@
-.PHONY: help check preview dev-init db-up db-down db-logs db-extensions migrate bootstrap server worker worker-once worker-probe fmt lint test test-unit test-db build
+.PHONY: help check preview dev-init db-up db-down db-logs db-extensions migrate bootstrap server worker worker-once worker-probe fmt lint test test-unit test-db test-scripts build
 
 # rustup installs into ~/.cargo/bin, which is not on PATH for a non-login `make` shell.
 # Adding it here (relative to $HOME, never an absolute personal path) means these targets
@@ -38,6 +38,8 @@ help:
 	@echo "    make test-unit    - only the tests that need no database"
 	@echo "    make test         - cargo test --workspace (integration tests need the test database env)"
 	@echo "    make test-db      - prepare the test database and run the full suite"
+	@echo "                        (parallel worktrees: export OTDEL_TEST_DB_NAME=otdel_<task>_<suffix> first)"
+	@echo "    make test-scripts - shell tests for scripts/ (no database needed)"
 	@echo "    make fmt / lint / build"
 	@echo ""
 	@echo "    make preview      - serve design/ ONLY at http://127.0.0.1:4173 (static prototype)"
@@ -105,11 +107,24 @@ test-unit:
 # Note the assignment before `eval`: `eval "$(...)"` would swallow a failure of the
 # script (an empty eval succeeds), and the suite would then report missing environment
 # variables instead of the real provisioning error.
+#
+# OTDEL_TEST_DB_NAME passes straight through from the environment. Two worktrees running
+# this target at the same time with the default name would share one database, so each
+# parallel worktree must set its own:
+#   OTDEL_TEST_DB_NAME=otdel_r01_isolation make test-db
+# See docs/development.md.
 test-db:
 	exported="$$(./scripts/dev-test-db.sh --export)" && eval "$$exported" && $(CARGO) test --workspace
 
+# Shell-level tests for scripts/. They use throw-away fixtures and a --dry-run mode, so
+# they need neither PostgreSQL nor .local/ and are safe to run in `check`.
+test-scripts:
+	bash -n scripts/dev-test-db.sh
+	./scripts/tests/dev-test-db.test.sh
+
 check:
 	node scripts/check.mjs
+	$(MAKE) test-scripts
 	$(CARGO) fmt --all -- --check
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 	$(CARGO) test --workspace --lib

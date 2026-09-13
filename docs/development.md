@@ -42,6 +42,67 @@ product/design specs.
   area, even if those files look incomplete — a missing file another worker is
   expected to add later is not this worker's job to fill in speculatively.
 
+## Test databases: one per worktree
+
+The integration suite creates, mutates and deletes rows. It must never run against
+the pilot database (`otdel`), and two worktrees must never run against the *same*
+test database — the second run would delete fixtures the first one is still using.
+
+`scripts/dev-test-db.sh` provisions a physically separate database in the same
+container and prints the three variables the suite reads
+(`OTDEL_TEST_DATABASE_URL`, `OTDEL_TEST_ADMIN_DATABASE_URL`,
+`OTDEL_TEST_SUPERUSER_URL`).
+
+**The default name `otdel_test` is shared.** It is kept as the default so a single
+checkout keeps working exactly as before, but it is only safe when one worktree at a
+time uses it. Any worktree that may run tests concurrently picks its own name:
+
+```sh
+export OTDEL_TEST_DB_NAME=otdel_r01_isolation   # otdel_<task>_<suffix>
+make test-db
+# or, to set the variables in the current shell:
+eval "$(scripts/dev-test-db.sh --export)" && cargo test --workspace
+```
+
+A worktree that always wants the same name can write `OTDEL_TEST_DB_NAME` into its
+own `.local/otdel.env` instead of exporting it each time.
+
+All worktrees share the one PostgreSQL container published on `127.0.0.1:58432`
+(see `compose.yaml`); isolation comes from distinct database names, not distinct
+ports. `OTDEL_TEST_DB_HOST_PORT` exists for the exception — a worktree running its
+own container on another port — and rewrites the port in all three derived URLs. It
+should normally stay unset.
+
+What the script guarantees, and what `scripts/tests/dev-test-db.test.sh` checks:
+
+- **It never drops or recreates an existing database.** A database that is already
+  there is reused and migrated. The single `DROP DATABASE` in the file is only
+  reachable through the separate `--drop` command below.
+- **The pilot database is refused in either direction** — as a test target (by name
+  *and* by the value configured in `.local/otdel.env`), and as a pilot URL that
+  already points at the test database.
+- **Names are validated, not escaped.** Only `^[a-z][a-z0-9_]*$` up to 63 characters
+  is accepted, so a name can never carry a second SQL statement or anything a shell
+  would interpret. `otdel-test`, `Otdel_Test`, `otdel_test; DROP DATABASE otdel; --`
+  and `otdel_test$(id)` are all rejected before any connection is opened.
+- **`--export` writes only shell to stdout.** Every status line goes to stderr,
+  including the "creating the database..." line, so
+  `eval "$(scripts/dev-test-db.sh --export)"` is safe even on the first run when the
+  database does not exist yet.
+
+Cleaning up a finished worktree's database is a deliberate, separate command that
+refuses the pilot database, the shared `otdel_test` default, and anything outside the
+`otdel_` namespace:
+
+```sh
+OTDEL_TEST_DB_NAME=otdel_r01_isolation \
+  scripts/dev-test-db.sh --drop --confirm otdel_r01_isolation
+```
+
+Add `--dry-run` to any invocation to resolve and validate the configuration without
+running docker, psql or cargo. `make test-scripts` runs the script's own tests; they
+need neither a database nor `.local/`, and are part of `make check`.
+
 ## Reporting
 
 - A worker reports results (files changed, exact verification commands and

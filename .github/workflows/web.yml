@@ -1,0 +1,61 @@
+name: web
+
+on:
+  pull_request:
+    paths:
+      - "apps/web/**"
+      - ".github/workflows/web.yml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/web/**"
+      - ".github/workflows/web.yml"
+
+# Least-privilege default, matching .github/workflows/ci.yml.
+permissions:
+  contents: read
+
+jobs:
+  web-check:
+    name: web-check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      # actions/checkout v4, pinned to full commit SHA (not a mutable tag) —
+      # same pin as .github/workflows/ci.yml.
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+
+      # actions/setup-node v4, pinned to full commit SHA (not a mutable tag) —
+      # same pin as .github/workflows/ci.yml.
+      - name: Set up Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install dependencies (npm ci, native apps/web lockfile)
+        run: npm ci
+
+      - name: Type-check (tsc)
+        run: npm run check
+
+      # oxlint fails the job on rule *errors* (see apps/web/.oxlintrc.json,
+      # e.g. react/rules-of-hooks). Remaining rules stay at warning level and
+      # are printed in this step's log rather than silently dropped; they are
+      # deliberately not promoted to errors here, because doing so would gate
+      # the pipeline on stylistic rules that currently flag intentional,
+      # documented patterns.
+      - name: Lint (oxlint)
+        run: npm run lint
+
+      - name: Test (Vitest, controlled mocks only — no real backend/network)
+        run: npm test
+
+      - name: Build (production bundle)
+        run: npm run build

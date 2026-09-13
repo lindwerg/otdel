@@ -1,0 +1,525 @@
+//! Shared harness for the database-backed API tests.
+//!
+//! These tests need a real PostgreSQL: row-level security, the composite foreign keys
+//! and the `SECURITY DEFINER` session functions are the things being verified, and none
+//! of them exist in a mock. The connection details come from the environment:
+//!
+//! ```text
+//! OTDEL_TEST_DATABASE_URL        restricted runtime role
+//! OTDEL_TEST_ADMIN_DATABASE_URL  migration role (schema owner)
+//! OTDEL_TEST_SUPERUSER_URL       optional: only the “privileged role is refused” test
+//! ```
+//!
+//! `scripts/dev-test-db.sh` prints them; `make test-db` sets them and runs the suite.
+//! When they are absent the tests **fail with that explanation** instead of reporting
+//! success — a database test that silently skips is worse than no test.
+
+#![allow(dead_code)]
+
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
+use axum::http::{Method, Request, StatusCode};
+use axum::Router;
+use http_body_util::BodyExt;
+use otdel_api::state::AppState;
+use otdel_core::config::Config;
+use otdel_core::secret;
+use otdel_db::Database;
+use otdel_storage::{FilesystemObjectStore, ObjectStore};
+use serde_json::Value;
+use sqlx::{Executor, PgPool};
+use tower::ServiceExt;
+use uuid::Uuid;
+
+pub const OWNER_PASSWORD: &str = "local-owner-password-1a";
+
+/// A running application under test, with its own storage directory and bureau.
+pub struct TestApp {
+    pub router: Router,
+    pub state: AppState,
+    pub bureau_id: Uuid,
+    pub bureau_slug: String,
+    pub storage_root: std::path::PathBuf,
+    pub admin_pool: PgPool,
+}
+
+impl TestApp {
+    /// Build an application bound to a freshly provisioned bureau.
+    ///
+    /// Every test gets its own bureau (and its own storage namespace), so tests can run
+    /// concurrently against one database and still make statements about isolation.
+    pub async fn start() -> Self {
+        let runtime_url = require_env("OTDEL_TEST_DATABASE_URL");
+        let admin_url = require_env("OTDEL_TEST_ADMIN_DATABASE_URL");
+
+        let admin_pool = PgPool::connect(&admin_url)
+            .await
+            .expect("connect with the migration role");
+
+        let slug = unique_slug();
+        let bureau_id = provision_bureau(&admin_pool, &slug).await;
+
+        let storage_root = std::env::temp_dir().join(format!("otdel-api-test-{}", Uuid::new_v4()));
+        let config = test_config(&runtime_url, &slug, &storage_root);
+
+        let db = Database::connect(&config.database_url, 5)
+            .await
+            .expect("connect with the runtime role");
+        db.verify_runtime_role()
+            .await
+            .expect("the test runtime role must be the restricted one");
+
+        let store = FilesystemObjectStore::open_at(&storage_root)
+            .await
+            .expect("open the test object store");
+        let store: Arc<dyn ObjectStore> = Arc::new(store);
+
+        let state = AppState::new(Arc::new(config), db, store);
+        let router = otdel_api::app(state.clone());
+
+        Self {
+            router,
+            state,
+            bureau_id,
+            bureau_slug: slug,
+            storage_root,
+            admin_pool,
+        }
+    }
+
+    /// Send a request and read the whole response.
+    pub async fn send(&self, request: Request<Body>) -> TestResponse {
+        let response = self
+            .router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("router must not fail");
+
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("read the response body")
+            .to_bytes();
+
+        TestResponse {
+            status,
+            headers,
+            body: bytes.to_vec(),
+        }
+    }
+
+    /// Sign in and return a client that carries the session cookie and CSRF token.
+    pub async fn sign_in(&self) -> TestClient {
+        let response = self
+            .send(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/session")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "password": OWNER_PASSWORD }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "sign-in failed: {}",
+            response.text()
+        );
+
+        let cookie = response
+            .headers
+            .get(SET_COOKIE)
+            .expect("session cookie")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let csrf_token = response.json()["csrf_token"].as_str().unwrap().to_owned();
+
+        TestClient { cookie, csrf_token }
+    }
+
+    /// Create a partner directly through the API (as an authenticated owner would).
+    pub async fn create_partner(&self, client: &TestClient, name: &str) -> Uuid {
+        let response = self
+            .send(client.json_request(
+                Method::POST,
+                "/api/partners",
+                serde_json::json!({ "name": name }),
+            ))
+            .await;
+        assert_eq!(response.status, StatusCode::CREATED, "{}", response.text());
+        Uuid::parse_str(response.json()["id"].as_str().unwrap()).unwrap()
+    }
+
+    /// Open a transaction on the migration role **with this bureau's row-level-security
+    /// context set**, the way the server does it.
+    ///
+    /// The tenant tables use `FORCE ROW LEVEL SECURITY`, so the policies apply to the
+    /// schema owner too. A fixture that forgets the context does not quietly do nothing:
+    /// writes fail with `42501` and reads match zero rows. Tests therefore go through
+    /// this helper instead of weakening the policies.
+    pub async fn admin_tx(&self) -> sqlx::Transaction<'_, sqlx::Postgres> {
+        set_bureau_context(&self.admin_pool, self.bureau_id).await
+    }
+
+    /// Run one statement as the migration role inside this bureau's context and assert
+    /// how many rows it touched.
+    pub async fn admin_update(&self, sql: &str, bind: Uuid, expected_rows: u64) {
+        let mut tx = self.admin_tx().await;
+        let result = sqlx::query(sql)
+            .bind(bind)
+            .execute(&mut *tx)
+            .await
+            .unwrap_or_else(|error| panic!("fixture statement failed: {error}\n{sql}"));
+        assert_eq!(
+            result.rows_affected(),
+            expected_rows,
+            "fixture statement touched the wrong number of rows (bureau context missing?)\n{sql}"
+        );
+        tx.commit().await.expect("commit the fixture transaction");
+    }
+
+    /// Remove this test's rows and storage directory.
+    ///
+    /// Failures are reported, not swallowed: a cleanup that silently does nothing would
+    /// leave rows behind and make later runs confusing.
+    pub async fn cleanup(self) {
+        delete_bureau_as_admin(&self.admin_pool, self.bureau_id).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&self.storage_root).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                panic!("could not remove the test storage directory: {error}");
+            }
+        }
+        self.admin_pool.close().await;
+    }
+}
+
+/// Cookie + CSRF token of a signed-in owner.
+#[derive(Debug, Clone)]
+pub struct TestClient {
+    pub cookie: String,
+    pub csrf_token: String,
+}
+
+impl TestClient {
+    pub fn get(&self, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header(COOKIE, &self.cookie)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    pub fn json_request(&self, method: Method, uri: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(COOKIE, &self.cookie)
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-csrf-token", &self.csrf_token)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// Multipart upload request with one `file` part.
+    pub fn upload_request(
+        &self,
+        uri: &str,
+        filename: &str,
+        content_type: Option<&str>,
+        bytes: &[u8],
+    ) -> Request<Body> {
+        let body = multipart_body(&[MultipartPart {
+            name: "file",
+            filename: Some(filename),
+            content_type,
+            bytes: bytes.to_vec(),
+        }]);
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(COOKIE, &self.cookie)
+            .header("x-csrf-token", &self.csrf_token)
+            .header(
+                CONTENT_TYPE,
+                format!("multipart/form-data; boundary={MULTIPART_BOUNDARY}"),
+            )
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    pub fn raw_multipart_request(&self, uri: &str, parts: &[MultipartPart<'_>]) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(COOKIE, &self.cookie)
+            .header("x-csrf-token", &self.csrf_token)
+            .header(
+                CONTENT_TYPE,
+                format!("multipart/form-data; boundary={MULTIPART_BOUNDARY}"),
+            )
+            .body(Body::from(multipart_body(parts)))
+            .unwrap()
+    }
+}
+
+pub struct TestResponse {
+    pub status: StatusCode,
+    pub headers: axum::http::HeaderMap,
+    pub body: Vec<u8>,
+}
+
+impl TestResponse {
+    pub fn json(&self) -> Value {
+        serde_json::from_slice(&self.body).unwrap_or_else(|_| {
+            panic!(
+                "response body is not JSON (status {}): {}",
+                self.status,
+                self.text()
+            )
+        })
+    }
+
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+
+    /// Assert the contract error envelope and return its `code`.
+    pub fn error_code(&self) -> String {
+        let json = self.json();
+        let error = json
+            .get("error")
+            .unwrap_or_else(|| panic!("no `error` object in: {}", self.text()));
+        assert!(error.get("message").is_some(), "error has no message");
+        assert!(
+            error.get("retryable").is_some(),
+            "error has no retryable flag"
+        );
+        assert_eq!(
+            self.headers
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.starts_with("application/json")),
+            Some(true),
+            "errors must be JSON, got: {}",
+            self.text()
+        );
+        error["code"].as_str().unwrap().to_owned()
+    }
+}
+
+// --- multipart building ----------------------------------------------------------
+
+pub const MULTIPART_BOUNDARY: &str = "otdeltestboundary9d3f";
+
+pub struct MultipartPart<'a> {
+    pub name: &'a str,
+    pub filename: Option<&'a str>,
+    pub content_type: Option<&'a str>,
+    pub bytes: Vec<u8>,
+}
+
+pub fn multipart_body(parts: &[MultipartPart<'_>]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for part in parts {
+        body.extend_from_slice(format!("--{MULTIPART_BOUNDARY}\r\n").as_bytes());
+        let mut disposition = format!("Content-Disposition: form-data; name=\"{}\"", part.name);
+        if let Some(filename) = part.filename {
+            disposition.push_str(&format!("; filename=\"{filename}\""));
+        }
+        body.extend_from_slice(disposition.as_bytes());
+        body.extend_from_slice(b"\r\n");
+        if let Some(content_type) = part.content_type {
+            body.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
+        }
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(&part.bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{MULTIPART_BOUNDARY}--\r\n").as_bytes());
+    body
+}
+
+// --- tiny synthetic fixtures ------------------------------------------------------
+// Generated in-process: no document is committed to this repository, and the real
+// catalogues stay private (see docs/development.md).
+
+/// Minimal but structurally valid one-page PDF.
+pub fn tiny_pdf(marker: &str) -> Vec<u8> {
+    format!(
+        "%PDF-1.4\n\
+         1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n\
+         2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n\
+         3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>endobj\n\
+         % marker {marker}\n\
+         trailer<</Root 1 0 R>>\n\
+         %%EOF\n"
+    )
+    .into_bytes()
+}
+
+/// 1×1 PNG (signature + minimal chunks).
+pub fn tiny_png() -> Vec<u8> {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x0d]);
+    bytes.extend_from_slice(b"IHDR");
+    bytes.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
+    bytes.extend_from_slice(&[0x1f, 0x15, 0xc4, 0x89]);
+    bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    bytes.extend_from_slice(b"IEND");
+    bytes.extend_from_slice(&[0xae, 0x42, 0x60, 0x82]);
+    bytes
+}
+
+/// JPEG signature followed by filler — enough for signature detection.
+pub fn tiny_jpeg() -> Vec<u8> {
+    let mut bytes = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10];
+    bytes.extend_from_slice(b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0");
+    bytes.extend_from_slice(&[0xff, 0xd9]);
+    bytes
+}
+
+// --- environment ------------------------------------------------------------------
+
+pub fn require_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| {
+        panic!(
+            "{name} is not set. The database-backed tests need a real PostgreSQL; run \
+             `make test-db`, or `eval \"$(scripts/dev-test-db.sh --export)\"` and then \
+             `cargo test`. See docs/backend-1a.md. These tests deliberately fail instead \
+             of silently passing without a database."
+        )
+    })
+}
+
+pub fn optional_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+fn unique_slug() -> String {
+    format!("test-{}", Uuid::new_v4().simple())
+        .chars()
+        .take(64)
+        .collect()
+}
+
+async fn provision_bureau(admin_pool: &PgPool, slug: &str) -> Uuid {
+    let row: (Uuid,) =
+        sqlx::query_as("INSERT INTO otdel.bureaus (slug, name) VALUES ($1, $2) RETURNING id")
+            .bind(slug)
+            .bind("Test bureau")
+            .fetch_one(admin_pool)
+            .await
+            .expect("provision the test bureau");
+    row.0
+}
+
+/// Insert a partner directly with the migration role — used to build a *foreign*
+/// bureau's data that the tested session must never see.
+///
+/// The insert runs inside that bureau's row-level-security context: the policies are
+/// forced for the table owner as well, so this is the only way to write the row without
+/// weakening them.
+pub async fn insert_partner_as_admin(admin_pool: &PgPool, bureau_id: Uuid, name: &str) -> Uuid {
+    let mut tx = set_bureau_context(admin_pool, bureau_id).await;
+    let row: (Uuid,) =
+        sqlx::query_as("INSERT INTO otdel.partners (bureau_id, name) VALUES ($1, $2) RETURNING id")
+            .bind(bureau_id)
+            .bind(name)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("insert a partner as the migration role inside the bureau context");
+    tx.commit().await.expect("commit the partner insert");
+    row.0
+}
+
+pub async fn new_bureau_as_admin(admin_pool: &PgPool) -> (Uuid, String) {
+    let slug = unique_slug();
+    let id = provision_bureau(admin_pool, &slug).await;
+    (id, slug)
+}
+
+/// Delete everything belonging to one bureau.
+///
+/// Tenant tables are deleted inside that bureau's context (forced row-level security
+/// applies to the owner too); `sessions` and `bureaus` are not force-protected and are
+/// deleted afterwards. Errors are propagated — a cleanup helper that ignores them hides
+/// exactly the kind of permission problem these tests exist to catch.
+pub async fn delete_bureau_as_admin(admin_pool: &PgPool, bureau_id: Uuid) {
+    let mut tx = set_bureau_context(admin_pool, bureau_id).await;
+    for statement in [
+        "DELETE FROM otdel.jobs WHERE bureau_id = $1",
+        "DELETE FROM otdel.materials WHERE bureau_id = $1",
+        "DELETE FROM otdel.partners WHERE bureau_id = $1",
+    ] {
+        sqlx::query(statement)
+            .bind(bureau_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap_or_else(|error| panic!("cleanup failed ({statement}): {error}"));
+    }
+    tx.commit().await.expect("commit the cleanup transaction");
+
+    for statement in [
+        "DELETE FROM otdel.sessions WHERE bureau_id = $1",
+        "DELETE FROM otdel.bureaus WHERE id = $1",
+    ] {
+        sqlx::query(statement)
+            .bind(bureau_id)
+            .execute(admin_pool)
+            .await
+            .unwrap_or_else(|error| panic!("cleanup failed ({statement}): {error}"));
+    }
+}
+
+/// SQLSTATE of a database error, for tests that must distinguish “foreign key” from
+/// “row-level security refused it”.
+pub fn sqlstate(error: &sqlx::Error) -> Option<String> {
+    match error {
+        sqlx::Error::Database(db_error) => db_error.code().map(|code| code.into_owned()),
+        _ => None,
+    }
+}
+
+/// Set the row-level-security context on a raw connection, the way the server does.
+pub async fn set_bureau_context(
+    pool: &PgPool,
+    bureau_id: Uuid,
+) -> sqlx::Transaction<'_, sqlx::Postgres> {
+    let mut tx = pool.begin().await.expect("begin");
+    tx.execute(sqlx::query("SELECT set_config('otdel.bureau_id', $1::text, true)").bind(bureau_id))
+        .await
+        .expect("set the bureau context");
+    tx
+}
+
+fn test_config(runtime_url: &str, bureau_slug: &str, storage_root: &std::path::Path) -> Config {
+    let mut source = std::collections::BTreeMap::new();
+    source.insert("OTDEL_DATABASE_URL".to_owned(), runtime_url.to_owned());
+    source.insert(
+        "OTDEL_OWNER_PASSWORD_HASH".to_owned(),
+        secret::hash_password(OWNER_PASSWORD).expect("hash the test password"),
+    );
+    source.insert("OTDEL_BUREAU_SLUG".to_owned(), bureau_slug.to_owned());
+    source.insert(
+        "OTDEL_STORAGE_ROOT".to_owned(),
+        storage_root.to_string_lossy().into_owned(),
+    );
+    // Small limit so the “too large” test does not have to stream 25 MiB.
+    source.insert("OTDEL_MAX_UPLOAD_BYTES".to_owned(), "4096".to_owned());
+    Config::load(&source).expect("test configuration")
+}

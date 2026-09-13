@@ -37,7 +37,12 @@
  *   5. Unresolved merge-conflict markers in tracked text files.
  *   6. JSON syntax for every tracked *.json file that passed check 4's
  *      symlink/size/readability/NUL validation (rejected files are never
- *      read here).
+ *      read here). `tsconfig*.json`, `jsconfig*.json` and `.vscode/*.json`
+ *      are JSON with Comments by convention: they are parsed with comments
+ *      and trailing commas stripped first, so they are really validated
+ *      rather than skipped. A tsconfig additionally requires a workflow that
+ *      runs a real TypeScript check (see check 10) — this script does not
+ *      type-check anything itself.
  *   7. JavaScript syntax for every tracked *.js/*.mjs/*.cjs file that passed
  *      the same validation, via `node --check` (rejected files are never
  *      subprocessed here).
@@ -49,12 +54,13 @@
  *      are validated only if/when present in this checkout — this worktree
  *      may simply not be synced with main yet, so their absence here is not
  *      itself a failure.
- *  10. Manifest/CI enforcement gate: deliberately and unconditionally FAILS
- *      if Cargo.toml, package.json, or apps/web/package.json is present —
- *      there is no real Rust/web CI job in this repo yet, and no attempt to
- *      infer one by pattern-matching workflow text (too easy to fake with a
- *      comment). Adding a manifest requires replacing this guard with a real
- *      CI job in the same PR. See docs/development.md.
+ *  10. Manifest/CI consistency: when a manifest exists, the corresponding
+ *      workflow must actually invoke its build/lint/test commands (for Rust:
+ *      fmt, clippy, `cargo test --workspace`, and a database for the
+ *      integration suite). This replaces the earlier prototype-stage guard,
+ *      which failed unconditionally because no real Rust/web jobs existed yet.
+ *      It verifies that the commands are present — only CI itself can show
+ *      that they pass. See docs/development.md.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -239,17 +245,90 @@ for (const file of trackedFiles) {
 // Only files already validated by the loop above (safeTextFiles) are parsed:
 // a rejected symlink/oversized/unreadable file is never read here, even if
 // it happens to end in .json — it was already reported as a failure above.
+//
+// Some tooling files are JSON with Comments (JSONC) by convention and are
+// *valid* that way: TypeScript's own tsconfig.json (and jsconfig.json, and
+// editor settings under .vscode/) allow // and /* */ comments and trailing
+// commas. Rejecting them as "invalid JSON" would be wrong, and skipping them
+// would mean a broken tsconfig passes the check unnoticed. They are therefore
+// parsed after comments and trailing commas are removed — still validated,
+// just against the grammar they actually use.
+const jsoncRe = /(^|\/)(tsconfig[^/]*\.json|jsconfig[^/]*\.json)$|(^|\/)\.vscode\/[^/]+\.json$/i;
+
+/**
+ * Remove JSONC comments and trailing commas. String literals (including
+ * escaped quotes) are copied through untouched, so a `//` or `/*` inside a
+ * string value is never mistaken for a comment.
+ */
+function stripJsonc(text) {
+  const out = [];
+  // Output indices of commas that are structural (i.e. not inside a string literal).
+  // Only those may be dropped as trailing commas; a comma inside a string value such as
+  // "a,}" must survive untouched.
+  const structuralCommas = [];
+  let i = 0;
+  let inString = false;
+  while (i < text.length) {
+    const ch = text[i];
+    if (inString) {
+      if (ch === '\\' && i + 1 < text.length) {
+        out.push(ch, text[i + 1]);
+        i += 2;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      out.push(ch);
+      i += 1;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out.push(ch);
+      i += 1;
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '/') {
+      while (i < text.length && text[i] !== '\n') i += 1;
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      i += 2;
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i += 1;
+      i += 2;
+      continue;
+    }
+    if (ch === ',') structuralCommas.push(out.length);
+    out.push(ch);
+    i += 1;
+  }
+  // Drop a structural comma when the next non-whitespace character closes the object or
+  // array it belongs to.
+  for (const pos of structuralCommas) {
+    let j = pos + 1;
+    while (j < out.length && /\s/.test(out[j])) j += 1;
+    if (j < out.length && (out[j] === '}' || out[j] === ']')) out[pos] = '';
+  }
+  return out.join('');
+}
+
 const jsonFiles = trackedFiles.filter((f) => f.toLowerCase().endsWith('.json') && safeTextFiles.has(f));
+let jsoncCount = 0;
 for (const file of jsonFiles) {
+  const raw = readFileSync(file, 'utf8');
+  const isJsonc = jsoncRe.test(file);
+  if (isJsonc) jsoncCount += 1;
   try {
-    JSON.parse(readFileSync(file, 'utf8'));
+    JSON.parse(isJsonc ? stripJsonc(raw) : raw);
   } catch {
     // Deliberately no err.message/excerpt: a JSON parse error can quote the
     // offending file content verbatim, which may include secrets.
-    fail(`Invalid JSON: ${file}`);
+    fail(isJsonc ? `Invalid JSONC (comments/trailing commas allowed): ${file}` : `Invalid JSON: ${file}`);
   }
 }
-note(`${jsonFiles.length} JSON file(s) parsed (validated text files only).`);
+note(
+  `${jsonFiles.length} JSON file(s) parsed (validated text files only), ` +
+  `${jsoncCount} of them as JSONC (tsconfig/jsconfig/.vscode).`
+);
 
 // --- 6. JavaScript syntax via node --check ---
 // Same restriction: only files in safeTextFiles are ever passed to a
@@ -338,15 +417,20 @@ for (const doc of optionalDocsOnceExist) {
   }
 }
 
-// --- 10. Manifest-vs-CI enforcement gate (deliberately dumb, on purpose) ---
-// Prototype-stage policy: this repository has NO real Rust/web CI jobs yet,
-// so the mere presence of a manifest means the "pending" CI notices are now
-// stale and this guard itself needs to be replaced. There is no attempt to
-// infer whether a real job "looks right" by pattern-matching workflow text
-// (that was tried before and is easy to satisfy with a comment or an example
-// snippet without any job actually running) — it simply fails, unconditionally,
-// until a human/reviewer replaces this whole gate with a real one in the same
-// PR that adds the manifest. See docs/development.md.
+// --- 10. Manifest-vs-CI consistency ---
+//
+// The prototype-stage guard that used to live here failed unconditionally on the
+// presence of any manifest, because there were no real Rust/web CI jobs. The Rust
+// workspace and its jobs now exist (`.github/workflows/ci.yml`: rust-check and
+// rust-integration), so the guard is replaced by the check it was a placeholder for:
+// a manifest must be accompanied by a workflow that actually runs its build/lint/test
+// commands.
+//
+// This is still not a claim that CI passes — only CI can show that. It checks that the
+// commands are present, so a manifest cannot be added while the workflow keeps
+// reporting the suite as "pending". The Rust side is verified against this repository's
+// own workflow; the web side is owned by another workflow file
+// (.github/workflows/web.yml) and is accepted from either file.
 function fileExists(p) {
   try {
     return statSync(p).isFile();
@@ -355,14 +439,78 @@ function fileExists(p) {
   }
 }
 
-for (const manifest of ['Cargo.toml', 'package.json', 'apps/web/package.json']) {
-  if (fileExists(manifest)) {
+function readIfPresent(p) {
+  return fileExists(p) ? readFileSync(p, 'utf8') : '';
+}
+
+const ciWorkflow = readIfPresent('.github/workflows/ci.yml');
+const webWorkflow = readIfPresent('.github/workflows/web.yml');
+const allWorkflows = ciWorkflow + '\n' + webWorkflow;
+
+if (fileExists('Cargo.toml')) {
+  if (!ciWorkflow) {
+    fail('Cargo.toml is present but .github/workflows/ci.yml is missing.');
+  } else {
+    const requiredRustSteps = [
+      { re: /cargo\s+fmt\s+--all\s+--\s+--check/, label: 'cargo fmt --all -- --check' },
+      { re: /cargo\s+clippy\s+--workspace\s+--all-targets\s+--\s+-D\s+warnings/, label: 'cargo clippy --workspace --all-targets -- -D warnings' },
+      { re: /cargo\s+test\s+--workspace/, label: 'cargo test --workspace' },
+    ];
+    for (const step of requiredRustSteps) {
+      if (!step.re.test(ciWorkflow)) {
+        fail(
+          `Cargo.toml is present, but .github/workflows/ci.yml does not run \`${step.label}\`. ` +
+          `A Rust manifest must come with a job that really builds, lints and tests it. ` +
+          `See docs/development.md.`
+        );
+      }
+    }
+    // The database-backed suites must actually be provided with a database, otherwise
+    // `cargo test --workspace` in CI fails on the missing environment (by design) and
+    // somebody would be tempted to make those tests skip silently instead.
+    if (!/OTDEL_TEST_DATABASE_URL/.test(ciWorkflow)) {
+      fail(
+        'Cargo.toml is present, but .github/workflows/ci.yml never sets ' +
+        'OTDEL_TEST_DATABASE_URL — the database-backed integration tests would not run. ' +
+        'See docs/backend-1a.md.'
+      );
+    }
+  }
+  note('Cargo.toml present: checked that ci.yml runs fmt, clippy and the full test suite.');
+}
+
+for (const manifest of ['package.json', 'apps/web/package.json']) {
+  if (!fileExists(manifest)) continue;
+  const hasInstall = /(npm\s+ci|pnpm\s+install|yarn\s+install)/.test(allWorkflows);
+  const hasBuildOrTest = /(npm\s+run\s+build|pnpm\s+(run\s+)?build|npm\s+test|npm\s+run\s+test|pnpm\s+(run\s+)?test)/.test(allWorkflows);
+  if (!hasInstall || !hasBuildOrTest) {
     fail(
-      `${manifest} is present, but this repository has no real CI job for it yet. This is a ` +
-      `deliberately unconditional prototype-stage guard (scripts/check.mjs), not a smart check — ` +
-      `replace it, and add the real cargo/npm/pnpm build+lint+test job to ` +
-      `.github/workflows/ci.yml, in the SAME PR that adds ${manifest}. See docs/development.md.`
+      `${manifest} is present, but no workflow (.github/workflows/ci.yml or web.yml) runs a ` +
+      `dependency install plus build/test for it. Add the real job in the same PR as the ` +
+      `manifest. See docs/development.md.`
     );
+  } else {
+    note(`${manifest} present: found install and build/test commands in the workflows.`);
+  }
+}
+
+// A tsconfig is parsed as JSONC above, which proves only that it is syntactically
+// well-formed. The actual TypeScript validation is `tsc` (or vue-tsc/svelte-check), and
+// it belongs in a workflow — otherwise relaxing the JSON parse for tsconfig would have
+// traded a false failure for a genuinely unchecked frontend.
+const tsconfigs = trackedFiles.filter((f) => /(^|\/)tsconfig[^/]*\.json$/i.test(f));
+if (tsconfigs.length > 0) {
+  const hasTypeCheck =
+    /(npx\s+tsc|\btsc\b\s+(--noEmit|-p|--project|--build)|run\s+(type-?check|typecheck)|vue-tsc|svelte-check)/.test(allWorkflows);
+  if (!hasTypeCheck) {
+    fail(
+      `${tsconfigs[0]} is present, but no workflow (.github/workflows/ci.yml or web.yml) runs a ` +
+      `TypeScript check (tsc --noEmit / a typecheck script / vue-tsc / svelte-check). This ` +
+      `script only validates tsconfig syntax as JSONC; it does not type-check. See ` +
+      `docs/development.md.`
+    );
+  } else {
+    note(`${tsconfigs.length} tsconfig file(s) present: found a TypeScript check command in the workflows.`);
   }
 }
 

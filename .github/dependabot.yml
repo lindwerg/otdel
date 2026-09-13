@@ -1,0 +1,10 @@
+version: 2
+updates:
+  # Keep pinned GitHub Actions SHAs/refs up to date. No package ecosystems
+  # (cargo, npm) are configured yet because no Cargo.toml / package.json
+  # exists in this repository yet — add those update blocks in the same PR
+  # that introduces the corresponding manifest.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

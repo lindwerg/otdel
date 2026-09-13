@@ -20,9 +20,38 @@
 //! claim never enters the bounded context in the first place — the query that builds it
 //! is scoped to the pinned version, and the version is scoped to the partner and the
 //! bureau by row-level security.
+//!
+//! ## A label is not agreement (F02)
+//!
+//! The rule above makes a citation real. It does **not** make the sentence above the
+//! citation follow from it: the audit found that any prose citing `C1` was returned as an
+//! answer, because the check was handed the labels and never the claims. A price could sit
+//! above a quotation about load and be published as a sourced answer.
+//!
+//! So the cited claims are now checked against the words of the answer, on the narrow
+//! points where being wrong is expensive:
+//!
+//! | Checked | Why |
+//! |---|---|
+//! | every number | «выдерживает 10 kN» over a claim that says 3,5 |
+//! | the unit written after a number | 3,5 мм is not 3,5 kN |
+//! | designations (`BP21D`) | an answer about the neighbouring product |
+//! | commercial vocabulary | a price composed from a technical claim |
+//! | negations | an absence does not follow from silence |
+//! | promises and blanket qualifiers | «гарантированно совместим с любыми системами» |
+//!
+//! **This is a barrier, not a semantic verifier, and it is never described as one.** It
+//! compares tokens; it does not understand the sentence, and an answer that passes is
+//! returned with that limit written next to it ([`VERIFICATION_NOTICE`]). Anything it
+//! cannot confirm lowers the reply to [`AnswerState::EvidenceOnly`] — the claims and their
+//! citations, without prose — which is a worse answer and never a wrong one. Real semantic
+//! checking needs the structured evidence of R02/R03 and a reviewing model; until then the
+//! free-form answer is deliberately restricted to restating what was verified.
 
 use otdel_core::publication::{AnswerState, ClaimStatus};
 use otdel_core::retrieval_config::RetrievalLimits;
+use otdel_knowledge::measure::{self, mentions};
+use otdel_knowledge::quote::SearchableText;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -33,6 +62,16 @@ use crate::prompt::{quote_block, sanitise_line, UNTRUSTED_NOTICE};
 pub const SCHEMA_NAME: &str = "otdel_grounded_answer";
 pub const PROMPT_PROFILE: &str = "answer/2026-09-13.1";
 const LABEL_PREFIX: &str = "C";
+
+/// What the server says about its own check, beside every answer it returns.
+///
+/// Stated in the product, not only in this file, because "проверено" without a scope is
+/// the claim the audit refused: a deterministic token check is an extra barrier, not proof
+/// of meaning.
+pub const VERIFICATION_NOTICE: &str =
+    "ответ сверен с процитированными утверждениями по числам, единицам, обозначениям \
+     изделий, отрицаниям и обещаниям — это дополнительный барьер, а не полная смысловая \
+     проверка";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -222,10 +261,17 @@ pub struct ValidatedAnswer {
 ///   citations";
 /// * the model cited a label it was not given → that citation is dropped. If none
 ///   survive, the answer is refused;
-/// * the model answered with empty prose → treated as no answer.
+/// * the model answered with empty prose → treated as no answer;
+/// * the model answered something its own citations do not support → the prose is
+///   dropped and the evidence is returned, with each unconfirmed assertion named.
+///
+/// `claims` are the very claims `labels` were built from, in the same order, so a cited
+/// label resolves to the claim the model was shown. Passing them is what makes the last
+/// rule possible at all: the previous signature could not see a single value.
 pub fn validate(
     response: &AnswerResponse,
     labels: &[String],
+    claims: &[CheckedClaim],
     limits: &RetrievalLimits,
 ) -> ValidatedAnswer {
     let mut rejections: Vec<String> = Vec::new();
@@ -295,13 +341,278 @@ pub fn validate(
         };
     }
 
+    // The answer cites real claims. Whether it *says* what they say is a separate
+    // question, and it is the one F02 was about.
+    let text = text.expect("an empty answer was handled above");
+    let cited_claims: Vec<&CheckedClaim> = cited
+        .iter()
+        .filter_map(|index| claims.get(*index))
+        .collect();
+    let unconfirmed = unconfirmed_assertions(&text, &cited_claims);
+    if !unconfirmed.is_empty() {
+        rejections.push(
+            "ответ не выдан в свободной форме: сервер не подтвердил по процитированным \
+             утверждениям всё, что в нём сказано. Ниже — сами утверждения с цитатами"
+                .to_owned(),
+        );
+        rejections.extend(unconfirmed);
+        return ValidatedAnswer {
+            state: AnswerState::EvidenceOnly,
+            text: None,
+            cited,
+            rejections,
+            note,
+        };
+    }
+
+    rejections.push(VERIFICATION_NOTICE.to_owned());
     ValidatedAnswer {
         state: AnswerState::Answered,
-        text,
+        text: Some(text),
         cited,
         rejections,
         note,
     }
+}
+
+/// Words that assert an absence. An absence never follows from a quotation that is simply
+/// silent about the subject, so one has to be written in the cited claims too.
+const NEGATION_STEMS: &[&str] = &[
+    "не",
+    "нет",
+    "без",
+    "отсутств",
+    "запрещ",
+    "невозможн",
+    "никак",
+    "ничем",
+];
+
+/// Words that turn information into an undertaking. `block-01-spec.md` §9: an answer is
+/// information with sources, not a clearance, a compatibility statement or an obligation.
+const PROMISE_STEMS: &[&str] = &[
+    "гарант",
+    "сертифицир",
+    "совместим",
+    "соответств",
+    "аналог",
+    "подходит",
+    "рекоменд",
+    "обязательно",
+    "допускается",
+    "разрешен",
+    "всегда",
+    "любых",
+    "любой",
+    "любые",
+    "максимальн",
+    "минимальн",
+];
+
+/// Words that make an answer a commercial one. A claim of another kind never supports
+/// them, however genuinely its quotation contains the number.
+const COMMERCIAL_STEMS: &[&str] = &[
+    "цена",
+    "цены",
+    "цену",
+    "ценой",
+    "стоимост",
+    "прайс",
+    "руб",
+    "оплат",
+    "скидк",
+    "поставк",
+    "доставк",
+    "отгрузк",
+];
+
+/// Symbols that make an answer a commercial one without being a word.
+const COMMERCIAL_SYMBOLS: &[char] = &['₽', '$', '€'];
+
+/// Everything in `text` that the cited claims do not support, one sentence each.
+///
+/// Empty means "nothing was found", which is not the same as "everything is true" — see
+/// this module's header. Each check is written so that *doubt produces a sentence*: an
+/// unknown token is reported rather than assumed harmless.
+fn unconfirmed_assertions(text: &str, cited: &[&CheckedClaim]) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+
+    if cited.is_empty() {
+        return vec![
+            "процитированные метки не удалось сопоставить с утверждениями этой версии".to_owned(),
+        ];
+    }
+
+    let support = support_text(cited);
+    let searchable = SearchableText::new(&support);
+    let folded_support = measure::fold(&support);
+    let folded_text = measure::fold(text);
+
+    // --- numbers ------------------------------------------------------------------
+    let supported_numbers = measure::numbers_in(&support);
+    for number in measure::numbers_in(text) {
+        if !supported_numbers.contains(&number) {
+            found.push(format!(
+                "число «{}» не встречается ни в одном процитированном утверждении",
+                sanitise_line(&number, 40)
+            ));
+        }
+    }
+
+    // --- the unit written after a number -------------------------------------------
+    for unit in units_after_numbers(text) {
+        if !searchable.contains_token(&unit) {
+            found.push(format!(
+                "единица «{}» не встречается ни в одном процитированном утверждении",
+                sanitise_line(&unit, 40)
+            ));
+        }
+    }
+
+    // --- designations ---------------------------------------------------------------
+    for designation in designations_in(&folded_text) {
+        if !searchable.contains_token(&designation) {
+            found.push(format!(
+                "обозначение «{}» не встречается ни в одном процитированном утверждении",
+                sanitise_line(&designation, 40)
+            ));
+        }
+    }
+
+    // --- a commercial answer needs a commercial claim ---------------------------------
+    let has_commercial_claim = cited
+        .iter()
+        .any(|claim| claim.kind == otdel_core::knowledge::FactKind::Commercial);
+    if !has_commercial_claim {
+        let commercial_word = COMMERCIAL_STEMS
+            .iter()
+            .find(|stem| mentions(&folded_text, stem) && !mentions(&folded_support, stem));
+        let commercial_symbol = COMMERCIAL_SYMBOLS
+            .iter()
+            .find(|symbol| folded_text.contains(**symbol) && !folded_support.contains(**symbol));
+        if let Some(word) = commercial_word {
+            found.push(format!(
+                "ответ говорит о коммерческих условиях («{word}»), а процитированные \
+                 утверждения — нет"
+            ));
+        } else if let Some(symbol) = commercial_symbol {
+            found.push(format!(
+                "ответ говорит о коммерческих условиях («{symbol}»), а процитированные \
+                 утверждения — нет"
+            ));
+        }
+    }
+
+    // --- negations and promises ------------------------------------------------------
+    for stem in NEGATION_STEMS {
+        if mentions(&folded_text, stem) && !mentions(&folded_support, stem) {
+            found.push(format!(
+                "отрицание («{stem}») не следует из процитированных утверждений: молчание \
+                 источника не доказывает отсутствие"
+            ));
+            break;
+        }
+    }
+    for stem in PROMISE_STEMS {
+        if mentions(&folded_text, stem) && !mentions(&folded_support, stem) {
+            found.push(format!(
+                "утверждение с обещанием или обобщением («{stem}») не подтверждено \
+                 процитированными утверждениями"
+            ));
+            break;
+        }
+    }
+
+    found
+}
+
+/// Everything the cited claims say, as one searchable text.
+///
+/// `model_context` is excluded, exactly as it is excluded from the checker and from the
+/// search index: the drafting model's own explanation must not become the thing that
+/// vouches for the answering model's sentence.
+fn support_text(cited: &[&CheckedClaim]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for claim in cited {
+        if let Some(product) = &claim.product_name {
+            parts.push(product.clone());
+        }
+        parts.push(claim.attribute.clone());
+        parts.push(claim.value_text.clone());
+        if let Some(unit) = &claim.unit {
+            parts.push(unit.clone());
+        }
+        if let Some(conditions) = &claim.conditions {
+            parts.push(conditions.clone());
+        }
+        for evidence in &claim.evidence {
+            parts.push(evidence.quote.clone());
+        }
+    }
+    parts.join(" \n ")
+}
+
+/// Every token written immediately after a number, when it is short enough to be a unit.
+fn units_after_numbers(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if !chars[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        while index < chars.len() {
+            if chars[index].is_ascii_digit() {
+                index += 1;
+                continue;
+            }
+            if matches!(chars[index], '.' | ',')
+                && chars
+                    .get(index + 1)
+                    .is_some_and(|next| next.is_ascii_digit())
+            {
+                index += 1;
+                continue;
+            }
+            break;
+        }
+
+        // One optional space, then the unit: `3.5 kN` and `3.5kN` are both written.
+        let mut cursor = index;
+        if chars.get(cursor).is_some_and(|ch| *ch == ' ') {
+            cursor += 1;
+        }
+        let start = cursor;
+        while cursor < chars.len()
+            && (chars[cursor].is_alphabetic() || matches!(chars[cursor], '%' | '°' | '/'))
+        {
+            cursor += 1;
+        }
+        if cursor > start {
+            let unit: String = chars[start..cursor].iter().collect();
+            // A unit is short. A sentence continuing after the number is not one, and
+            // checking every word of the prose as if it were a unit would refuse
+            // everything.
+            if unit.chars().count() <= 12 {
+                out.push(measure::fold(&unit));
+            }
+        }
+    }
+
+    out
+}
+
+/// Tokens carrying letters *and* digits — how a catalogue writes a designation.
+fn designations_in(folded_text: &str) -> Vec<String> {
+    folded_text
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '-')
+        .filter(|token| {
+            token.chars().any(|ch| ch.is_alphabetic()) && token.chars().any(|ch| ch.is_numeric())
+        })
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Which claims of a version may be put in front of the answering model.
@@ -398,20 +709,133 @@ mod tests {
         RetrievalLimits::default()
     }
 
-    #[test]
-    fn an_answer_with_a_resolving_citation_is_an_answer() {
-        let result = validate(
+    /// The one claim every test below is answered from: BP21's load.
+    fn shown() -> Vec<CheckedClaim> {
+        vec![claim(ClaimStatus::SourceSupported)]
+    }
+
+    fn answered(text: &str) -> ValidatedAnswer {
+        validate(
             &parse(json!({
-                "answer": "Нагрузка 3.5 kN при опирании на две опоры.",
+                "answer": text,
                 "citations": [{"claim": "C1"}],
                 "insufficient": false,
                 "note": null
             })),
             &["C1".to_owned()],
+            &shown(),
             &limits(),
-        );
+        )
+    }
+
+    #[test]
+    fn an_answer_with_a_resolving_citation_is_an_answer() {
+        let result = answered("Нагрузка 3.5 kN при опирании на две опоры.");
         assert_eq!(result.state, AnswerState::Answered);
         assert_eq!(result.cited, vec![0]);
+    }
+
+    // --- what a citation label does not prove (F02) --------------------------------
+
+    #[test]
+    fn a_price_cannot_be_asserted_from_a_claim_about_load() {
+        // F02 exactly: `validate` used to see only the labels, so any prose citing C1 was
+        // an answer — including a price the cited claim says nothing about. The number is
+        // even on the page (`BP21 1200 3.5 kN`), which is why a number check alone is not
+        // enough and the commercial vocabulary is checked separately.
+        let result = answered("Цена профиля BP21 — 1200 рублей.");
+        assert_eq!(result.state, AnswerState::EvidenceOnly);
+        assert_eq!(result.text, None);
+        assert!(
+            result
+                .rejections
+                .iter()
+                .any(|reason| reason.contains("коммерческ")),
+            "{:?}",
+            result.rejections
+        );
+        assert_eq!(
+            result.cited,
+            vec![0],
+            "the evidence itself is still returned"
+        );
+    }
+
+    #[test]
+    fn a_number_that_is_in_no_cited_claim_is_not_asserted() {
+        let result = answered("BP21 выдерживает 10 kN.");
+        assert_eq!(result.state, AnswerState::EvidenceOnly);
+        assert!(
+            result.rejections.iter().any(|reason| reason.contains("10")),
+            "{:?}",
+            result.rejections
+        );
+    }
+
+    #[test]
+    fn a_unit_that_is_in_no_cited_claim_is_not_asserted() {
+        // The value is right and the unit is invented: 3.5 мм is not 3.5 kN.
+        let result = answered("Толщина составляет 3.5 мм.");
+        assert_eq!(result.state, AnswerState::EvidenceOnly);
+    }
+
+    #[test]
+    fn another_products_designation_cannot_ride_along_with_the_citation() {
+        let result = answered("BP21D выдерживает 3.5 kN.");
+        assert_eq!(result.state, AnswerState::EvidenceOnly);
+        assert!(
+            result
+                .rejections
+                .iter()
+                .any(|reason| reason.contains("BP21D") || reason.contains("bp21d")),
+            "{:?}",
+            result.rejections
+        );
+    }
+
+    #[test]
+    fn a_negation_needs_the_same_support_as_a_statement() {
+        // "нет" and "не" assert an absence, and an absence does not follow from a
+        // quotation that simply does not mention the subject.
+        let result = answered("Профиль не требует дополнительного крепления.");
+        assert_eq!(result.state, AnswerState::EvidenceOnly);
+    }
+
+    #[test]
+    fn a_promise_is_never_composed_out_of_a_technical_claim() {
+        // §13: an answer is information with sources, not a compatibility clearance.
+        let result = answered("Профиль гарантированно совместим с любыми системами.");
+        assert_eq!(result.state, AnswerState::EvidenceOnly);
+    }
+
+    #[test]
+    fn an_answer_that_restates_its_claim_is_given_with_the_limits_of_the_check_stated() {
+        let result = answered("Нагрузка BP21 — 3,5 kN при опирании на две опоры.");
+        assert_eq!(
+            result.state,
+            AnswerState::Answered,
+            "a comma and a dot are one number: {:?}",
+            result.rejections
+        );
+        assert!(
+            result
+                .rejections
+                .iter()
+                .any(|reason| reason.contains("не полная смысловая проверка")),
+            "the answer must not be presented as semantically verified: {:?}",
+            result.rejections
+        );
+    }
+
+    #[test]
+    fn a_conditions_clause_of_the_cited_claim_may_be_repeated() {
+        let result = answered("При опирании на две опоры нагрузка равна 3.5 kN.");
+        assert_eq!(
+            result.state,
+            AnswerState::Answered,
+            "{:?}",
+            result.rejections
+        );
     }
 
     #[test]
@@ -426,6 +850,7 @@ mod tests {
                 "note": null
             })),
             &["C1".to_owned()],
+            &shown(),
             &limits(),
         );
         assert_eq!(result.state, AnswerState::EvidenceOnly);
@@ -449,6 +874,7 @@ mod tests {
                 "note": null
             })),
             &["C1".to_owned()],
+            &shown(),
             &limits(),
         );
         assert_eq!(result.state, AnswerState::EvidenceOnly);
@@ -470,6 +896,7 @@ mod tests {
                 "note": "цена в показанных утверждениях не названа"
             })),
             &["C1".to_owned()],
+            &shown(),
             &limits(),
         );
         assert_eq!(result.state, AnswerState::EvidenceOnly);
@@ -490,6 +917,7 @@ mod tests {
                 "note": null
             })),
             &["C1".to_owned()],
+            &shown(),
             &limits(),
         );
         assert_eq!(result.state, AnswerState::EvidenceOnly);
@@ -506,6 +934,7 @@ mod tests {
                 "note": null
             })),
             &["C1".to_owned()],
+            &shown(),
             &limits(),
         );
         assert_eq!(result.state, AnswerState::Answered);
@@ -530,6 +959,7 @@ mod tests {
                 "note": null
             })),
             &["C1".to_owned()],
+            &shown(),
             &limits(),
         );
         assert_eq!(result.cited, vec![0]);

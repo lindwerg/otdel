@@ -12,13 +12,19 @@
 //! message, a promise of technical compatibility or an obligation; the interface is
 //! required to say so beside it, and the phase documentation repeats it.
 //!
-//! Every rule below is a count over verdicts. There is no model, no score and no
-//! threshold anybody has to trust.
+//! Every rule below is a count over verdicts **and** a check of the fields that topic's
+//! question actually needs. The second half is what F03 found missing: any one supported
+//! partner fact reported "Описание продукции: знания есть", and a load with no unit
+//! reported "Ответы о характеристиках: готово". A count of verdicts says the knowledge is
+//! real; it does not say it answers the question being promised. There is still no model,
+//! no score and no threshold anybody has to trust.
 
 use otdel_core::knowledge::FactKind;
 use otdel_core::publication::{
     ClaimScope, ClaimStatus, ReadinessEntry, ReadinessState, ReadinessTopic,
 };
+
+use otdel_knowledge::measure::{self, mentions};
 
 use crate::chunk::normalise;
 use crate::claim::CheckedClaim;
@@ -136,22 +142,6 @@ pub fn gap_blocks(gap: &GapText) -> Vec<ReadinessTopic> {
     topics
 }
 
-/// Does `haystack` use a word that begins with `stem`?
-///
-/// A plain substring test was the first version of this and it was wrong: «вес» is
-/// inside «известно», so a gap reading «неизвестно нечто» was classified as being about
-/// weight. A stem has to start a word, which is what a stem *is*. Multi-word stems
-/// ("lead time") are matched as substrings, since they already carry their own
-/// boundaries.
-fn mentions(haystack: &str, stem: &str) -> bool {
-    if stem.contains(' ') {
-        return haystack.contains(stem);
-    }
-    haystack
-        .split(|ch: char| !ch.is_alphanumeric())
-        .any(|word| word.starts_with(stem))
-}
-
 /// Decide all four topics.
 pub fn assess(claims: &[CheckedClaim], gaps: &[GapText]) -> Vec<ReadinessEntry> {
     let blocking: Vec<(ReadinessTopic, &GapText)> = gaps
@@ -172,10 +162,12 @@ fn assess_topic(
 ) -> ReadinessEntry {
     let relevant: Vec<&CheckedClaim> = claims.iter().filter(|c| relevant_to(topic, c)).collect();
 
-    let supported = relevant
+    let supported_claims: Vec<&CheckedClaim> = relevant
         .iter()
+        .copied()
         .filter(|c| c.status == ClaimStatus::SourceSupported)
-        .count();
+        .collect();
+    let supported = supported_claims.len();
     let conflicted = relevant
         .iter()
         .filter(|c| c.status == ClaimStatus::Conflicted)
@@ -225,6 +217,12 @@ fn assess_topic(
     }
 
     let mut caveats: Vec<String> = Vec::new();
+    // The rule F03 was missing: a supported claim is not automatically an answer to *this*
+    // topic's question. Counting verdicts says the knowledge is real; only the topic's own
+    // required fields say it is enough.
+    if let Some(shortfall) = shortfall_for(topic, &supported_claims) {
+        caveats.push(shortfall);
+    }
     if conflicted > 0 {
         caveats.push(format!(
             "по {conflicted} утверждению(ям) источники расходятся — численный ответ по ним не \
@@ -263,6 +261,79 @@ fn assess_topic(
             ),
         }
     }
+}
+
+/// How many distinct properties of one product it takes before the product is
+/// *described* rather than measured once.
+///
+/// Two is the smallest number that is not one, and one was the defect: a catalogue that
+/// yielded a single load figure was reported as "описание продукции: знания есть". This is
+/// a floor on completeness, not a score — nothing above it is claimed to be better.
+const MIN_DESCRIPTION_PROPERTIES: usize = 2;
+
+/// What this topic still lacks, in words, or `None` when its required fields are there.
+///
+/// Each branch answers one question: *what does a version need before it may say it can
+/// answer this kind of question?* — which is `R01c`'s "Ready определяется по обязательным
+/// полям конкретной задачи/продукта, не по одному факту".
+fn shortfall_for(topic: ReadinessTopic, supported: &[&CheckedClaim]) -> Option<String> {
+    match topic {
+        ReadinessTopic::ProductDescription => {
+            let described = supported
+                .iter()
+                .filter_map(|claim| {
+                    claim
+                        .product_name
+                        .as_deref()
+                        .map(|product| (normalise(product), normalise(&claim.attribute)))
+                })
+                .fold(Vec::<(String, Vec<String>)>::new(), |mut acc, (p, a)| {
+                    match acc.iter_mut().find(|(product, _)| *product == p) {
+                        Some((_, properties)) if !properties.contains(&a) => properties.push(a),
+                        Some(_) => {}
+                        None => acc.push((p, vec![a])),
+                    }
+                    acc
+                });
+            let best = described
+                .iter()
+                .map(|(_, properties)| properties.len())
+                .max()
+                .unwrap_or(0);
+            (best < MIN_DESCRIPTION_PROPERTIES).then(|| {
+                format!(
+                    "ни об одном изделии не подтверждено больше одного свойства: этого мало для \
+                     описания продукции (нужно не менее {MIN_DESCRIPTION_PROPERTIES})"
+                )
+            })
+        }
+        ReadinessTopic::CharacteristicAnswers | ReadinessTopic::CommercialAnswers => {
+            let complete = supported.iter().any(|claim| states_a_whole_quantity(claim));
+            (!complete).then(|| {
+                "ни одна подтверждённая величина не полна: значение без единицы измерения или \
+                 повторяющее название свойства не даёт численного ответа"
+                    .to_owned()
+            })
+        }
+        // A hypothesis about who buys this is prose by nature; it has no required unit.
+        ReadinessTopic::AudienceHypotheses => None,
+    }
+}
+
+/// Is this claim a whole statement of a quantity?
+///
+/// A number needs something saying what it measures — the unit column or the value's own
+/// wording (`3,5 кН`). A value that only repeats its property's name is a heading, never a
+/// quantity, whatever verdict reached it. A value with no number at all is qualitative
+/// ("материал: сталь") and is complete as written.
+fn states_a_whole_quantity(claim: &CheckedClaim) -> bool {
+    if measure::restates_attribute(&claim.attribute, &claim.value_text) {
+        return false;
+    }
+    if !measure::has_number(&claim.value_text) {
+        return true;
+    }
+    claim.unit.is_some() || measure::inline_unit(&claim.value_text).is_some()
 }
 
 /// Which claims bear on which topic.
@@ -324,6 +395,11 @@ mod tests {
     use otdel_core::publication::ClaimOrigin;
     use uuid::Uuid;
 
+    /// A complete claim: a value, and a unit that says what the value measures.
+    ///
+    /// The unit is not decoration in this fixture. Since R01 a number with no unit does
+    /// not make a topic ready, so a fixture without one would be testing the incomplete
+    /// case in every test that only means to test something else.
     fn claim(kind: FactKind, status: ClaimStatus, origin: ClaimOrigin) -> CheckedClaim {
         CheckedClaim {
             origin,
@@ -333,12 +409,32 @@ mod tests {
             status,
             attribute: "нагрузка".to_owned(),
             value_text: "3.5".to_owned(),
-            unit: None,
+            unit: Some("кН".to_owned()),
             conditions: None,
             model_context: None,
             check_note: None,
             evidence: Vec::new(),
         }
+    }
+
+    /// The same claim about another property, so a product can be *described* rather
+    /// than measured once.
+    fn other_property(kind: FactKind, status: ClaimStatus) -> CheckedClaim {
+        let mut claim = claim(kind, status, ClaimOrigin::PartnerMaterial);
+        claim.origin_id = Uuid::from_u128(2);
+        claim.attribute = "длина".to_owned();
+        claim.value_text = "1200".to_owned();
+        claim.unit = Some("мм".to_owned());
+        claim
+    }
+
+    fn reason_of(entries: &[ReadinessEntry], topic: ReadinessTopic) -> String {
+        entries
+            .iter()
+            .find(|entry| entry.topic == topic)
+            .expect("every topic is assessed")
+            .reason
+            .clone()
     }
 
     fn state_of(entries: &[ReadinessEntry], topic: ReadinessTopic) -> ReadinessState {
@@ -375,6 +471,102 @@ mod tests {
         assert_eq!(
             state_of(&entries, ReadinessTopic::CommercialAnswers),
             ReadinessState::Blocked
+        );
+    }
+
+    #[test]
+    fn one_fact_about_a_product_is_not_a_description_of_it() {
+        // F03: «Описание продукции: знания есть» was reported from any single supported
+        // partner fact, so a catalogue that yielded one load figure looked like a product
+        // description. One property is one property.
+        let claims = vec![claim(
+            FactKind::Characteristic,
+            ClaimStatus::SourceSupported,
+            ClaimOrigin::PartnerMaterial,
+        )];
+        let entries = assess(&claims, &[]);
+        assert_eq!(
+            state_of(&entries, ReadinessTopic::ProductDescription),
+            ReadinessState::Limited
+        );
+        let reason = reason_of(&entries, ReadinessTopic::ProductDescription);
+        assert!(reason.contains("одно"), "{reason}");
+    }
+
+    #[test]
+    fn two_properties_of_one_product_do_describe_it() {
+        let claims = vec![
+            claim(
+                FactKind::Characteristic,
+                ClaimStatus::SourceSupported,
+                ClaimOrigin::PartnerMaterial,
+            ),
+            other_property(FactKind::Characteristic, ClaimStatus::SourceSupported),
+        ];
+        assert_eq!(
+            state_of(&assess(&claims, &[]), ReadinessTopic::ProductDescription),
+            ReadinessState::Ready
+        );
+    }
+
+    #[test]
+    fn a_number_with_no_unit_never_makes_characteristic_answers_ready() {
+        // The published BASIS row: `2,0/2,5`, no unit, no conditions. The topic is not
+        // ready for a technical question, whatever the claim's own verdict is.
+        let mut naked = claim(
+            FactKind::Characteristic,
+            ClaimStatus::SourceSupported,
+            ClaimOrigin::PartnerMaterial,
+        );
+        naked.value_text = "2,0/2,5".to_owned();
+        naked.unit = None;
+
+        let entries = assess(&[naked], &[]);
+        assert_eq!(
+            state_of(&entries, ReadinessTopic::CharacteristicAnswers),
+            ReadinessState::Limited
+        );
+        let reason = reason_of(&entries, ReadinessTopic::CharacteristicAnswers);
+        assert!(reason.contains("единиц"), "{reason}");
+    }
+
+    #[test]
+    fn a_price_with_no_currency_never_makes_commercial_answers_ready() {
+        let mut naked = claim(
+            FactKind::Commercial,
+            ClaimStatus::SourceSupported,
+            ClaimOrigin::PartnerMaterial,
+        );
+        naked.attribute = "цена".to_owned();
+        naked.value_text = "1200".to_owned();
+        naked.unit = None;
+
+        assert_eq!(
+            state_of(&assess(&[naked], &[]), ReadinessTopic::CommercialAnswers),
+            ReadinessState::Limited
+        );
+    }
+
+    #[test]
+    fn a_heading_stored_as_a_value_carries_no_topic_even_if_it_arrives_supported() {
+        // The checker lowers this claim, and readiness refuses it a second time: a
+        // readiness matrix is read as permission to answer, so it does not depend on one
+        // upstream rule having fired.
+        let mut heading = claim(
+            FactKind::Characteristic,
+            ClaimStatus::SourceSupported,
+            ClaimOrigin::PartnerMaterial,
+        );
+        heading.attribute = "безопасная рабочая нагрузка (Н)".to_owned();
+        heading.value_text = "безопасная рабочая нагрузка (Н)".to_owned();
+        heading.unit = None;
+
+        assert_ne!(
+            state_of(
+                &assess(&[heading], &[]),
+                ReadinessTopic::CharacteristicAnswers
+            ),
+            ReadinessState::Ready
         );
     }
 

@@ -21,6 +21,8 @@
 //! caller records the run as `needs_provider` — storing nothing.
 
 pub mod candidate;
+/// How a written quantity is read: numbers, units, and what may be compared with what.
+pub mod measure;
 pub mod prompt;
 pub mod quote;
 pub mod schema;

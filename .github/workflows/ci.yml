@@ -168,6 +168,56 @@ jobs:
           # Re-running must be a no-op (regression for the search_path/_sqlx_migrations bug).
           cargo run --bin otdel-api -- migrate
 
+      # Phase 1E: enable pgvector so the hybrid half of the search suite really runs.
+      #
+      # This cannot be part of the roles step (the `otdel` schema does not exist until
+      # migration 0001) and cannot be part of a migration (pgvector is not a `trusted`
+      # extension and `otdel_migrator` is deliberately NOSUPERUSER). Migration 0006
+      # therefore carries on without the vector column, and this step adds both the
+      # extension and the column afterwards — the same thing `scripts/dev-extensions.sh`
+      # does locally.
+      #
+      # Schema `otdel`, not `public`: 0001 grants `USAGE` on `public` to the migration
+      # role only, so a `vector` type there is invisible to `otdel_app`.
+      #
+      # Without this step the suite still passes — the hybrid test skips itself with a
+      # message — but that path would never be exercised in CI, which is the same as not
+      # having it.
+      - name: Enable pgvector for the phase 1E search tests
+        env:
+          PGPASSWORD: ci-superuser-password
+        run: |
+          set -euo pipefail
+          psql -h 127.0.0.1 -U otdel_superuser -d otdel_test -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE EXTENSION IF NOT EXISTS vector SCHEMA otdel;
+          DO $$
+          DECLARE
+              v_schema text;
+          BEGIN
+              SELECT n.nspname INTO v_schema
+                FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+               WHERE e.extname = 'vector';
+              IF v_schema IS NULL THEN
+                  RAISE EXCEPTION 'pgvector is not available in this image';
+              END IF;
+              IF EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = 'otdel' AND table_name = 'version_chunks'
+                     AND column_name = 'embedding'
+              ) THEN
+                  RETURN;
+              END IF;
+              EXECUTE format('ALTER TABLE otdel.version_chunks ADD COLUMN embedding %I.vector',
+                             v_schema);
+              EXECUTE format(
+                  'ALTER TABLE otdel.version_chunks ADD CONSTRAINT '
+                  'version_chunks_embedding_matches_dims '
+                  'CHECK (embedding IS NULL OR (embedding_dims IS NOT NULL '
+                  'AND %I.vector_dims(embedding) = embedding_dims))', v_schema);
+          END
+          $$;
+          SQL
+
       - name: Integration tests
         env:
           OTDEL_TEST_DATABASE_URL: postgres://otdel_app:ci-app-password@127.0.0.1:5432/otdel_test

@@ -49,11 +49,19 @@ pub struct Material {
 ///
 /// `page_number` is the 1B addition: `null` for a whole-document run, and the page a
 /// single-page retry targets otherwise.
+///
+/// `material_id` became nullable in 1E, and it is the one non-additive change that phase
+/// made to an existing wire type. `validate_partner` is the first job that is not about
+/// a single document — the checker looks at everything a partner has, because a
+/// contradiction between two catalogues is only visible from there. Giving that job some
+/// arbitrary material id would have kept the type simpler by writing down something
+/// untrue; a database CHECK now ties the two together, so `material_id` is absent
+/// exactly for that kind and present for every other.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     pub id: Uuid,
     pub partner_id: Uuid,
-    pub material_id: Uuid,
+    pub material_id: Option<Uuid>,
     pub page_number: Option<i32>,
     pub kind: JobKind,
     pub status: JobStatus,
@@ -134,7 +142,9 @@ impl MaterialStatus {
 /// so a problem page can be retried without re-reading the other 31
 /// (`docs/block-01-plan.md`, 1B §2); 1C adds the understanding run that drafts product
 /// knowledge from the pages a material already has; 1D adds the research plan, which is
-/// the only kind that reaches outside this machine.
+/// the only kind that reaches outside this machine; 1E adds the partner-wide check that
+/// turns candidates into a published version, and it is the only kind with no material
+/// of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
@@ -142,6 +152,7 @@ pub enum JobKind {
     ExtractPage,
     UnderstandMaterial,
     ResearchPlan,
+    ValidatePartner,
 }
 
 impl JobKind {
@@ -151,6 +162,7 @@ impl JobKind {
             Self::ExtractPage => "extract_page",
             Self::UnderstandMaterial => "understand_material",
             Self::ResearchPlan => "research_plan",
+            Self::ValidatePartner => "validate_partner",
         }
     }
 
@@ -160,6 +172,7 @@ impl JobKind {
             "extract_page" => Some(Self::ExtractPage),
             "understand_material" => Some(Self::UnderstandMaterial),
             "research_plan" => Some(Self::ResearchPlan),
+            "validate_partner" => Some(Self::ValidatePartner),
             _ => None,
         }
     }
@@ -167,6 +180,15 @@ impl JobKind {
     /// A page job carries a page number; every other kind never does.
     pub const fn needs_page_number(self) -> bool {
         matches!(self, Self::ExtractPage)
+    }
+
+    /// Every kind but the partner-wide check is about one material.
+    ///
+    /// The database says the same thing (`jobs_material_matches_kind` in
+    /// `0006_publication.sql`); this is the Rust side of it, so a worker can turn
+    /// `Option<Uuid>` into a `Uuid` at one place with a real reason for the unwrap.
+    pub const fn needs_material(self) -> bool {
+        !matches!(self, Self::ValidatePartner)
     }
 
     /// Kinds the document-reading worker half claims. The understanding half claims
@@ -188,6 +210,16 @@ impl JobKind {
     /// to "a paid external request was made".
     pub const fn research_kinds() -> [Self; 1] {
         [Self::ResearchPlan]
+    }
+
+    /// Kinds the phase 1E worker half claims.
+    ///
+    /// Disjoint from the other three, and for a reason of its own: this is the half that
+    /// decides what may be published and answered. A document reader or a researcher
+    /// that could claim one of these would be a path from "a file arrived" to "a version
+    /// went live".
+    pub const fn validation_kinds() -> [Self; 1] {
+        [Self::ValidatePartner]
     }
 }
 
@@ -297,7 +329,7 @@ mod tests {
         let job = Job {
             id: Uuid::from_u128(1),
             partner_id: Uuid::from_u128(2),
-            material_id: Uuid::from_u128(3),
+            material_id: Some(Uuid::from_u128(3)),
             page_number: None,
             kind: JobKind::ExtractDocument,
             status: JobStatus::Queued,
@@ -349,11 +381,12 @@ mod tests {
     }
 
     #[test]
-    fn the_three_worker_halves_claim_disjoint_kinds() {
+    fn the_four_worker_halves_claim_disjoint_kinds() {
         let halves = [
             ("extraction", JobKind::extraction_kinds().to_vec()),
             ("knowledge", JobKind::knowledge_kinds().to_vec()),
             ("research", JobKind::research_kinds().to_vec()),
+            ("validation", JobKind::validation_kinds().to_vec()),
         ];
 
         for (name, kinds) in &halves {
@@ -370,6 +403,38 @@ mod tests {
                     );
                 }
             }
+        }
+
+        // Every kind belongs to exactly one half: a kind claimed by nobody would sit in
+        // the queue for ever, looking queued and never running.
+        let claimed: Vec<JobKind> = halves
+            .iter()
+            .flat_map(|(_, kinds)| kinds.iter().copied())
+            .collect();
+        for kind in [
+            JobKind::ExtractDocument,
+            JobKind::ExtractPage,
+            JobKind::UnderstandMaterial,
+            JobKind::ResearchPlan,
+            JobKind::ValidatePartner,
+        ] {
+            assert!(
+                claimed.contains(&kind),
+                "{kind:?} is claimed by no worker half"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_partner_wide_check_has_no_material() {
+        assert!(!JobKind::ValidatePartner.needs_material());
+        for kind in [
+            JobKind::ExtractDocument,
+            JobKind::ExtractPage,
+            JobKind::UnderstandMaterial,
+            JobKind::ResearchPlan,
+        ] {
+            assert!(kind.needs_material(), "{kind:?} must name its material");
         }
     }
 

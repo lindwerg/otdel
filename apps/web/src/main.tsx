@@ -7,6 +7,7 @@ import './styles/global.css'
 import './styles/pages.css'
 import './styles/knowledge.css'
 import './styles/research.css'
+import './styles/publication.css'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

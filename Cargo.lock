@@ -1291,9 +1291,11 @@ dependencies = [
  "http-body-util",
  "otdel-core",
  "otdel-db",
+ "otdel-embed",
  "otdel-extract",
  "otdel-knowledge",
  "otdel-llm",
+ "otdel-publish",
  "otdel-research",
  "otdel-search",
  "otdel-storage",
@@ -1334,6 +1336,7 @@ dependencies = [
  "sha2",
  "subtle",
  "thiserror",
+ "tracing",
  "uuid",
 ]
 
@@ -1344,11 +1347,27 @@ dependencies = [
  "chrono",
  "log",
  "otdel-core",
+ "otdel-publish",
  "sqlx",
  "thiserror",
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "otdel-embed"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "otdel-core",
+ "otdel-embed",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1392,6 +1411,24 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "otdel-publish"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "otdel-core",
+ "otdel-knowledge",
+ "otdel-llm",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1448,12 +1485,15 @@ dependencies = [
 name = "otdel-worker"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "futures-util",
  "otdel-core",
  "otdel-db",
+ "otdel-embed",
  "otdel-extract",
  "otdel-knowledge",
  "otdel-llm",
+ "otdel-publish",
  "otdel-research",
  "otdel-search",
  "otdel-storage",
@@ -1472,6 +1512,7 @@ dependencies = [
  "otdel-api",
  "otdel-core",
  "otdel-db",
+ "otdel-embed",
  "otdel-extract",
  "otdel-llm",
  "otdel-search",

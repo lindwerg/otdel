@@ -46,7 +46,7 @@ async fn a_claimed_job_is_not_offered_to_a_second_worker() {
         .expect("the queued job must be claimable");
     tx.commit().await.unwrap();
 
-    assert_eq!(first.material_id, material_id);
+    assert_eq!(first.material_id, Some(material_id));
     assert_eq!(first.status, JobStatus::Running);
     assert_eq!(first.kind, JobKind::ExtractDocument);
     // The attempt is counted at claim time, so a worker that dies still burns one.

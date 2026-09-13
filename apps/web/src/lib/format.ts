@@ -1,15 +1,26 @@
 import type {
+  AnswerState,
+  ClaimStatus,
   ExtractionSummary,
   FactKind,
   KnowledgeFact,
   KnowledgeRunStatus,
+  KnowledgeVersion,
+  MatchKind,
   MaterialStatus,
   PageStatus,
   QueryOutcome,
   QuestionAudience,
+  ReadinessState,
+  ReadinessTopic,
   ResearchPlanStatus,
+  SearchMode,
+  SearchState,
   SourceStatus,
   TextSource,
+  ValidationRunStatus,
+  VersionClaim,
+  VersionStatus,
 } from '../api/types'
 
 export function formatBytes(bytes: number): string {
@@ -426,6 +437,314 @@ export function formatMicros(micros: number, currency: string): string {
 /** Bytes downloaded, as a sentence. Reuses the upload formatter's units. */
 export function formatFetchedBytes(bytes: number): string {
   return formatBytes(bytes)
+}
+
+// --- Phase 1E: versions, readiness, search and answers ---------------------
+
+/**
+ * Labels for a knowledge version.
+ *
+ * Only one of these is an error, and it is not on this list. `blocked` means the
+ * readiness rules were not met, so the version stayed unpublished *on purpose* —
+ * the check worked exactly as designed. `superseded` means a newer version took
+ * over, `revoked` means somebody withdrew it for a stated reason. Painting any of
+ * them red would send the owner hunting for a malfunction that never happened.
+ */
+const VERSION_STATUS: Record<VersionStatus, StatusPresentation> = {
+  draft: {
+    label: 'Черновик версии',
+    defaultHint: 'Версия собрана, но проверка ещё не завершена. Она не опубликована.',
+    tone: 'neutral',
+  },
+  validating: {
+    label: 'Проверяется',
+    defaultHint: 'Правила проверки применяются к кандидатам. Версия ещё не опубликована.',
+    tone: 'progress',
+  },
+  published: {
+    label: 'Опубликована',
+    defaultHint: 'По этой версии выполняются поиск и ответы.',
+    tone: 'success',
+  },
+  blocked: {
+    label: 'Не опубликована: правила готовности не выполнены',
+    defaultHint:
+      'Версия существует как запись проверки и не публикуется. Причины перечислены ниже дословно.',
+    tone: 'warn',
+  },
+  superseded: {
+    label: 'Заменена более новой',
+    defaultHint:
+      'Версия остаётся читаемой: закреплённая когда-то версия не исчезает, по ней можно искать.',
+    tone: 'neutral',
+  },
+  revoked: {
+    label: 'Отозвана',
+    defaultHint: 'Версия снята с публикации владельцем; причина указана рядом.',
+    tone: 'warn',
+  },
+}
+
+export function versionStatusPresentation(status: VersionStatus): StatusPresentation {
+  return VERSION_STATUS[status] ?? { label: status, defaultHint: '', tone: 'neutral' }
+}
+
+/**
+ * Labels for a check.
+ *
+ * There is no `needs_provider` here and there cannot be: the check is
+ * deterministic, and `model_reviewed = 0` is the normal outcome of an
+ * installation without a model key, not a degraded one.
+ */
+const VALIDATION_RUN_STATUS: Record<ValidationRunStatus, StatusPresentation> = {
+  queued: {
+    label: 'Проверка в очереди',
+    defaultHint: 'Кандидаты поставлены на проверку и ждут исполнителя.',
+    tone: 'neutral',
+  },
+  running: {
+    label: 'Проверка идёт',
+    defaultHint: 'Правила применяются к кандидатам партнёра.',
+    tone: 'progress',
+  },
+  completed: {
+    label: 'Проверка завершена',
+    defaultHint: 'Все кандидаты получили статус проверки.',
+    tone: 'success',
+  },
+  partial: {
+    label: 'Проверка завершена частично',
+    defaultHint: 'Часть кандидатов не вошла в версию — причины ниже дословно.',
+    tone: 'warn',
+  },
+  failed: {
+    label: 'Проверка не выполнена',
+    defaultHint: 'Версия не собрана.',
+    tone: 'error',
+  },
+}
+
+export function validationRunStatusPresentation(
+  status: ValidationRunStatus,
+): StatusPresentation {
+  return VALIDATION_RUN_STATUS[status] ?? { label: status, defaultHint: '', tone: 'neutral' }
+}
+
+/**
+ * Verdicts on a statement.
+ *
+ * The wording of `source_supported` is the single most load-bearing string in
+ * this phase. It means the cited source says so — not that the manufacturer
+ * confirmed it, not that anybody measured it, not that it is true. So the label
+ * says «подтверждено источником» and the hint immediately says what that is not.
+ * Every other verdict is a form of "not confirmed by its source", which is why
+ * none of them is styled as success and none is styled as an error either: a
+ * hypothesis is a legitimate, recorded outcome of the check.
+ */
+const CLAIM_STATUS: Record<ClaimStatus, StatusPresentation> = {
+  source_supported: {
+    label: 'подтверждено источником',
+    defaultHint:
+      'Процитированный источник это утверждает. Это не независимая проверка и не гарантия истинности.',
+    tone: 'success',
+  },
+  hypothesis: {
+    label: 'гипотеза — источником не подтверждено',
+    defaultHint: 'Источник этого не утверждает; формулировка остаётся предположением.',
+    tone: 'warn',
+  },
+  unknown: {
+    label: 'не установлено — источником не подтверждено',
+    defaultHint: 'Правилам проверки не хватило данных, чтобы признать утверждение.',
+    tone: 'warn',
+  },
+  conflicted: {
+    label: 'противоречие — источником не подтверждено',
+    defaultHint: 'Источники говорят разное; выбор между ними здесь не делается.',
+    tone: 'warn',
+  },
+  stale: {
+    label: 'источник устарел — не подтверждено',
+    defaultHint: 'Утверждение опирается на источник, который с тех пор изменился или устарел.',
+    tone: 'warn',
+  },
+}
+
+export function claimStatusPresentation(status: ClaimStatus): StatusPresentation {
+  return CLAIM_STATUS[status] ?? { label: status, defaultHint: '', tone: 'neutral' }
+}
+
+/** Only `source_supported` may look confirmed. Everything else must not. */
+export function isClaimSourceSupported(status: ClaimStatus): boolean {
+  return status === 'source_supported'
+}
+
+const READINESS_TOPIC_LABEL: Record<ReadinessTopic, string> = {
+  product_description: 'описание продукта',
+  audience_hypotheses: 'гипотезы аудитории',
+  characteristic_answers: 'ответы о характеристиках',
+  commercial_answers: 'ответы о коммерческих условиях',
+}
+
+export function readinessTopicLabel(topic: ReadinessTopic): string {
+  return READINESS_TOPIC_LABEL[topic] ?? topic
+}
+
+/** The four topics, in the order §7 names them. Rendered even when the server
+ *  sent no entry for one, so the matrix is never quietly three rows long. */
+export const READINESS_TOPICS: ReadinessTopic[] = [
+  'product_description',
+  'audience_hypotheses',
+  'characteristic_answers',
+  'commercial_answers',
+]
+
+/**
+ * Readiness of one topic.
+ *
+ * `blocked` here is a warning, not an error: it says knowledge is missing, which
+ * is a fact about the materials and not a malfunction. And `ready` is worded as
+ * availability — «знания есть» — because readiness is never a permission to send
+ * anything or to promise anything.
+ */
+const READINESS_STATE: Record<ReadinessState, StatusPresentation> = {
+  ready: {
+    label: 'знания есть',
+    defaultHint: 'По этой теме в версии есть подтверждённые источником утверждения.',
+    tone: 'success',
+  },
+  limited: {
+    label: 'знания неполные',
+    defaultHint: 'Отвечать можно с оговорками; оговорки названы рядом.',
+    tone: 'warn',
+  },
+  blocked: {
+    label: 'знаний недостаточно',
+    defaultHint: 'По этой теме отвечать нечем: пробел записан и назван рядом.',
+    tone: 'warn',
+  },
+}
+
+export function readinessStatePresentation(state: ReadinessState): StatusPresentation {
+  return READINESS_STATE[state] ?? { label: state, defaultHint: '', tone: 'neutral' }
+}
+
+/**
+ * States of a search response.
+ *
+ * `no_published_version` is neither an error nor an empty result — it is the
+ * named state of a partner who has nothing published yet, and it is styled
+ * neutrally so nobody starts debugging the search.
+ */
+const SEARCH_STATE: Record<SearchState, StatusPresentation> = {
+  ok: {
+    label: 'найдено',
+    defaultHint: 'Все результаты принадлежат одной опубликованной версии.',
+    tone: 'success',
+  },
+  no_published_version: {
+    label: 'у партнёра нет опубликованной версии',
+    defaultHint:
+      'Искать пока не по чему: проверка не проходила, была заблокирована или версия отозвана. Это состояние, а не ошибка.',
+    tone: 'neutral',
+  },
+  insufficient_evidence: {
+    label: 'подходящих утверждений нет',
+    defaultHint: 'Версия есть, но в ней нет утверждений по этому запросу. Догадка не подставляется.',
+    tone: 'warn',
+  },
+}
+
+export function searchStatePresentation(state: SearchState): StatusPresentation {
+  return SEARCH_STATE[state] ?? { label: state, defaultHint: '', tone: 'neutral' }
+}
+
+/**
+ * States of an answer.
+ *
+ * `evidence_only` is the honest half-answer: statements with citations exist,
+ * prose does not, because no model is configured or because the model's answer
+ * failed its citation check. That is a working system saying what it has, so it
+ * is a warning at most — never an error.
+ */
+const ANSWER_STATE: Record<AnswerState, StatusPresentation> = {
+  answered: {
+    label: 'ответ составлен моделью',
+    defaultHint: 'Текст — формулировка модели; под ним цитаты утверждений закреплённой версии.',
+    tone: 'success',
+  },
+  evidence_only: {
+    label: 'прозаический ответ не составлен — показаны найденные утверждения',
+    defaultHint:
+      'Найденные утверждения и цитаты есть, связного текста нет: модель не настроена либо её ответ не прошёл проверку цитат.',
+    tone: 'warn',
+  },
+  insufficient_evidence: {
+    label: 'ответа нет: подходящих утверждений не нашлось',
+    defaultHint: 'Версия есть, но отвечать нечем. Догадка не подставляется.',
+    tone: 'warn',
+  },
+  no_published_version: {
+    label: 'у партнёра нет опубликованной версии',
+    defaultHint:
+      'Отвечать пока не по чему: проверка не проходила, была заблокирована или версия отозвана. Это состояние, а не ошибка.',
+    tone: 'neutral',
+  },
+}
+
+export function answerStatePresentation(state: AnswerState): StatusPresentation {
+  return ANSWER_STATE[state] ?? { label: state, defaultHint: '', tone: 'neutral' }
+}
+
+const MATCH_KIND_LABEL: Record<MatchKind, string> = {
+  exact: 'точное совпадение',
+  keyword: 'по ключевым словам',
+  vector: 'по смыслу (вектор)',
+}
+
+export function matchKindLabel(kind: MatchKind): string {
+  return MATCH_KIND_LABEL[kind] ?? kind
+}
+
+/**
+ * The mode one response ran in.
+ *
+ * `keyword` is not a failure and not a lesser result set — it is the whole
+ * search minus its vector half, and `degraded[]` next to it says why that half
+ * was unavailable.
+ */
+const SEARCH_MODE_LABEL: Record<SearchMode, string> = {
+  hybrid: 'поиск по ключевым словам и по смыслу',
+  keyword: 'только по ключевым словам',
+}
+
+export function searchModeLabel(mode: SearchMode): string {
+  return SEARCH_MODE_LABEL[mode] ?? mode
+}
+
+/** The value with its unit, exactly as the version recorded it. */
+export function claimValueLine(claim: VersionClaim): string {
+  return claim.unit ? `${claim.value_text} ${claim.unit}` : claim.value_text
+}
+
+/**
+ * What one version holds, in the counters it really has.
+ *
+ * Counts, never a share: "80% подтверждено" would read as a measure of quality,
+ * and the number of unconfirmed statements is exactly the thing that must stay
+ * legible.
+ */
+export function versionCountsLine(version: KnowledgeVersion): string {
+  const parts = [
+    `утверждений: ${version.claims_total}`,
+    `подтверждено источником: ${version.claims_source_supported}`,
+    `гипотез: ${version.claims_hypothesis}`,
+    `не установлено: ${version.claims_unknown}`,
+    `противоречий: ${version.claims_conflicted}`,
+    `устаревших: ${version.claims_stale}`,
+    `пробелов: ${version.gaps_open}`,
+  ]
+  return parts.join(' · ')
 }
 
 /** Pages whose outcome the owner may still be able to change. */

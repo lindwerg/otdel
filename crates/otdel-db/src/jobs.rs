@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use otdel_core::extraction::page_extraction_idempotency_key;
 use otdel_core::knowledge::understanding_idempotency_key;
 use otdel_core::model::{extraction_idempotency_key, Job, JobKind, JobStatus};
+use otdel_core::publication::validation_idempotency_key;
 use otdel_core::research::research_plan_idempotency_key;
 use sqlx::postgres::PgRow;
 use sqlx::Row;
@@ -354,6 +355,88 @@ pub async fn enqueue_research(
     })?;
 
     job_from_row(&row)
+}
+
+/// Enqueue the partner-wide check, or re-arm the one that already exists.
+///
+/// The only job kind with no material: the checker looks at everything the partner has,
+/// because a contradiction between two catalogues is only visible from there.
+///
+/// Idempotent by partner, with the same `ON CONFLICT … WHERE status <> 'running'` shape
+/// as the other kinds — so pressing "проверить" twice, or a finished understanding run
+/// queueing a check while one is already going, reuses a single row. The condition lives
+/// inside the statement rather than between a read and a write, so two workers cannot
+/// both find it absent.
+pub async fn enqueue_validation(
+    tx: &mut ScopedTx,
+    partner_id: Uuid,
+    run_id: Uuid,
+) -> DbResult<Job> {
+    let bureau_id = tx.bureau_id();
+    let key = validation_idempotency_key(partner_id);
+
+    let updated = sqlx::query(&format!(
+        "INSERT INTO otdel.jobs \
+             (bureau_id, partner_id, material_id, validation_run_id, kind, status, \
+              idempotency_key) \
+         VALUES ($1, $2, NULL, $3, 'validate_partner', 'queued', $4) \
+         ON CONFLICT (bureau_id, idempotency_key) DO UPDATE \
+            SET status = 'queued', \
+                stage = NULL, \
+                error = NULL, \
+                error_kind = NULL, \
+                run_after = now(), \
+                lease_owner = NULL, \
+                lease_expires_at = NULL, \
+                validation_run_id = EXCLUDED.validation_run_id, \
+                max_attempts = GREATEST(otdel.jobs.max_attempts, otdel.jobs.attempts + 1), \
+                updated_at = now() \
+          WHERE otdel.jobs.status <> 'running' \
+         RETURNING {COLUMNS}"
+    ))
+    .bind(bureau_id)
+    .bind(partner_id)
+    .bind(run_id)
+    .bind(&key)
+    .fetch_optional(tx.conn())
+    .await?;
+
+    if let Some(row) = updated {
+        return job_from_row(&row);
+    }
+
+    // The `WHERE` refused the update: a check is running right now. Return it rather
+    // than starting a second one.
+    let row = sqlx::query(&format!(
+        "SELECT {COLUMNS} FROM otdel.jobs WHERE bureau_id = $1 AND idempotency_key = $2"
+    ))
+    .bind(bureau_id)
+    .bind(&key)
+    .fetch_optional(tx.conn())
+    .await?
+    .ok_or_else(|| {
+        DbError::Decode("validation job conflicted but the existing job is not visible".to_owned())
+    })?;
+
+    job_from_row(&row)
+}
+
+/// Is there already an unfinished check for this partner?
+pub async fn validation_pending(tx: &mut ScopedTx, partner_id: Uuid) -> DbResult<bool> {
+    let bureau_id = tx.bureau_id();
+    let row = sqlx::query(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM otdel.jobs \
+              WHERE bureau_id = $1 AND partner_id = $2 AND kind = 'validate_partner' \
+                AND status IN ('queued', 'running') \
+         ) AS pending",
+    )
+    .bind(bureau_id)
+    .bind(partner_id)
+    .fetch_one(tx.conn())
+    .await?;
+
+    Ok(row.try_get::<bool, _>("pending")?)
 }
 
 /// Is there already an unfinished job for this research plan?

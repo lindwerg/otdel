@@ -289,8 +289,182 @@ char_start, char_end}`. `quote` — дословный фрагмент сохр
 `Job.kind` дополняется значением `research_plan`. План задания хранится отдельной колонкой
 `jobs.research_plan_id` и в wire-контракт `Job` не добавляется: этапам 1A–1C он не нужен.
 
+## API этапа 1E — проверка, версии знаний, публикация, поиск и ответы
+
+Те же правила конверта, авторизации и CSRF. Дополнения строго аддитивные.
+
+**Что здесь решается.** Кандидаты 1C и 1D проходят детерминированные правила, получают
+статус проверки и либо попадают в **неизменяемую версию знаний**, либо честно остаются
+неопубликованными. Искать и спрашивать можно **только по опубликованной версии**:
+черновик 1C/1D через эти эндпоинты не виден вовсе.
+
+**Состояние адаптеров.** Проверка и публикация **не требуют модели**: правила
+детерминированы (`block-01-spec.md` §6.7 — «совпадение ответов двух моделей не является
+доказательством»). Модель и embeddings нужны только двум необязательным надстройкам:
+прозаическому ответу и векторной половине поиска. Без них система работает и говорит, в
+каком именно режиме.
+
+- `GET /api/retrieval/provider` → `{state, validation, embedding, answer, vector, search_mode,
+  missing[], limits, message}`.
+  - `validation` = `{mode: "deterministic", message}` — всегда доступна; поля `state` у неё
+    нет намеренно, потому что выключить её нельзя.
+  - `embedding`/`answer` — `AdapterView` = `{state, provider, endpoint_host, model, message}`
+    (тот же тип, что в 1D). Ключ не возвращается никогда; `endpoint_host` — только хост.
+  - `vector` = `{state, profile|null, message}`. `state`:
+    `ready` — расширение `pgvector` установлено и embedding-провайдер настроен;
+    `no_embeddings` — расширение есть, провайдера нет, векторы не считаются;
+    `extension_missing` — `CREATE EXTENSION vector` не выполнен (миграция не может его
+    выполнить: расширение не `trusted`, а роль миграций не суперпользователь).
+  - `search_mode`: `hybrid` | `keyword_only`. Это фактический режим, а не намерение.
+  - `limits` = `{max_query_chars, max_results, max_answer_claims, max_answer_chars,
+    chunk_max_chars}`. Размерности вектора здесь нет намеренно: она неизвестна, пока не
+    сделан хотя бы один вызов, и поле, всегда равное `null`, — это обещание, которого
+    система не выполняет.
+
+**Версии знаний.** Все ответы ограничены партнёром внутри бюро.
+
+- `GET /api/partners/{id}/versions` → `{items: [KnowledgeVersion]}`, новые первыми.
+- `GET /api/partners/{id}/versions/{version_id}` → `KnowledgeVersion`.
+- `GET /api/partners/{id}/versions/{version_id}/claims` → `{items: [VersionClaim]}`.
+- `GET /api/partners/{id}/versions/{version_id}/gaps` → `{items: [VersionGap]}`.
+- `GET /api/partners/{id}/validation` → `{provider, published: KnowledgeVersion|null,
+  runs: [ValidationRun], versions: [KnowledgeVersion], candidates: CandidateSummary}`.
+  `candidates` = `{facts, findings, gaps_open, materials_drafted}` — сколько кандидатов
+  сейчас есть у партнёра, чтобы интерфейс не предлагал проверку там, где проверять нечего.
+- `POST /api/partners/{id}/validate` → `ValidationRun`. Ставит в очередь проверку всех
+  кандидатов партнёра. Идемпотентен: пока проверка `queued`/`running`, повтор возвращает тот
+  же запуск. 409 `conflict` — у партнёра нет ни одного кандидата.
+- `POST /api/partners/{id}/versions/{version_id}/retract` `{reason}` → `KnowledgeVersion`.
+  Переводит версию в `revoked`. 409 `conflict`, если версия не `published`. `reason` — 1–1000
+  символов, обязателен: отзыв без причины не отличить от сбоя.
+
+`KnowledgeVersion`: `{id, partner_id, number, status, validation_run_id, input_fingerprint,
+claims_total, claims_source_supported, claims_hypothesis, claims_unknown, claims_conflicted,
+claims_stale, gaps_open, chunks_total, chunks_embedded, embedding_profile, readiness:
+[ReadinessEntry], blocked_reasons[], created_at, published_at, superseded_at, revoked_at,
+revoked_reason}`.
+
+- `status`: `draft` | `validating` | `published` | `blocked` | `superseded` | `revoked`
+  (`block-01-spec.md` §7). `blocked` — правила готовности не выполнены: версия существует как
+  запись проверки, но **не публикуется**, и `blocked_reasons` говорит словами, почему.
+- `number` — порядковый номер версии партнёра, начиная с 1. Он растёт и не переиспользуется.
+- У партнёра в каждый момент не больше одной версии со статусом `published` — это
+  гарантировано частичным уникальным индексом, а не порядком операций в коде.
+- `input_fingerprint` — отпечаток входа (какие кандидаты и какие их ревизии вошли).
+  Запоздавший запуск, чей отпечаток старше уже опубликованного, не публикуется
+  (`block-01-spec.md` §7).
+- Счётчики вычисляются из строк снимка при чтении.
+
+`ReadinessEntry`: `{topic, state, reason}`.
+
+- `topic`: `product_description` | `audience_hypotheses` | `characteristic_answers` |
+  `commercial_answers` (§7: готовность определяется отдельно для описания продукта, гипотез
+  аудитории, ответов о характеристиках и ответов о коммерческих условиях).
+- `state`: `ready` | `limited` | `blocked`. `limited` — отвечать можно, но с оговорками, и
+  `reason` называет их словами.
+- Готовность — это **доступность знаний**, а не разрешение на рассылку, сделку или обещание
+  совместимости. Интерфейс обязан говорить это рядом.
+
+`VersionClaim`: `{id, version_id, origin, origin_id, scope, product_name, kind, status,
+attribute, value_text, unit, conditions, model_context, check_note, evidence:
+[VersionEvidence], created_at}`.
+
+- `origin`: `partner_material` (факт 1C) | `industry_research` (вывод 1D). `origin_id` —
+  идентификатор исходного кандидата; он существует для прослеживаемости и **не** делает
+  снимок зависимым от кандидата: удаление кандидата не меняет опубликованную версию.
+- `scope`: `partner` | `industry`. Отраслевое утверждение остаётся отраслевым и внутри
+  версии: у него нет и не может быть `product_name` (`block-01-plan.md`, 1D §4).
+- `status`: `source_supported` | `hypothesis` | `unknown` | `conflicted` | `stale`
+  (`block-01-spec.md` §6.7). `source_supported` означает **поддержку источником**, а не
+  независимую проверку производителем и не гарантию истинности.
+- `check_note` — словами, почему статус такой. Интерфейс показывает его как есть.
+- `evidence` никогда не пуст (отложенный триггер БД), и цитаты **скопированы в версию**:
+  снимок не ссылается на текст страницы, который может быть перечитан.
+
+`VersionEvidence`: `{id, claim_id, source_kind, material_id, material_filename, page_number,
+region_id, url, host, retrieved_at, content_hash, quote, char_start, char_end}`.
+
+- `source_kind`: `material` | `external`. Поля другого вида — `null`. Оригинал партнёра
+  открывается существующим `.../original#page=N`; внешний источник — своим `url`.
+- `quote` — дословный фрагмент, скопированный в версию в момент публикации.
+
+`VersionGap`: `{id, version_id, origin_id, product_name, topic, missing, blocks,
+blocks_topics[], created_at}`. `blocks_topics` — какие из четырёх готовностей этот пробел
+ограничивает; пробел показывает, какие ответы он блокирует (`block-01-spec.md` §11).
+
+`ValidationRun`: `{id, partner_id, status, prompt_profile, version_id, version_number,
+claims_considered, claims_source_supported, claims_hypothesis, claims_unknown,
+claims_conflicted, claims_stale, claims_rejected, gaps_carried, chunks_created,
+chunks_embedded, model_reviewed, published, rejections[], blocked_reasons[], diagnostic,
+started_at, finished_at, created_at}`.
+
+- `status`: `queued` | `running` | `completed` | `partial` | `failed`. Значения
+  `needs_provider` здесь **нет**: проверка детерминирована и не зависит от модели.
+- `model_reviewed` — сколько утверждений получили второе мнение модели. `0` — нормальное
+  состояние без ключа, и оно не понижает статус запуска.
+- `published` — была ли версия опубликована этим запуском. `false` при
+  `blocked_reasons` непустом.
+- Один партнёр — одна строка текущего запуска; история попыток остаётся на задании.
+
+`Job.kind` дополняется значением `validate_partner` (без `page_number` и без
+`research_plan_id`). **`Job.material_id` становится nullable** — это единственное
+не-аддитивное изменение существующего типа в этом этапе: проверка относится к партнёру, а
+не к документу, и записать туда произвольный `material_id` значило бы записать неправду.
+Для всех остальных видов задания поле присутствует, и это связано CHECK-ом в БД.
+
+**Поиск и ответы.** Оба эндпоинта — `POST`, потому что запрос содержит текст, а не
+идентификатор: текст вопроса не место в URL, в логах и в истории браузера.
+
+- `POST /api/partners/{id}/retrieval/search` `{query, version_id?, product?, limit?}` →
+  `SearchResponse`. `product` — название изделия; сравнение идёт по свёрнутой форме, так
+  что регистр и пробелы не важны. Тело проверяется строго (`deny_unknown_fields`):
+  неизвестное поле — 400, а не молча проигнорированный фильтр.
+- `POST /api/partners/{id}/retrieval/answer` `{question, version_id?}` → `AnswerResponse`.
+
+Область обязательна и берётся из пути и сессии, а не из тела (`block-01-spec.md` §9).
+`version_id` закрепляет версию; он допускается только для версии этого партнёра со статусом
+`published` или `superseded` — закреплённая когда-то версия остаётся читаемой, потому что в
+этом и состоит смысл закрепления. Версия `revoked` отвергается 409 `conflict`; `draft`,
+`validating` и `blocked` — 404, как несуществующие для поиска. Без `version_id` берётся
+текущая опубликованная.
+
+`SearchResponse`: `{state, version, mode, degraded[], items: [SearchHit], gaps: [VersionGap],
+message}`.
+
+- `state`: `ok` | `no_published_version` | `insufficient_evidence`.
+  `no_published_version` — у партнёра нечего искать: проверка не проходила, была заблокирована
+  или версия отозвана. Это не ошибка и не пустой результат, это названное состояние.
+- `version` — `VersionRef` = `{id, number, status, published_at}` либо `null`.
+- `mode`: `hybrid` | `keyword`. `degraded` — список причин словами, почему режим не полный
+  (нет embedding-провайдера, нет расширения, у версии нет векторов её профиля).
+- Результаты одного ответа всегда принадлежат **одной** версии (§9: «в один ответ не
+  смешиваются разные версии»).
+
+`SearchHit`: `{claim, score, matched_by[]}`. `matched_by` — непустое подмножество
+`exact` | `keyword` | `vector`; `score` — внутренняя сопоставимость в пределах одного ответа,
+а не вероятность и не процент уверенности.
+
+`AnswerResponse`: `{state, version, mode, degraded[], text, answer_is_model_context,
+claims: [VersionClaim], citations: [VersionEvidence], conditions[], gaps: [VersionGap],
+readiness: [ReadinessEntry], limitations[], rejections[], message}`.
+
+- `state`: `answered` | `evidence_only` | `insufficient_evidence` | `no_published_version`.
+- **`answered` обязывает к цитатам.** При `state = answered` `citations` непуст, и каждая
+  цитата принадлежит утверждению этой закреплённой версии этого партнёра. Ответ, чьи
+  цитаты не разрешились, не отдаётся как ответ: он понижается до `evidence_only` с
+  причиной в `rejections`.
+- `evidence_only` — найденные утверждения с цитатами есть, прозаического ответа нет: модель
+  не настроена либо её ответ не прошёл проверку. `text = null`.
+- `insufficient_evidence` — версия есть, подходящих утверждений нет. `text = null`,
+  `claims` и `citations` пусты, `gaps` называет пробел, если он записан. Догадка не
+  подставляется (`block-01-spec.md` §13.5).
+- `answer_is_model_context` — `true` всегда, когда `text` не `null`: прозаический ответ
+  является формулировкой модели, а не цитатой, и интерфейс обязан пометить это.
+- `limitations` — оговорки словами: ограниченная готовность, `conflicted` среди найденного,
+  `stale` источник. Частичная готовность не выглядит как полный коммерческий допуск
+  (§13.7).
+
 ## Следующие контракты
 
-1E — опубликованные версии и поиск/ответы; 1F — обновления и приёмку. Каждый контракт
-фиксируется до соответствующей UI-интеграции. Не создавать работающие на вид заглушки этих
-разделов раньше времени.
+1F — обновления, расширение входов и приёмка. Контракт фиксируется до соответствующей
+UI-интеграции. Не создавать работающие на вид заглушки этих разделов раньше времени.

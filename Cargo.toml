@@ -9,6 +9,8 @@ members = [
     "crates/otdel-knowledge",
     "crates/otdel-search",
     "crates/otdel-research",
+    "crates/otdel-embed",
+    "crates/otdel-publish",
     "crates/otdel-api",
     "crates/otdel-worker",
     "apps/api",
@@ -31,6 +33,8 @@ otdel-llm = { path = "crates/otdel-llm" }
 otdel-knowledge = { path = "crates/otdel-knowledge" }
 otdel-search = { path = "crates/otdel-search" }
 otdel-research = { path = "crates/otdel-research" }
+otdel-embed = { path = "crates/otdel-embed" }
+otdel-publish = { path = "crates/otdel-publish" }
 otdel-api = { path = "crates/otdel-api" }
 otdel-worker = { path = "crates/otdel-worker" }
 

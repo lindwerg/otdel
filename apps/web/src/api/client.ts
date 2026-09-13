@@ -1,10 +1,13 @@
 import type {
+  AnswerRequest,
+  AnswerResponse,
   ApiErrorBody,
   GlossaryTerm,
   Job,
   KnowledgeGap,
   KnowledgeOverview,
   KnowledgeRun,
+  KnowledgeVersion,
   ListResponse,
   Material,
   MaterialPage,
@@ -20,7 +23,14 @@ import type {
   ResearchProviderState,
   ResearchQueryRecord,
   ResearchSource,
+  RetrievalProviderState,
+  SearchRequest,
+  SearchResponse,
   SessionResponse,
+  ValidationOverview,
+  ValidationRun,
+  VersionClaim,
+  VersionGap,
 } from './types'
 
 /** Server-side limit per docs/implementation-contract.md ("До 25 MiB на файл"). */
@@ -390,6 +400,128 @@ export function stopResearch(
     researchPath(partnerId, `/plans/${encodeURIComponent(planId)}/stop`),
     { method: 'POST', csrfToken },
   )
+}
+
+// --- Knowledge versions, search and answers (phase 1E) ---------------------
+
+function versionsPath(partnerId: string, suffix = ''): string {
+  return `/partners/${encodeURIComponent(partnerId)}/versions${suffix}`
+}
+
+function retrievalPath(partnerId: string, suffix: string): string {
+  return `/partners/${encodeURIComponent(partnerId)}/retrieval${suffix}`
+}
+
+/**
+ * What this installation can do with published knowledge.
+ *
+ * Not partner data: it describes the machine. Note what it does *not* gate —
+ * checking and publishing are deterministic and need no model at all. The
+ * adapters here decide only two optional halves: prose answers, and the vector
+ * side of search. No key is ever returned; only the host that would be called.
+ */
+export function fetchRetrievalProvider(): Promise<RetrievalProviderState> {
+  return apiRequest<RetrievalProviderState>('/retrieval/provider')
+}
+
+export function fetchValidationOverview(partnerId: string): Promise<ValidationOverview> {
+  return apiRequest<ValidationOverview>(`/partners/${encodeURIComponent(partnerId)}/validation`)
+}
+
+export async function listVersions(partnerId: string): Promise<KnowledgeVersion[]> {
+  const res = await apiRequest<ListResponse<KnowledgeVersion>>(versionsPath(partnerId))
+  return res.items
+}
+
+export function fetchVersion(partnerId: string, versionId: string): Promise<KnowledgeVersion> {
+  return apiRequest<KnowledgeVersion>(
+    versionsPath(partnerId, `/${encodeURIComponent(versionId)}`),
+  )
+}
+
+export async function listVersionClaims(
+  partnerId: string,
+  versionId: string,
+): Promise<VersionClaim[]> {
+  const res = await apiRequest<ListResponse<VersionClaim>>(
+    versionsPath(partnerId, `/${encodeURIComponent(versionId)}/claims`),
+  )
+  return res.items
+}
+
+export async function listVersionGaps(
+  partnerId: string,
+  versionId: string,
+): Promise<VersionGap[]> {
+  const res = await apiRequest<ListResponse<VersionGap>>(
+    versionsPath(partnerId, `/${encodeURIComponent(versionId)}/gaps`),
+  )
+  return res.items
+}
+
+/**
+ * Queue the deterministic check over every candidate this partner has.
+ *
+ * Idempotent server-side: while a run is queued or running this returns that same
+ * run. A 409 means the partner has no candidates at all — the caller shows that
+ * reason rather than a generic failure.
+ */
+export function startValidation(partnerId: string, csrfToken: string): Promise<ValidationRun> {
+  return apiRequest<ValidationRun>(`/partners/${encodeURIComponent(partnerId)}/validate`, {
+    method: 'POST',
+    csrfToken,
+  })
+}
+
+/**
+ * Withdraw a published version, with a stated reason.
+ *
+ * `reason` is required by the contract (1–1000 characters) for one reason: a
+ * withdrawal without a reason cannot be told apart from a malfunction. A 409
+ * means the version was not `published` when the request arrived.
+ */
+export function retractVersion(
+  partnerId: string,
+  versionId: string,
+  reason: string,
+  csrfToken: string,
+): Promise<KnowledgeVersion> {
+  return apiRequest<KnowledgeVersion>(
+    versionsPath(partnerId, `/${encodeURIComponent(versionId)}/retract`),
+    { method: 'POST', body: { reason }, csrfToken },
+  )
+}
+
+/**
+ * Search inside **one published version**. A 1C/1D draft is not visible here.
+ *
+ * POST, and therefore CSRF-protected, because the request carries the text
+ * somebody typed: a question does not belong in a URL, in a server log or in
+ * browser history.
+ */
+export function searchPublished(
+  partnerId: string,
+  body: SearchRequest,
+  csrfToken: string,
+): Promise<SearchResponse> {
+  return apiRequest<SearchResponse>(retrievalPath(partnerId, '/search'), {
+    method: 'POST',
+    body,
+    csrfToken,
+  })
+}
+
+/** Ask inside one published version. POST for the same reason as the search. */
+export function askPublished(
+  partnerId: string,
+  body: AnswerRequest,
+  csrfToken: string,
+): Promise<AnswerResponse> {
+  return apiRequest<AnswerResponse>(retrievalPath(partnerId, '/answer'), {
+    method: 'POST',
+    body,
+    csrfToken,
+  })
 }
 
 // --- Jobs --------------------------------------------------------------

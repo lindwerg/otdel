@@ -9,7 +9,10 @@
 //! originals ([`extraction`]); phase 1C adds the structured product knowledge drafted
 //! from those pages ([`knowledge`]) and the configuration of the model adapter that
 //! drafts it ([`llm_config`]); phase 1D adds bounded industry research over external
-//! sources ([`research`]) and the configuration that bounds it ([`research_config`]).
+//! sources ([`research`]) and the configuration that bounds it ([`research_config`]);
+//! phase 1E adds verification, the immutable published version and the search over it
+//! ([`publication`]), with the optional embedding adapter and the bounds on reading it
+//! ([`retrieval_config`]).
 
 pub mod config;
 pub mod error;
@@ -19,8 +22,10 @@ pub mod knowledge;
 pub mod llm_config;
 pub mod media;
 pub mod model;
+pub mod publication;
 pub mod research;
 pub mod research_config;
+pub mod retrieval_config;
 pub mod secret;
 pub mod validate;
 

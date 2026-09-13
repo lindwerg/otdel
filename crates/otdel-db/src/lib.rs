@@ -18,8 +18,11 @@ pub mod knowledge_read;
 pub mod materials;
 pub mod pages;
 pub mod partners;
+pub mod publication;
+pub mod publication_read;
 pub mod research;
 pub mod research_read;
+pub mod retrieval;
 pub mod sessions;
 pub mod tenancy;
 
@@ -47,7 +50,7 @@ const MIGRATION_SEARCH_PATH: &str = "public";
 /// Tenant tables whose row-level security is verified before the server serves a
 /// request. Grows with the schema: 1A intake, 1B page evidence, 1C product draft,
 /// 1D research money and external sources.
-const TENANT_TABLES: [&str; 22] = [
+const TENANT_TABLES: [&str; 29] = [
     "partners",
     "materials",
     "jobs",
@@ -70,6 +73,13 @@ const TENANT_TABLES: [&str; 22] = [
     "research_findings",
     "research_evidence",
     "research_spend",
+    "validation_runs",
+    "knowledge_versions",
+    "version_claims",
+    "version_evidence",
+    "version_gaps",
+    "version_readiness",
+    "version_chunks",
 ];
 
 #[derive(Debug, Clone)]

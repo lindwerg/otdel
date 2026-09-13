@@ -35,7 +35,9 @@ use otdel_core::config::Config;
 use otdel_db::Database;
 use otdel_extract::ToolAvailability;
 use otdel_storage::{FilesystemObjectStore, ObjectStore};
-use otdel_worker::{KnowledgeWorker, Maintenance, MaintenanceSettings, ResearchWorker};
+use otdel_worker::{
+    KnowledgeWorker, Maintenance, MaintenanceSettings, ResearchWorker, ValidationWorker,
+};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -47,6 +49,10 @@ const MAX_KNOWLEDGE_JOBS_PER_PASS: u32 = 4;
 /// Research plans taken in one pass. Lower again: each one can search, download several
 /// pages and call a model, and each one spends real money.
 const MAX_RESEARCH_JOBS_PER_PASS: u32 = 2;
+/// Partner checks taken in one pass. One: a check reads every candidate a partner has,
+/// re-locates every citation and writes a whole version, so a pass stays short enough to
+/// be stopped between jobs rather than inside one.
+const MAX_VALIDATION_JOBS_PER_PASS: u32 = 1;
 /// How often the recovery half runs while the worker is up.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
 
@@ -61,9 +67,11 @@ async fn main() -> ExitCode {
         "-h" | "--help" | "help" => {
             eprintln!(
                 "usage: otdel-worker [run|once|probe]\n\n\
-                 run   — extraction + understanding + maintenance until SIGINT/SIGTERM (default)\n\
+                 run   — extraction + understanding + research + verification + \
+                 maintenance until SIGINT/SIGTERM (default)\n\
                  once  — one pass of each, then exit\n\
-                 probe — report OCR/rasteriser and model adapter availability, then exit\n\n\
+                 probe — report OCR/rasteriser, model and embedding adapter \
+                 availability, then exit\n\n\
                  Extraction reads queued materials page by page. Pages without a usable\n\
                  text layer are recognised when an engine is installed, and recorded as\n\
                  `needs_ocr` with the reason when it is not.\n\
@@ -73,7 +81,14 @@ async fn main() -> ExitCode {
                  Research answers approved industry questions from external sources,\n\
                  within a budget and a declared host allowlist. Without a configured\n\
                  search endpoint, allowlist and model, nothing leaves this machine and\n\
-                 no money is reserved: each plan is recorded as `needs_provider`."
+                 no money is reserved: each plan is recorded as `needs_provider`.\n\
+                 Verification re-checks every candidate against the source text as it is\n\
+                 stored now, freezes what survives into an immutable version and publishes\n\
+                 it when the readiness rules pass. This half needs nothing configured: the\n\
+                 rules are deterministic. A model, when there is one, may only lower a\n\
+                 verdict; an embedding provider, when there is one, adds the semantic half\n\
+                 of search. Without either, knowledge is still checked, published and\n\
+                 searchable by exact value and text."
             );
             Ok(())
         }
@@ -125,6 +140,14 @@ async fn run(mode: Mode) -> Result<()> {
     let (search, fetcher) = otdel_worker::build_research_adapters(&config);
     report_research(&search.describe(), &fetcher.describe());
 
+    // The embedding adapter, described for the same reason — with one difference worth
+    // stating out loud, because it is the opposite of the three above: its absence stops
+    // nothing. Verification and publication are deterministic, so knowledge is checked
+    // and published either way; what is missing without it is the semantic half of
+    // search.
+    let embeddings = otdel_worker::build_embedding_provider(&config);
+    report_embeddings(&embeddings.describe());
+
     if mode == Mode::Probe {
         return Ok(());
     }
@@ -170,6 +193,12 @@ async fn run(mode: Mode) -> Result<()> {
         Arc::clone(&fetcher),
         Arc::clone(&provider),
     );
+    let validation = ValidationWorker::new(
+        Arc::clone(&config),
+        db.clone(),
+        Arc::clone(&provider),
+        Arc::clone(&embeddings),
+    );
     let maintenance = Maintenance::new(
         Arc::clone(&config),
         db.clone(),
@@ -190,6 +219,10 @@ async fn run(mode: Mode) -> Result<()> {
             .run_pass(bureau_id, MAX_RESEARCH_JOBS_PER_PASS)
             .await
             .context("research pass")?;
+        let checked = validation
+            .run_pass(bureau_id, MAX_VALIDATION_JOBS_PER_PASS)
+            .await
+            .context("validation pass")?;
         let recovery = maintenance.run_once().await.context("maintenance pass")?;
         println!(
             "jobs_claimed={} jobs_completed={} jobs_failed={} pages_read={} \
@@ -200,8 +233,11 @@ async fn run(mode: Mode) -> Result<()> {
              research_queries={} research_sources_fetched={} research_findings={} \
              research_findings_rejected={} plans_awaiting_provider={} \
              plans_budget_exhausted={} research_micros_spent={} \
+             validation_jobs_claimed={} validation_jobs_completed={} \
+             validation_jobs_failed={} versions_published={} versions_blocked={} \
+             claims_checked={} claims_rejected={} chunks_embedded={} \
              sessions_purged={} leases_reclaimed={} stalled_runs_settled={} \
-             stalled_plans_settled={} reservations_released={} \
+             stalled_plans_settled={} stalled_checks_settled={} reservations_released={} \
              staging_files_removed={} \
              objects_scanned={} orphan_objects={} scan_truncated={}",
             extraction.jobs_claimed,
@@ -227,10 +263,19 @@ async fn run(mode: Mode) -> Result<()> {
             researched.plans_awaiting_provider,
             researched.plans_budget_exhausted,
             researched.micros_spent,
+            checked.jobs_claimed,
+            checked.jobs_completed,
+            checked.jobs_failed,
+            checked.versions_published,
+            checked.versions_blocked,
+            checked.claims_checked,
+            checked.claims_rejected,
+            checked.chunks_embedded,
             recovery.sessions_purged,
             recovery.leases_reclaimed,
             recovery.stalled_runs_settled,
             recovery.stalled_plans_settled,
+            recovery.stalled_checks_settled,
             recovery.reservations_released,
             recovery.staging_files_removed,
             recovery.objects_scanned,
@@ -250,6 +295,7 @@ async fn run(mode: Mode) -> Result<()> {
         extractor,
         knowledge,
         research,
+        validation,
         maintenance,
         bureau_id,
         config.extraction.poll_interval,
@@ -263,6 +309,7 @@ async fn serve(
     extractor: otdel_worker::Extractor,
     knowledge: KnowledgeWorker,
     research: ResearchWorker,
+    validation: ValidationWorker,
     maintenance: Maintenance,
     bureau_id: uuid::Uuid,
     poll_interval: Duration,
@@ -330,6 +377,22 @@ async fn serve(
                     Err(error) => warn!(error = %error, "research pass failed"),
                 }
 
+                match validation.run_pass(bureau_id, MAX_VALIDATION_JOBS_PER_PASS).await {
+                    Ok(report) if report.jobs_claimed > 0 => info!(
+                        jobs_claimed = report.jobs_claimed,
+                        jobs_completed = report.jobs_completed,
+                        jobs_failed = report.jobs_failed,
+                        versions_published = report.versions_published,
+                        versions_blocked = report.versions_blocked,
+                        claims_checked = report.claims_checked,
+                        claims_rejected = report.claims_rejected,
+                        chunks_embedded = report.chunks_embedded,
+                        "verification pass finished"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => warn!(error = %error, "verification pass failed"),
+                }
+
                 if last_maintenance.elapsed() >= MAINTENANCE_INTERVAL {
                     last_maintenance = Instant::now();
                     match maintenance.run_once().await {
@@ -374,6 +437,29 @@ fn report_tools(tools: &otdel_worker::ToolReport) {
             "page rasteriser unavailable: PDF pages cannot be rendered for recognition"
         ),
     }
+}
+
+/// Say plainly what the embedding adapter changes, and — more importantly — what it does
+/// not.
+fn report_embeddings(description: &otdel_embed::EmbeddingDescription) {
+    if description.is_ready() {
+        info!(
+            provider = %description.provider,
+            model = %description.model,
+            endpoint_host = description.endpoint_host.clone().unwrap_or_default(),
+            "embedding adapter ready: published versions will carry vectors and search is hybrid"
+        );
+        return;
+    }
+
+    warn!(
+        state = description.state,
+        missing = ?description.missing,
+        "embedding adapter not configured: knowledge is still checked and published as \
+         usual — those rules are deterministic. Only the semantic half of search is \
+         absent; no pseudo-vector is created, and search reports `keyword` mode with the \
+         reason"
+    );
 }
 
 /// Say plainly whether the product role can run on this machine.

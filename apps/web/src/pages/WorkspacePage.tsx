@@ -7,16 +7,18 @@ import { KnowledgePanel } from '../components/knowledge/KnowledgePanel'
 import { MaterialsPanel } from '../components/MaterialsPanel'
 import { PartnerFormDialog } from '../components/PartnerFormDialog'
 import { PartnerSidebar } from '../components/PartnerSidebar'
+import { PublicationPanel } from '../components/publication/PublicationPanel'
 import { ResearchPanel } from '../components/research/ResearchPanel'
 import { StatusMessage } from '../components/StatusMessage'
 
-/** Sections of the partner card that exist today. Knowledge is phase 1C and
- *  research phase 1D; versions and history arrive with 1E/1F and are deliberately
- *  absent rather than stubbed. */
+/** Sections of the partner card that exist today. Knowledge is phase 1C,
+ *  research 1D and published versions 1E; updates and acceptance arrive with 1F
+ *  and are deliberately absent rather than stubbed. */
 const TABS = [
   { id: 'materials', label: 'Материалы' },
   { id: 'knowledge', label: 'Знания' },
   { id: 'research', label: 'Исследование' },
+  { id: 'published', label: 'Версии и поиск' },
 ] as const
 
 type TabId = (typeof TABS)[number]['id']
@@ -234,8 +236,10 @@ export function WorkspacePage() {
                 <MaterialsPanel key={selectedPartner.id} partnerId={selectedPartner.id} partnerName={selectedPartner.name} />
               ) : activeTab === 'knowledge' ? (
                 <KnowledgePanel key={selectedPartner.id} partnerId={selectedPartner.id} />
-              ) : (
+              ) : activeTab === 'research' ? (
                 <ResearchPanel key={selectedPartner.id} partnerId={selectedPartner.id} />
+              ) : (
+                <PublicationPanel key={selectedPartner.id} partnerId={selectedPartner.id} />
               )}
             </>
           ) : null}

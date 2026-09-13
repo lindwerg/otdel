@@ -18,6 +18,7 @@ use crate::error::AppError;
 use crate::extraction_config::ExtractionSettings;
 use crate::llm_config::LlmSettings;
 use crate::research_config::ResearchSettings;
+use crate::retrieval_config::RetrievalSettings;
 use crate::secret;
 
 /// Lower bound shared by the session TTL and the idle timeout.
@@ -98,6 +99,11 @@ pub struct Config {
     /// allowlist this stays in the "needs configuration" state and nothing leaves the
     /// machine.
     pub research: ResearchSettings,
+    /// Phase 1E: the optional embedding adapter and the bounds on reading the published
+    /// version. Verification and publication need none of it — they are deterministic —
+    /// so an unconfigured embedding adapter means search runs keyword-only and says so,
+    /// not that knowledge stops being published.
+    pub retrieval: RetrievalSettings,
 }
 
 impl fmt::Debug for Config {
@@ -131,6 +137,7 @@ impl fmt::Debug for Config {
             .field("llm", &self.llm)
             // ResearchSettings redacts its own key for the same reason.
             .field("research", &self.research)
+            .field("retrieval", &self.retrieval)
             .finish()
     }
 }
@@ -298,6 +305,7 @@ impl Config {
         let extraction = ExtractionSettings::load(source)?;
         let llm = LlmSettings::load(source)?;
         let research = ResearchSettings::load(source)?;
+        let retrieval = RetrievalSettings::load(source)?;
 
         Ok(Self {
             env,
@@ -319,6 +327,7 @@ impl Config {
             extraction,
             llm,
             research,
+            retrieval,
         })
     }
 

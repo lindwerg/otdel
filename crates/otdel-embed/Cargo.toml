@@ -1,0 +1,28 @@
+[package]
+name = "otdel-embed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Embedding adapter of OTDEL phase 1E: one OpenAI-compatible /embeddings client, bounded batches, a body read with a real ceiling, redacted logs — and an honest 'not configured' state that reaches no network and never produces a pseudo-vector."
+
+[features]
+# A scripted in-process provider for tests. Off by default so nothing test-shaped can end
+# up in a production build and hand out vectors as if a service had been called.
+fake = []
+
+[dependencies]
+otdel-core.workspace = true
+
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+otdel-embed = { workspace = true, features = ["fake"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

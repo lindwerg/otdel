@@ -11,7 +11,10 @@ pub mod knowledge;
 pub mod materials;
 pub mod pages;
 pub mod partners;
+pub mod publication;
 pub mod research;
+pub mod retrieval;
+pub mod retrieval_state;
 pub mod session;
 
 use axum::extract::DefaultBodyLimit;
@@ -123,6 +126,45 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/partners/{partner_id}/research/questions/{question_id}/plan",
             post(research::approve),
+        )
+        // Phase 1E: the check, the immutable versions it produces, and reading them.
+        // Verification and publication need no adapter at all — `/retrieval/provider`
+        // describes only the two optional halves (vectors, prose answers).
+        .route("/retrieval/provider", get(retrieval::provider))
+        .route(
+            "/partners/{partner_id}/validation",
+            get(publication::overview),
+        )
+        .route(
+            "/partners/{partner_id}/validate",
+            post(publication::validate),
+        )
+        .route("/partners/{partner_id}/versions", get(publication::list))
+        .route(
+            "/partners/{partner_id}/versions/{version_id}",
+            get(publication::get),
+        )
+        .route(
+            "/partners/{partner_id}/versions/{version_id}/claims",
+            get(publication::claims),
+        )
+        .route(
+            "/partners/{partner_id}/versions/{version_id}/gaps",
+            get(publication::gaps),
+        )
+        .route(
+            "/partners/{partner_id}/versions/{version_id}/retract",
+            post(publication::retract),
+        )
+        // Search and answering are POST because the request carries the text of a
+        // question. A question does not belong in a URL, a log or a browser history.
+        .route(
+            "/partners/{partner_id}/retrieval/search",
+            post(retrieval::search),
+        )
+        .route(
+            "/partners/{partner_id}/retrieval/answer",
+            post(retrieval::ask),
         )
         .route("/partners/{partner_id}/jobs", get(jobs::list))
         .layer(DefaultBodyLimit::max(upload_limit));

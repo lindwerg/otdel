@@ -5,13 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "HTTP API of OTDEL block 1: sessions, partners, material intake, page evidence (1B) and the product knowledge draft (1C)."
+description = "HTTP API of OTDEL block 1: sessions, partners, material intake, page evidence (1B), the product knowledge draft (1C), bounded industry research (1D) and the published knowledge version with its search and answers (1E)."
 
 [dependencies]
 otdel-core.workspace = true
 otdel-db.workspace = true
 otdel-knowledge.workspace = true
+otdel-embed.workspace = true
 otdel-llm.workspace = true
+otdel-publish.workspace = true
 otdel-research.workspace = true
 otdel-search.workspace = true
 otdel-storage.workspace = true
@@ -38,6 +40,9 @@ otdel-llm = { workspace = true, features = ["fake"] }
 # fetcher, so the budget, the source journal and the citation checks run for real while
 # nothing leaves the machine and nothing is paid for.
 otdel-search = { workspace = true, features = ["fake"] }
+# The 1E suites drive the hybrid search with scripted vectors, so the vector half runs
+# against a real pgvector column without a key and without a network.
+otdel-embed = { workspace = true, features = ["fake"] }
 otdel-worker.workspace = true
 
 async-trait.workspace = true

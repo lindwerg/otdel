@@ -65,8 +65,13 @@ export interface Material {
 
 export interface Job {
   id: string
+  /**
+   * `null` for a `validate_partner` job, which is about the partner rather than about
+   * one document. Every other kind names its material, and the database ties the two
+   * together.
+   */
+  material_id: string | null
   partner_id: string
-  material_id: string
   page_number: number | null
   kind: string
   status: string
@@ -598,6 +603,387 @@ export interface ResearchOverview {
   summary: ResearchSummary
   plans: ResearchPlan[]
   questions: IndustryQuestion[]
+}
+
+// --- Phase 1E: checked knowledge versions, search and answers ---------------
+
+/**
+ * State of the deterministic half of 1E.
+ *
+ * It has no `state` field on purpose (`implementation-contract.md`, 1E): checking
+ * and publishing are rule-based and cannot be switched off, so there is nothing
+ * for a state to say. A shape with a `state: 'ready'` here would invite the
+ * reading that verification, too, depends on a configured model.
+ */
+export interface ValidationModeView {
+  mode: 'deterministic'
+  message: string
+}
+
+/** One optional adapter — the same shape 1D uses. Never carries a key. */
+export interface AdapterView {
+  state: 'ready' | 'needs_configuration' | 'disabled'
+  provider: string
+  endpoint_host: string | null
+  model: string | null
+  message: string
+}
+
+/**
+ * Whether vectors exist at all.
+ *
+ * `extension_missing` is not a bug and not something the migration can repair:
+ * `vector` is not a trusted extension and the migration role is not superuser.
+ * `no_embeddings` means the extension is there and nothing is being computed,
+ * because no embedding provider is configured. Both are named states, and in
+ * both search still works on keywords.
+ */
+export interface VectorView {
+  state: 'ready' | 'no_embeddings' | 'extension_missing'
+  profile: string | null
+  message: string
+}
+
+/** Bounds of one search or answer, stated before anything is asked. */
+export interface RetrievalLimits {
+  max_query_chars: number
+  max_results: number
+  max_answer_claims: number
+  max_answer_chars: number
+  chunk_max_chars: number
+  /** `null` until an embedding provider is configured: there is no dimension to
+   *  state, and stating one anyway would describe vectors nobody is computing. */
+}
+
+/**
+ * The *actual* retrieval mode of the installation, not the intended one.
+ *
+ * Deliberately a separate union from `SearchMode`: the installation says
+ * `keyword_only`, one response says `keyword`. The contract spells them
+ * differently and this file mirrors the wire, so neither value is silently
+ * translated into the other.
+ */
+export type RetrievalSearchMode = 'hybrid' | 'keyword_only'
+
+export interface RetrievalProviderState {
+  state: 'ready' | 'needs_configuration' | 'disabled'
+  validation: ValidationModeView
+  embedding: AdapterView
+  answer: AdapterView
+  vector: VectorView
+  search_mode: RetrievalSearchMode
+  /** Environment variables the owner still has to set. */
+  missing: string[]
+  limits: RetrievalLimits
+  message: string
+}
+
+/**
+ * Status of one immutable knowledge version.
+ *
+ * `blocked` is the one that must not be read as a failure: the readiness rules
+ * were not met, so the version exists as the record of a check and is **not**
+ * published. `superseded` and `revoked` are settled outcomes too — a version
+ * that was once pinned stays readable, which is the whole point of pinning.
+ */
+export type VersionStatus =
+  | 'draft'
+  | 'validating'
+  | 'published'
+  | 'blocked'
+  | 'superseded'
+  | 'revoked'
+
+/** Readiness is decided separately for these four, and for nothing else. */
+export type ReadinessTopic =
+  | 'product_description'
+  | 'audience_hypotheses'
+  | 'characteristic_answers'
+  | 'commercial_answers'
+
+/** `limited` means answering is possible with stated caveats — not "almost ready". */
+export type ReadinessState = 'ready' | 'limited' | 'blocked'
+
+/**
+ * Readiness of one topic.
+ *
+ * Readiness is the **availability of knowledge**, never a permission to send
+ * anything, to promise compatibility or to take on an obligation. `reason` says
+ * in words what the state means here, and the interface shows it as-is.
+ */
+export interface ReadinessEntry {
+  topic: ReadinessTopic
+  state: ReadinessState
+  reason: string
+}
+
+export interface KnowledgeVersion {
+  id: string
+  partner_id: string
+  /** Partner's own sequence, from 1. It grows and is never reused. */
+  number: number
+  status: VersionStatus
+  validation_run_id: string | null
+  /** Which candidates, at which revisions, went in. A late run with an older
+   *  fingerprint than the published one is not published. */
+  input_fingerprint: string
+  claims_total: number
+  claims_source_supported: number
+  claims_hypothesis: number
+  claims_unknown: number
+  claims_conflicted: number
+  claims_stale: number
+  gaps_open: number
+  chunks_total: number
+  chunks_embedded: number
+  embedding_profile: string | null
+  readiness: ReadinessEntry[]
+  /** Why this version was not published, in the server's own words. Shown as-is. */
+  blocked_reasons: string[]
+  created_at: string
+  published_at: string | null
+  superseded_at: string | null
+  revoked_at: string | null
+  /** Mandatory on retraction: a withdrawal without a reason is indistinguishable
+   *  from a malfunction. */
+  revoked_reason: string | null
+}
+
+/**
+ * Verdict of the deterministic check on one statement.
+ *
+ * `source_supported` means **the cited source says so** — not that a manufacturer
+ * confirmed it and not that it is true (`block-01-spec.md` §6.7). Everything else
+ * is explicitly not confirmed by its source, and the interface must show that.
+ */
+export type ClaimStatus =
+  | 'source_supported'
+  | 'hypothesis'
+  | 'unknown'
+  | 'conflicted'
+  | 'stale'
+
+/** Which candidate this snapshot was taken from: a 1C fact or a 1D conclusion. */
+export type ClaimOrigin = 'partner_material' | 'industry_research'
+
+/** An industry statement stays industry-wide inside a version, and has no product. */
+export type ClaimScope = 'partner' | 'industry'
+
+export type EvidenceSourceKind = 'material' | 'external'
+
+/**
+ * A quotation **copied into the version** at publication time.
+ *
+ * The snapshot does not point at page text that could be re-read and changed;
+ * `quote` is the fragment as it was. Fields of the other `source_kind` are null:
+ * a material citation has no `url`, an external one has no page number.
+ */
+export interface VersionEvidence {
+  id: string
+  claim_id: string
+  source_kind: EvidenceSourceKind
+  material_id: string | null
+  material_filename: string | null
+  page_number: number | null
+  region_id: string | null
+  url: string | null
+  host: string | null
+  retrieved_at: string | null
+  content_hash: string | null
+  quote: string
+  char_start: number
+  char_end: number
+}
+
+export interface VersionClaim {
+  id: string
+  version_id: string
+  origin: ClaimOrigin
+  /** The candidate this came from — traceability only. Deleting the candidate
+   *  does not change the published version. */
+  origin_id: string
+  scope: ClaimScope
+  product_name: string | null
+  /** The same four kinds phase 1C drafts with — a version does not invent new ones. */
+  kind: FactKind
+  status: ClaimStatus
+  attribute: string
+  /** The value exactly as the source writes it. Never reformatted. */
+  value_text: string
+  unit: string | null
+  conditions: string | null
+  /** The model's own words. Shown as explicitly not a quotation. */
+  model_context: string | null
+  /** Why the verdict is what it is, in words. Shown as-is when present. */
+  check_note: string | null
+  evidence: VersionEvidence[]
+  created_at: string
+}
+
+export interface VersionGap {
+  id: string
+  version_id: string
+  origin_id: string
+  product_name: string | null
+  topic: string
+  missing: string
+  blocks: string | null
+  /** Which of the four readiness topics this gap limits. */
+  blocks_topics: ReadinessTopic[]
+  created_at: string
+}
+
+/**
+ * Status of one check.
+ *
+ * There is deliberately no `needs_provider` here: the check is deterministic and
+ * does not depend on a model at all.
+ */
+export type ValidationRunStatus = 'queued' | 'running' | 'completed' | 'partial' | 'failed'
+
+export interface ValidationRun {
+  id: string
+  partner_id: string
+  status: ValidationRunStatus
+  prompt_profile: string
+  version_id: string | null
+  version_number: number | null
+  claims_considered: number
+  claims_source_supported: number
+  claims_hypothesis: number
+  claims_unknown: number
+  claims_conflicted: number
+  claims_stale: number
+  claims_rejected: number
+  gaps_carried: number
+  chunks_created: number
+  chunks_embedded: number
+  /** How many statements got a model's second opinion. `0` is the normal state
+   *  without a key and does not lower the run's status. */
+  model_reviewed: number
+  /** Whether this run published a version. `false` whenever `blocked_reasons` is non-empty. */
+  published: boolean
+  /** Why candidates were refused, in the server's own words. Shown as-is. */
+  rejections: string[]
+  blocked_reasons: string[]
+  diagnostic: string | null
+  started_at: string | null
+  finished_at: string | null
+  created_at: string
+}
+
+/** How many candidates the partner has right now, so the interface never offers
+ *  a check where there is nothing to check. */
+export interface CandidateSummary {
+  facts: number
+  findings: number
+  gaps_open: number
+  materials_drafted: number
+}
+
+export interface ValidationOverview {
+  provider: RetrievalProviderState
+  published: KnowledgeVersion | null
+  runs: ValidationRun[]
+  versions: KnowledgeVersion[]
+  candidates: CandidateSummary
+}
+
+/** The version one answer is pinned to. Results never mix two versions. */
+export interface VersionRef {
+  id: string
+  number: number
+  status: VersionStatus
+  published_at: string | null
+}
+
+/** Why one statement was found. Never empty. */
+export type MatchKind = 'exact' | 'keyword' | 'vector'
+
+/** The mode one response actually ran in. See `RetrievalSearchMode`. */
+export type SearchMode = 'hybrid' | 'keyword'
+
+/**
+ * `no_published_version` is not an error and not an empty result: the partner has
+ * nothing published, because no check ran, the check was blocked, or the version
+ * was retracted. It is a named state.
+ */
+export type SearchState = 'ok' | 'no_published_version' | 'insufficient_evidence'
+
+export interface SearchHit {
+  claim: VersionClaim
+  /** Comparability inside this one response — not a probability and not a percentage. */
+  score: number
+  matched_by: MatchKind[]
+}
+
+export interface SearchResponse {
+  state: SearchState
+  version: VersionRef | null
+  mode: SearchMode
+  /** Why the mode is not the full one, in words. Shown as-is. */
+  degraded: string[]
+  items: SearchHit[]
+  gaps: VersionGap[]
+  message: string
+}
+
+/**
+ * `evidence_only` — statements with citations exist, prose does not, because the
+ * model is not configured or its answer failed the citation check.
+ * `insufficient_evidence` — the version exists and holds nothing suitable; no
+ * guess is substituted (`block-01-spec.md` §13.5).
+ */
+export type AnswerState =
+  | 'answered'
+  | 'evidence_only'
+  | 'insufficient_evidence'
+  | 'no_published_version'
+
+export interface AnswerResponse {
+  state: AnswerState
+  version: VersionRef | null
+  mode: SearchMode
+  degraded: string[]
+  /** `null` in every state except `answered`. */
+  text: string | null
+  /** `true` whenever `text` is not null: prose is the model's wording, not a
+   *  quotation, and the interface is obliged to mark it. */
+  answer_is_model_context: boolean
+  claims: VersionClaim[]
+  citations: VersionEvidence[]
+  conditions: string[]
+  gaps: VersionGap[]
+  readiness: ReadinessEntry[]
+  /** Caveats in words: limited readiness, a `conflicted` statement among the
+   *  findings, a `stale` source. Shown as-is. */
+  limitations: string[]
+  rejections: string[]
+  message: string
+}
+
+/**
+ * Body of a search request.
+ *
+ * Optional members are genuinely absent rather than `null` — this is a request
+ * body, where an omitted key means "server decides" (current published version,
+ * default limit), which is not the same thing as sending an explicit null.
+ */
+export interface SearchRequest {
+  query: string
+  version_id?: string
+  /**
+   * Product *name*, not an id. Compared in folded form, so case and spacing do not
+   * matter. The server validates this body strictly, so a field that is not here is a
+   * 400 rather than a filter that is quietly ignored.
+   */
+  product?: string
+  limit?: number
+}
+
+export interface AnswerRequest {
+  question: string
+  version_id?: string
 }
 
 export interface ApiErrorBody {

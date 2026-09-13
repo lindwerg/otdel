@@ -36,6 +36,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::error::WorkerError;
+use crate::material_of;
 use crate::pagemap;
 use crate::workspace::{original_file_name, JobWorkspace};
 
@@ -141,7 +142,7 @@ impl Extractor {
                 Err(error) => {
                     warn!(
                         job_id = %job.id,
-                        material_id = %job.material_id,
+                        material_id = ?job.material_id,
                         permanent = error.is_permanent(),
                         error = %error,
                         "extraction job failed"
@@ -229,8 +230,9 @@ impl Extractor {
         bureau_id: Uuid,
         job: &Job,
     ) -> Result<StoredMaterial, WorkerError> {
+        let material_id = material_of(job)?;
         let mut tx = self.db.begin_scoped(bureau_id).await?;
-        let stored = materials::get_in_partner(&mut tx, job.partner_id, job.material_id).await?;
+        let stored = materials::get_in_partner(&mut tx, job.partner_id, material_id).await?;
         tx.commit().await?;
         stored.ok_or(WorkerError::MaterialMissing)
     }
@@ -477,10 +479,10 @@ impl Extractor {
         job: &Job,
         failure: Option<&str>,
     ) -> Result<(), WorkerError> {
+        let material_id = material_of(job)?;
         let mut tx = self.db.begin_scoped(bureau_id).await?;
         let material =
-            materials::get_in_partner_with_extraction(&mut tx, job.partner_id, job.material_id)
-                .await?;
+            materials::get_in_partner_with_extraction(&mut tx, job.partner_id, material_id).await?;
 
         let summary = material
             .as_ref()
@@ -497,7 +499,7 @@ impl Extractor {
 
         materials::finish_extraction(
             &mut tx,
-            job.material_id,
+            material_id,
             status,
             failure.or(summary.diagnostic.as_deref()),
             engine,
@@ -511,23 +513,23 @@ impl Extractor {
         // draft of the same material.
         let readable = summary.pages_extracted + summary.pages_partial > 0;
         if failure.is_none() && readable {
-            if jobs::understanding_pending(&mut tx, job.material_id).await? {
+            if jobs::understanding_pending(&mut tx, material_id).await? {
                 info!(
-                    material_id = %job.material_id,
+                    material_id = %material_id,
                     "understanding of this material is already queued; not queueing again"
                 );
             } else {
                 let queued =
-                    jobs::enqueue_understanding(&mut tx, job.partner_id, job.material_id).await?;
+                    jobs::enqueue_understanding(&mut tx, job.partner_id, material_id).await?;
                 otdel_db::knowledge::enqueue_run(
                     &mut tx,
                     job.partner_id,
-                    job.material_id,
+                    material_id,
                     otdel_knowledge::PROMPT_PROFILE,
                 )
                 .await?;
                 info!(
-                    material_id = %job.material_id,
+                    material_id = %material_id,
                     job_id = %queued.id,
                     "material queued for product understanding"
                 );
@@ -537,7 +539,7 @@ impl Extractor {
         tx.commit().await?;
 
         info!(
-            material_id = %job.material_id,
+            material_id = %material_id,
             status = status.as_str(),
             pages_total = summary.pages_total,
             pages_extracted = summary.pages_extracted,

@@ -13,6 +13,7 @@ base64.workspace = true
 chrono.workspace = true
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde.workspace = true
+tracing.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true

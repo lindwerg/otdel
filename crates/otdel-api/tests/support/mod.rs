@@ -676,6 +676,74 @@ impl TestApp {
         )
     }
 
+    /// Start with the phase 1E adapters replaced.
+    ///
+    /// Both are optional in production and both are optional here, which is the property
+    /// worth exercising: a suite that passes the unconfigured ones still gets a checked,
+    /// published, searchable version — only the vector half and the prose answer are
+    /// missing, and the response says so.
+    pub async fn start_with_retrieval(
+        llm: Arc<dyn LlmProvider>,
+        embeddings: Arc<dyn otdel_embed::EmbeddingProvider>,
+    ) -> Self {
+        let app = Self::start_with_settings(ResearchOverrides::default()).await;
+        let state = app
+            .state
+            .clone()
+            .with_provider(llm)
+            .with_embeddings(embeddings);
+        let router = otdel_api::app(state.clone());
+        Self {
+            router,
+            state,
+            ..app
+        }
+    }
+
+    /// The phase 1E worker, with the supplied optional adapters.
+    pub fn validation_worker(
+        &self,
+        llm: Arc<dyn LlmProvider>,
+        embeddings: Arc<dyn otdel_embed::EmbeddingProvider>,
+    ) -> otdel_worker::ValidationWorker {
+        otdel_worker::ValidationWorker::new(
+            Arc::clone(&self.state.config),
+            self.state.db.clone(),
+            llm,
+            embeddings,
+        )
+    }
+
+    /// One verification pass, the way `otdel-worker once` does it.
+    pub async fn run_validation(
+        &self,
+        worker: &otdel_worker::ValidationWorker,
+    ) -> otdel_worker::ValidationReport {
+        worker
+            .run_pass(self.bureau_id, 4)
+            .await
+            .expect("the verification pass must not fail as a whole")
+    }
+
+    /// Does this database have the pgvector column?
+    ///
+    /// The suite asserts different things depending on the answer, because both are real
+    /// deployments: the extension is not `trusted`, so a database whose operator never
+    /// installed it is the normal case, not a broken one.
+    pub async fn has_vector_column(&self) -> bool {
+        let mut tx = self
+            .state
+            .db
+            .begin_scoped(self.bureau_id)
+            .await
+            .expect("scoped transaction");
+        let present = otdel_db::publication_read::vector_column_exists(&mut tx)
+            .await
+            .expect("probing for the vector column");
+        tx.commit().await.expect("commit");
+        present
+    }
+
     /// One research pass, the way `otdel-worker once` does it.
     pub async fn run_research(&self, worker: &ResearchWorker) -> otdel_worker::ResearchReport {
         worker

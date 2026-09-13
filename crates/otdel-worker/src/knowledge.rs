@@ -38,6 +38,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::error::WorkerError;
+use crate::material_of;
 
 /// Delay before a transient model failure is tried again. Longer than the extraction
 /// backoff: a rate-limited provider needs more than thirty seconds of patience.
@@ -110,7 +111,7 @@ impl KnowledgeWorker {
                     }
                     warn!(
                         job_id = %job.id,
-                        material_id = %job.material_id,
+                        material_id = ?job.material_id,
                         permanent = error.is_permanent(),
                         error = %error,
                         "understanding job did not finish"
@@ -169,10 +170,11 @@ impl KnowledgeWorker {
     }
 
     async fn run_job(&self, bureau_id: Uuid, job: &Job) -> Result<JobOutcome, WorkerError> {
+        let material_id = material_of(job)?;
         // The material and its pages, inside this bureau and this partner. A job that
         // named somebody else's material would find nothing here.
         let mut tx = self.db.begin_scoped(bureau_id).await?;
-        let stored = materials::get_in_partner(&mut tx, job.partner_id, job.material_id).await?;
+        let stored = materials::get_in_partner(&mut tx, job.partner_id, material_id).await?;
         let Some(stored) = stored else {
             tx.commit().await?;
             return Err(WorkerError::MaterialMissing);
@@ -180,9 +182,9 @@ impl KnowledgeWorker {
         let partner = partners::get(&mut tx, job.partner_id)
             .await?
             .map_or_else(|| "партнёр".to_owned(), |partner| partner.name);
-        let readable = pages::readable_with_text(&mut tx, job.material_id).await?;
+        let readable = pages::readable_with_text(&mut tx, material_id).await?;
         let run =
-            knowledge::start_run(&mut tx, job.partner_id, job.material_id, PROMPT_PROFILE).await?;
+            knowledge::start_run(&mut tx, job.partner_id, material_id, PROMPT_PROFILE).await?;
         tx.commit().await?;
 
         let catalog = SourceCatalog::build(
@@ -286,7 +288,7 @@ impl KnowledgeWorker {
         }
 
         let counts =
-            knowledge::replace_draft(&mut tx, job.partner_id, job.material_id, run.id, &new_draft)
+            knowledge::replace_draft(&mut tx, job.partner_id, material_id, run.id, &new_draft)
                 .await?;
 
         let status = if drafted.draft.rejected > 0 || drafted.pages_skipped > 0 {
@@ -316,7 +318,7 @@ impl KnowledgeWorker {
         tx.commit().await?;
 
         info!(
-            material_id = %job.material_id,
+            material_id = %material_id,
             status = status.as_str(),
             products = counts.products,
             facts = counts.facts,

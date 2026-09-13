@@ -14,6 +14,11 @@
 //!   somebody else's machine and the only one that spends money, which is why it claims
 //!   its own job kind and refuses to start until a search endpoint, a host allowlist and
 //!   a model are all configured;
+//! * **verification and publication** ([`publication`]) — the phase 1E pipeline that
+//!   re-checks every candidate against the source text as it is stored now, freezes what
+//!   survives into an immutable version and switches the published pointer to it. Unlike
+//!   the two above it needs **nothing configured**: the rules are deterministic, so a
+//!   bureau with no keys at all still gets checked, published, searchable knowledge;
 //! * **maintenance** ([`Maintenance`]) — the recovery work that must not require a
 //!   human: expired sessions, jobs whose lease died with their worker, runs and plans
 //!   whose worker is gone, money reserved for calls that will never happen, staging files
@@ -27,8 +32,21 @@ pub mod error;
 pub mod extraction;
 pub mod knowledge;
 pub mod pagemap;
+pub mod publication;
 pub mod research;
 pub mod workspace;
+
+/// The material a job is about.
+///
+/// `validate_partner` is the only kind without one, and no half that calls this ever
+/// claims that kind — the claim lists are disjoint (`JobKind::extraction_kinds()`,
+/// `knowledge_kinds()`, `research_kinds()`, `validation_kinds()`). A `None` here would
+/// therefore mean a queue row contradicting its own kind, which the database also
+/// refuses (`jobs_material_matches_kind`). It is reported as a permanent failure of that
+/// one job rather than unwrapped: a panic would take the whole worker down with it.
+pub(crate) fn material_of(job: &otdel_core::model::Job) -> Result<Uuid, error::WorkerError> {
+    job.material_id.ok_or(error::WorkerError::MaterialMissing)
+}
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +65,7 @@ use uuid::Uuid;
 pub use error::WorkerError;
 pub use extraction::{ExtractionReport, Extractor, ToolReport};
 pub use knowledge::{KnowledgeReport, KnowledgeWorker};
+pub use publication::{ValidationReport, ValidationWorker};
 pub use research::{ResearchReport, ResearchWorker};
 
 /// Build the page processor from configuration.
@@ -104,6 +123,29 @@ pub fn build_knowledge_worker(
 /// The model adapter described by the configuration.
 pub fn build_llm_provider(config: &Config) -> Arc<dyn LlmProvider> {
     otdel_llm::build_provider(&config.llm)
+}
+
+/// Assemble the phase 1E half from configuration.
+///
+/// Both adapters it is handed are optional and may be the unconfigured ones. That is the
+/// normal case and it changes nothing about whether a version is published: the model can
+/// only lower a verdict it was never needed to reach, and the embedding provider only
+/// adds the vector half of search.
+pub fn build_validation_worker(
+    config: Arc<Config>,
+    db: Database,
+    llm: Arc<dyn LlmProvider>,
+    embeddings: Arc<dyn otdel_embed::EmbeddingProvider>,
+) -> ValidationWorker {
+    ValidationWorker::new(config, db, llm, embeddings)
+}
+
+/// The phase 1E embedding adapter described by the configuration.
+///
+/// Client-less when nothing is configured, exactly like the others — so there is no code
+/// path from a published version to a network, and no pseudo-vector anywhere.
+pub fn build_embedding_provider(config: &Config) -> Arc<dyn otdel_embed::EmbeddingProvider> {
+    otdel_embed::build_provider(&config.retrieval.embedding)
 }
 
 /// The phase 1D adapters described by the configuration.
@@ -170,6 +212,9 @@ pub struct MaintenanceReport {
     pub stalled_runs_settled: u64,
     /// Research plans in the same situation.
     pub stalled_plans_settled: u64,
+    /// Verification runs in the same situation. Without this a killed checker would
+    /// leave the interface saying "проверка идёт" for ever.
+    pub stalled_checks_settled: u64,
     /// Reservations of plans that are no longer running — money a dead worker was
     /// holding, given back to the budget.
     pub reservations_released: u64,
@@ -244,6 +289,11 @@ impl Maintenance {
         report.stalled_plans_settled = otdel_db::research::reclaim_stalled_plans(&mut tx).await?;
         report.reservations_released =
             otdel_db::research::release_orphan_reservations(&mut tx).await?;
+        // And the same for verification. A check holds no money and writes nothing until
+        // its final transaction, so a dead one costs only the row that says it is still
+        // running — which is exactly the row the owner is watching.
+        report.stalled_checks_settled =
+            otdel_db::publication::reclaim_stalled_runs(&mut tx).await?;
         tx.commit().await?;
 
         let sweep = self

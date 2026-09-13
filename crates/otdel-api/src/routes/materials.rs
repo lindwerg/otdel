@@ -37,10 +37,26 @@ pub async fn list(
     if !partners::exists(&mut tx, partner_id).await? {
         return Err(partner_not_found());
     }
-    let items = materials::list_for_partner(&mut tx, partner_id).await?;
+    // With the page roll-up: the listing is where the owner sees how far reading got,
+    // and the counters come from the page rows themselves.
+    let items = materials::list_for_partner_with_extraction(&mut tx, partner_id).await?;
     tx.commit().await?;
 
     Ok(Json(ItemsResponse::new(items)))
+}
+
+/// `GET /api/partners/{id}/materials/{material_id}` — one material with its page summary.
+pub async fn show(
+    State(state): State<AppState>,
+    session: Session,
+    ApiPath((partner_id, material_id)): ApiPath<(Uuid, Uuid)>,
+) -> ApiResult<Json<Material>> {
+    let mut tx = state.db.begin_scoped(session.bureau_id).await?;
+    let material =
+        materials::get_in_partner_with_extraction(&mut tx, partner_id, material_id).await?;
+    tx.commit().await?;
+
+    material.map(Json).ok_or_else(material_not_found)
 }
 
 /// `POST /api/partners/{id}/materials` — one file per request.
@@ -198,10 +214,15 @@ pub async fn retry(
         return Err(ApiError::new(stored.material.status.retry_refusal()));
     }
 
-    let material = materials::requeue(&mut tx, partner_id, material_id)
+    materials::requeue(&mut tx, partner_id, material_id)
         .await?
         .ok_or_else(material_not_found)?;
     let job = jobs::requeue_extraction(&mut tx, partner_id, material_id).await?;
+    // Re-read with the page summary attached, so the client sees the same shape the
+    // listing returns and knows what is still recorded from the previous run.
+    let material = materials::get_in_partner_with_extraction(&mut tx, partner_id, material_id)
+        .await?
+        .ok_or_else(material_not_found)?;
     tx.commit().await?;
 
     info!(

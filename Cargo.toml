@@ -4,6 +4,7 @@ members = [
     "crates/otdel-core",
     "crates/otdel-storage",
     "crates/otdel-db",
+    "crates/otdel-extract",
     "crates/otdel-api",
     "crates/otdel-worker",
     "apps/api",
@@ -21,6 +22,7 @@ publish = false
 otdel-core = { path = "crates/otdel-core" }
 otdel-storage = { path = "crates/otdel-storage" }
 otdel-db = { path = "crates/otdel-db" }
+otdel-extract = { path = "crates/otdel-extract" }
 otdel-api = { path = "crates/otdel-api" }
 otdel-worker = { path = "crates/otdel-worker" }
 
@@ -41,6 +43,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex = "0.4"
 http-body-util = "0.1"
+# Pure-Rust PDF reading (phase 1B). Chosen because the text-layer half of extraction must
+# be testable without any binary installed on the machine: the unit tests build PDFs in
+# process and read them back in process. It re-exports `lopdf`, which is how the page
+# inventory (media box, rotation, image XObjects) is read — using the re-export instead of
+# a second direct dependency guarantees both halves speak about the same `Document` type.
+pdf-extract = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

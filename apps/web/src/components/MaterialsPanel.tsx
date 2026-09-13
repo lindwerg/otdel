@@ -77,6 +77,9 @@ export function MaterialsPanel({ partnerId, partnerName }: MaterialsPanelProps) 
               onRetry={handleRetry}
               retrying={retryingId === material.id}
               retryError={retryErrors[material.id] ?? null}
+              // A single-page retry changes the material's roll-up, so the list
+              // is refreshed from the server rather than patched locally.
+              onPageChanged={reload}
             />
           ))}
         </ul>

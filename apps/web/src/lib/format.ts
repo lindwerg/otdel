@@ -1,4 +1,4 @@
-import type { MaterialStatus } from '../api/types'
+import type { ExtractionSummary, MaterialStatus, PageStatus, TextSource } from '../api/types'
 
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return '—'
@@ -47,13 +47,13 @@ const MATERIAL_STATUS: Record<MaterialStatus, StatusPresentation> = {
     tone: 'progress',
   },
   completed: {
-    label: 'Готово',
-    defaultHint: 'Обработка завершена.',
+    label: 'Прочитано',
+    defaultHint: 'Все страницы обработаны.',
     tone: 'success',
   },
   partial: {
-    label: 'Частично готово',
-    defaultHint: 'Часть страниц не удалось обработать.',
+    label: 'Прочитано частично',
+    defaultHint: 'Часть страниц не удалось прочитать.',
     tone: 'warn',
   },
   failed: {
@@ -78,4 +78,123 @@ export function materialStatusPresentation(status: MaterialStatus): StatusPresen
   )
 }
 
-export const RETRYABLE_MATERIAL_STATUSES: MaterialStatus[] = ['failed', 'partial', 'quarantined']
+/**
+ * Statuses the server actually accepts for a material retry.
+ *
+ * `quarantined` is deliberately absent: the backend refuses it (the content
+ * itself was rejected, so repeating cannot change the outcome), and offering a
+ * button that can only ever fail is worse than offering none.
+ */
+export const RETRYABLE_MATERIAL_STATUSES: MaterialStatus[] = ['failed', 'partial']
+
+// --- Phase 1B: pages -------------------------------------------------------
+
+/**
+ * Per-page labels. Wording matters here more than anywhere else in the app:
+ * `needs_ocr` must not read as a failure of the document and must never read as
+ * success, and `empty` is reserved for a page that genuinely holds nothing.
+ */
+const PAGE_STATUS: Record<PageStatus, StatusPresentation> = {
+  pending: {
+    label: 'Ожидает чтения',
+    defaultHint: 'Страница учтена, но ещё не прочитана.',
+    tone: 'neutral',
+  },
+  extracted: {
+    label: 'Прочитана',
+    defaultHint: 'Содержимое страницы извлечено.',
+    tone: 'success',
+  },
+  empty: {
+    label: 'Пустая',
+    defaultHint: 'На странице нет ни текста, ни изображений.',
+    tone: 'neutral',
+  },
+  needs_ocr: {
+    label: 'Нужно распознавание',
+    defaultHint: 'Текстового слоя нет; распознавание не выполнено.',
+    tone: 'warn',
+  },
+  partial: {
+    label: 'Прочитана частично',
+    defaultHint: 'Часть содержимого страницы осталась непрочитанной.',
+    tone: 'warn',
+  },
+  failed: {
+    label: 'Ошибка чтения',
+    defaultHint: 'Страницу не удалось прочитать.',
+    tone: 'error',
+  },
+}
+
+export function pageStatusPresentation(status: PageStatus): StatusPresentation {
+  return PAGE_STATUS[status] ?? { label: status, defaultHint: '', tone: 'neutral' }
+}
+
+/** Page statuses the server accepts for a single-page retry. */
+export const RETRYABLE_PAGE_STATUSES: PageStatus[] = [
+  'pending',
+  'needs_ocr',
+  'partial',
+  'failed',
+]
+
+const TEXT_SOURCE_LABEL: Record<TextSource, string> = {
+  none: 'текст не получен',
+  text_layer: 'из текстового слоя',
+  ocr: 'распознаванием',
+}
+
+export function textSourceLabel(source: TextSource): string {
+  return TEXT_SOURCE_LABEL[source] ?? source
+}
+
+/**
+ * Counts of page outcomes, as a plain sentence.
+ *
+ * Deliberately counts rather than a percentage: a share of pages read is not a
+ * measure of how much of the document is understood, and a progress bar with an
+ * invented estimate is exactly what docs/block-01-spec.md §11 forbids.
+ */
+export function extractionCountsLine(summary: ExtractionSummary): string {
+  const parts: string[] = []
+  const add = (count: number, label: string) => {
+    if (count > 0) parts.push(`${count} ${label}`)
+  }
+  add(summary.pages_extracted, 'прочитано')
+  add(summary.pages_partial, 'частично')
+  add(summary.pages_needs_ocr, 'ждут распознавания')
+  add(summary.pages_empty, 'пустых')
+  add(summary.pages_failed, 'с ошибкой')
+  add(summary.pages_pending, 'в очереди')
+
+  if (parts.length === 0) {
+    return `Страниц: ${summary.pages_total}. Ни одна ещё не прочитана.`
+  }
+  return `Страниц: ${summary.pages_total} — ${parts.join(', ')}.`
+}
+
+/**
+ * Which tools produced this result. Returns `null` when nothing is recorded, so
+ * the interface stays silent rather than claiming an engine that never ran.
+ */
+export function extractionToolsLine(summary: ExtractionSummary): string | null {
+  const parts: string[] = []
+  if (summary.parser_name) {
+    parts.push(`разбор: ${summary.parser_name} ${summary.parser_version ?? ''}`.trim())
+  }
+  if (summary.ocr_engine) {
+    parts.push(`распознавание: ${summary.ocr_version ?? summary.ocr_engine}`)
+  }
+  return parts.length > 0 ? parts.join(' · ') : null
+}
+
+/** Pages whose outcome the owner may still be able to change. */
+export function pagesNeedingAttention(summary: ExtractionSummary): number {
+  return (
+    summary.pages_needs_ocr +
+    summary.pages_partial +
+    summary.pages_failed +
+    summary.pages_pending
+  )
+}

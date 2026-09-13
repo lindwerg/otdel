@@ -1,4 +1,4 @@
-.PHONY: help check preview dev-init db-up db-down db-logs migrate bootstrap server worker worker-once fmt lint test test-unit test-db build
+.PHONY: help check preview dev-init db-up db-down db-logs migrate bootstrap server worker worker-once worker-probe fmt lint test test-unit test-db build
 
 # rustup installs into ~/.cargo/bin, which is not on PATH for a non-login `make` shell.
 # Adding it here (relative to $HOME, never an absolute personal path) means these targets
@@ -27,8 +27,9 @@ help:
 	@echo "    make migrate      - apply migrations with the migration role"
 	@echo "    make bootstrap    - provision the configured bureau"
 	@echo "    make server       - run the API on 127.0.0.1:18480"
-	@echo "    make worker       - run the maintenance worker (no document extraction in 1A)"
-	@echo "    make worker-once  - one maintenance pass, then exit"
+	@echo "    make worker       - run the worker: document extraction + maintenance"
+	@echo "    make worker-once  - one extraction pass and one maintenance pass, then exit"
+	@echo "    make worker-probe - report whether the OCR engine/rasteriser are installed"
 	@echo "    make db-down      - stop the database container (other projects are untouched)"
 	@echo ""
 	@echo "  Checks:"
@@ -69,6 +70,9 @@ worker:
 
 worker-once:
 	./scripts/dev-worker.sh once
+
+worker-probe:
+	./scripts/dev-worker.sh probe
 
 # --- checks --------------------------------------------------------------------
 

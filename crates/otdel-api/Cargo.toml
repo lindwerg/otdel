@@ -24,6 +24,12 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# The phase 1B suites drive the real worker against the real database through the real
+# HTTP API, so they need both halves plus the in-memory PDF fixtures.
+otdel-extract = { workspace = true, features = ["fixtures"] }
+otdel-worker.workspace = true
+
+async-trait.workspace = true
 http-body-util.workspace = true
 sqlx.workspace = true
 tower.workspace = true

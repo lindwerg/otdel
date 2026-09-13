@@ -1,28 +1,93 @@
-//! Maintenance worker.
+//! The OTDEL background worker.
 //!
-//! **This worker does not extract documents.** Reading PDFs and images is phase 1B; a
-//! process that pretended to process the queue would make `queued` materials look
-//! handled when nothing read them. What it does do is the recovery work that phase 1A
-//! genuinely needs and that must not require a human:
+//! Two halves, deliberately separate:
 //!
-//! * delete expired and idle-timed-out sessions;
-//! * return jobs whose worker lease expired to the queue (or fail them once the attempt
-//!   limit is reached), so an interrupted run resumes instead of hanging;
-//! * remove staging files left by uploads that were cut off;
-//! * compare stored objects with the material rows and *report* orphans.
+//! * **extraction** ([`extraction`]) — the phase 1B pipeline that turns a queued
+//!   material into per-page records, source regions and tables. This is the half that
+//!   actually reads documents;
+//! * **maintenance** ([`Maintenance`]) — the recovery work that must not require a
+//!   human: expired sessions, jobs whose lease died with their worker, staging files of
+//!   interrupted uploads, and orphan objects.
 //!
 //! Orphans are reported, never deleted: an object without a row can also be a request
 //! that is committing right now, and silently deleting an original is worse than a log
 //! line an operator can act on.
+
+pub mod error;
+pub mod extraction;
+pub mod pagemap;
+pub mod workspace;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use otdel_core::config::Config;
 use otdel_db::{jobs, materials, Database};
+use otdel_extract::{
+    Disabled, OcrEngine, PageProcessor, PageRasteriser, PopplerRasteriser, TesseractEngine,
+};
 use otdel_storage::ObjectStore;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+pub use error::WorkerError;
+pub use extraction::{ExtractionReport, Extractor, ToolReport};
+
+/// Build the page processor from configuration.
+///
+/// When recognition is switched off the adapters are [`Disabled`] — not "the real ones
+/// that we promise not to call". There is then no code path that could produce
+/// recognised text, which is the property the acceptance checks depend on.
+pub fn build_processor(config: &Config) -> PageProcessor {
+    let ocr = &config.extraction.ocr;
+    if !ocr.enabled {
+        let reason = "распознавание отключено настройкой OTDEL_OCR_ENABLED".to_owned();
+        return PageProcessor::new(
+            Arc::new(Disabled::new("tesseract", reason.clone())),
+            Arc::new(Disabled::new("pdftoppm", reason)),
+        );
+    }
+
+    PageProcessor::new(
+        Arc::new(TesseractEngine::new(
+            &ocr.engine_bin,
+            &ocr.languages,
+            ocr.timeout,
+        )),
+        Arc::new(PopplerRasteriser::new(
+            &ocr.renderer_bin,
+            ocr.dpi,
+            ocr.timeout,
+        )),
+    )
+}
+
+/// Probe the external tools once, so the reason for `needs_ocr` is the same on every
+/// page of a run and the operator sees it in the startup log.
+pub async fn probe_tools(processor: &PageProcessor) -> ToolReport {
+    ToolReport {
+        engine: processor.engine_availability().await,
+        rasteriser: processor.rasteriser_availability().await,
+    }
+}
+
+/// Assemble the extraction half from configuration.
+pub fn build_extractor(
+    config: Arc<Config>,
+    db: Database,
+    store: Arc<dyn ObjectStore>,
+    processor: Arc<PageProcessor>,
+    tools: ToolReport,
+) -> Extractor {
+    Extractor::new(config, db, store, processor, tools)
+}
+
+/// Compile-time reminder that both adapter traits stay object-safe: the worker holds
+/// them behind `Arc<dyn _>` so a different engine can be swapped in without touching it.
+const _: fn() = || {
+    fn accepts(_engine: &dyn OcrEngine, _rasteriser: &dyn PageRasteriser) {}
+    let _ = accepts;
+};
 
 /// Tunables for one maintenance pass.
 #[derive(Debug, Clone, Copy)]
@@ -66,6 +131,10 @@ pub enum MaintenanceError {
     #[error("bureau `{0}` is not provisioned")]
     BureauMissing(String),
 }
+
+/// Maintenance describes itself as phase 1A recovery; the extraction half lives in
+/// [`extraction`] and is driven by the binary in `apps/worker`.
+pub const MAINTENANCE_SCOPE: &str = "sessions, job leases, upload staging, orphan objects";
 
 pub struct Maintenance {
     config: Arc<Config>,

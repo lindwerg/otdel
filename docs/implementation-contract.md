@@ -172,8 +172,125 @@ quote, char_start, char_end}`. `quote` — дословный фрагмент �
 
 `Job.kind` дополняется значением `understand_material` (без `page_number`).
 
+## API этапа 1D — ограниченное отраслевое исследование, бюджет и источники
+
+Те же правила конверта, авторизации и CSRF. Дополнения строго аддитивные.
+
+**Состояние адаптеров.** Поисковый провайдер для OTDEL не выбран (`block-01-spec.md` §3),
+поэтому нормальное состояние — `needs_configuration`. Готовность требует всех трёх
+половин: поискового endpoint, списка разрешённых хостов и модели. Исследователь, который
+умеет искать, но не имеет права ничего прочитать (или прочитал бы, но не может
+истолковать), израсходовал бы бюджет и не дал ответа.
+
+- `GET /api/research/provider` → `{state, search, fetcher, model, missing[], allowed_hosts[],
+  limits, message}`. `state`: `ready` | `needs_configuration` | `disabled`.
+  `search`/`fetcher`/`model` — `AdapterView` = `{state, provider, endpoint_host, model,
+  message}`. Ключ не возвращается никогда и ни в каком виде; `endpoint_host` — только хост.
+  `limits` = `{max_queries_per_plan, max_results_per_query, max_sources_per_plan,
+  max_page_bytes, max_page_chars, request_timeout_seconds, plan_time_budget_seconds,
+  max_passes_per_plan}` — границы объявляются интерфейсу до запуска, а не после.
+
+**Бюджет.** Суммы — целые, в миллионных долях валютной единицы; пересчёта между валютами
+нет. Потолки — это настройка (`OTDEL_RESEARCH_BUDGET_MICROS`), балансы — данные.
+
+- `GET /api/research/budget` → `ResearchBudget` = `{currency, limit_micros, reserved_micros,
+  spent_micros, unknown_micros, available_micros, plan_budget_micros,
+  cost_per_search_micros, cost_per_fetch_micros, cost_per_model_call_micros, updated_at}`.
+  Тарифицируются все три вида внешнего вызова: поиск, загрузка страницы и обращение к
+  модели при истолковании собранных источников.
+  `reserved_micros` — деньги, удержанные под вызовы, которые сейчас выполняются;
+  `unknown_micros` — часть `spent_micros` с неизвестным исходом, требующая сверки
+  (`block-01-spec.md` §10). `available_micros = limit − spent − reserved`, не меньше нуля.
+  Суммы посчитаны **по объявленному тарифу**, а не по счёту провайдера.
+
+**Чтение.** Все ответы ограничены партнёром внутри бюро.
+
+- `GET /api/partners/{id}/research` → `{provider, budget, summary, plans: [ResearchPlan],
+  questions: [IndustryQuestion]}`.
+- `GET /api/partners/{id}/research/findings?plan_id=` → `{items: [ResearchFinding]}`.
+- `GET /api/partners/{id}/research/plans/{plan_id}/sources` → `{items: [ResearchSource]}`.
+- `GET /api/partners/{id}/research/plans/{plan_id}/queries` → `{items: [ResearchQuery]}`.
+
+**Запуск и остановка.**
+
+- `POST /api/partners/{id}/research/questions/{question_id}/plan` → `ResearchPlan`.
+  Единственный способ создать исследование: вопрос должен существовать в 1C с
+  `audience = industry`. Идемпотентен — пока план `queued`/`running`, повтор возвращает
+  тот же план; завершённый план ставится в очередь заново («исследовать заново»), в
+  пределах `max_passes`. 409 `conflict`: адаптеры не настроены (`retryable: true`), бюджет
+  бюро исчерпан, либо предел проходов исчерпан.
+- `POST /api/partners/{id}/research/plans/{plan_id}/stop` → `ResearchPlan`. Ставит флаг;
+  worker завершает план на ближайшей контрольной точке — всегда **до** платного вызова,
+  поэтому остановка не оставляет наполовину списанных денег. 409 `conflict`, если план уже
+  завершён.
+
+`ResearchPlan`: `{id, partner_id, material_id, material_filename, question_id,
+question_text, topic, status, provider, model, prompt_profile, passes, max_passes,
+budget_micros, reserved_micros, spent_micros, queries_made, results_seen, sources_fetched,
+sources_skipped, bytes_fetched, findings_accepted, findings_rejected, duration_ms,
+rejections[], diagnostic, cancel_requested, started_at, finished_at, created_at,
+updated_at}`.
+
+- `status`: `queued` | `running` | `completed` | `partial` | `failed` | `needs_provider` |
+  `budget_exhausted` | `cancelled` (словарь `block-01-spec.md` §7 плюс `needs_provider`).
+  `needs_provider` — обращений не было и бюджет не резервировался; `budget_exhausted` —
+  деньги кончились, работа остановлена, а не продолжена.
+- `question_id` становится `null`, если 1C заново разобрал этот материал: исследование и
+  его журнал сохраняются, а `question_text` — то, что действительно исследовалось.
+- `rejections` — причины словами; интерфейс показывает их как есть.
+
+`IndustryQuestion`: `{id, partner_id, material_id, material_filename, gap_id, gap_topic,
+gap_missing, text, status, plan_id, created_at}`. `plan_id = null` — вопрос ждёт решения
+владельца, и до решения с ним ничего не происходит.
+
+`ResearchQuery`: `{id, plan_id, ordinal, query_text, provider, results_count, cost_micros,
+outcome, diagnostic, created_at}`. `query_text` — дословно то, что было отправлено.
+`outcome`: `ok` | `failed` | `unknown` | `refused`. `refused` — запрос не отправлялся
+(например, вопрос называет партнёра) и стоил ноль; `unknown` — запрос ушёл, ответ не
+получен: расход засчитан и помечен к сверке.
+
+`ResearchSource`: `{id, plan_id, query_id, url, host, title, snippet, status, http_status,
+content_type, content_bytes, content_chars, content_hash, license, license_note,
+retrieved_at, published_at, cost_micros, diagnostic, created_at}`.
+
+- `status`: `discovered` | `skipped_host` | `skipped_robots` | `skipped_limit` |
+  `skipped_type` | `fetched` | `failed`. Любое значение кроме `fetched` означает, что
+  содержимое **не получено**, и каждое называет свою причину. Строка существует и для
+  непрочитанной ссылки: журнал, который её тихо выбрасывает, заставляет думать, что поиск
+  ничего не нашёл.
+- `snippet` — текст поисковика, средство обнаружения; цитировать его нельзя и ни одно
+  доказательство на него не ссылается (`block-01-spec.md` §6.5).
+- `license` заполняется, только если страница сама объявляет лицензию. `null` означает «не
+  объявлена», а не «свободно»; `license_note` говорит, что именно.
+- Текст снимка (`text_content`) через API не отдаётся: цитаты показываются в выводах, а
+  выдача целых страниц превратила бы обзор плана в мегабайты.
+
+`ResearchFinding`: `{id, partner_id, plan_id, scope, status, topic, attribute, value_text,
+unit, conditions, model_context, evidence: [ExternalEvidence], created_at}`.
+
+- `scope` всегда `industry`. Полей продукта, материала или артикула партнёра в контракте
+  нет вовсе: отраслевой вывод не может стать характеристикой изделия партнёра, потому что
+  его нечем так записать (`block-01-plan.md`, 1D §4).
+- `status` на 1D всегда `candidate`. Статусы проверки — этап 1E.
+- `value_text` — значение дословно из источника; вывод принимается, только если значение
+  найдено в цитате как отдельный токен. `unit` — только если единица буквально есть **в
+  цитате**; `conditions` — только если условия найдены в цитате, иначе текст переносится в
+  `model_context`.
+- `model_context` — формулировка модели, **не цитата**; интерфейс помечает её отдельно.
+- `evidence` никогда не пуст: вывод без внешнего источника не сохраняется (отложенный
+  триггер БД).
+
+`ExternalEvidence`: `{id, source_id, url, host, retrieved_at, content_hash, license, quote,
+char_start, char_end}`. `quote` — дословный фрагмент сохранённого снимка страницы (сервер
+извлекает его по смещениям, а не сохраняет формулировку модели); `char_start`/`char_end` —
+смещения в символах в `research_sources.text_content`. `retrieved_at` и `content_hash`
+говорят, **когда** и **что именно** было прочитано.
+
+`Job.kind` дополняется значением `research_plan`. План задания хранится отдельной колонкой
+`jobs.research_plan_id` и в wire-контракт `Job` не добавляется: этапам 1A–1C он не нужен.
+
 ## Следующие контракты
 
-1D — исследования и бюджеты; 1E — опубликованные версии и поиск/ответы; 1F — обновления
-и приёмку. Каждый контракт фиксируется до соответствующей UI-интеграции. Не создавать
-работающие на вид заглушки этих разделов раньше времени.
+1E — опубликованные версии и поиск/ответы; 1F — обновления и приёмку. Каждый контракт
+фиксируется до соответствующей UI-интеграции. Не создавать работающие на вид заглушки этих
+разделов раньше времени.

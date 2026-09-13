@@ -7,13 +7,17 @@ import {
   factKindLabel,
   factValueLine,
   formatBytes,
+  formatMicros,
   materialStatusPresentation,
   pageStatusPresentation,
   pagesNeedingAttention,
+  planStatusPresentation,
+  queryOutcomeLabel,
   questionAudienceLabel,
   RETRYABLE_MATERIAL_STATUSES,
   RETRYABLE_PAGE_STATUSES,
   runStatusPresentation,
+  sourceStatusPresentation,
 } from '../format'
 
 describe('formatBytes', () => {
@@ -185,5 +189,62 @@ describe('knowledge labels (phase 1C)', () => {
 
   it('states a source as file and page', () => {
     expect(evidenceSourceLine('каталог.pdf', 7)).toBe('каталог.pdf, стр. 7')
+  })
+})
+
+describe('research (phase 1D)', () => {
+  it('renders money the way a person reads it, from integers', () => {
+    expect(formatMicros(5_000, 'USD')).toBe('0,005 USD')
+    expect(formatMicros(1_000_000, 'USD')).toBe('1 USD')
+    expect(formatMicros(1_500_000, 'RUB')).toBe('1,5 RUB')
+    expect(formatMicros(0, 'USD')).toBe('0 USD')
+    expect(formatMicros(1, 'USD')).toBe('0,000001 USD')
+    expect(formatMicros(12_345_678, 'EUR')).toBe('12,345678 EUR')
+    // An over-spend reads as a negative amount rather than as a silent zero.
+    expect(formatMicros(-5_000, 'USD')).toBe('-0,005 USD')
+    // …and a value that is not a number does not become one.
+    expect(formatMicros(Number.NaN, 'USD')).toBe('— USD')
+  })
+
+  it('does not call an unconfigured, stopped or budget-bound plan a failure', () => {
+    const waiting = planStatusPresentation('needs_provider')
+    expect(waiting.tone).toBe('warn')
+    expect(waiting.label).not.toMatch(/ошибка/i)
+
+    const exhausted = planStatusPresentation('budget_exhausted')
+    expect(exhausted.label).toBe('Остановлено по бюджету')
+    expect(exhausted.tone).toBe('warn')
+    expect(exhausted.label).not.toMatch(/ошибка/i)
+    // A budget doing its job is not a malfunction, and the hint says so.
+    expect(exhausted.defaultHint).toMatch(/остановлена, а не продолжена/)
+
+    const cancelled = planStatusPresentation('cancelled')
+    expect(cancelled.tone).toBe('neutral')
+    expect(cancelled.label).not.toMatch(/ошибка/i)
+
+    // A real failure still reads as one.
+    expect(planStatusPresentation('failed').tone).toBe('error')
+    expect(planStatusPresentation('completed').tone).toBe('success')
+  })
+
+  it('gives every unread source its own reason', () => {
+    const reasons = (
+      ['skipped_host', 'skipped_robots', 'skipped_limit', 'skipped_type', 'failed'] as const
+    ).map((status) => sourceStatusPresentation(status).label)
+
+    // Five different outcomes, five different labels: a journal that said only
+    // "не прочитано" would explain nothing.
+    expect(new Set(reasons).size).toBe(reasons.length)
+    expect(sourceStatusPresentation('skipped_host').label).toBe('Хост не разрешён')
+    expect(sourceStatusPresentation('skipped_robots').label).toMatch(/robots/i)
+    expect(sourceStatusPresentation('fetched').tone).toBe('success')
+    // Only a read page is presented as read.
+    expect(sourceStatusPresentation('discovered').label).toBe('Найдено, не читалось')
+  })
+
+  it('says plainly that an unknown outcome still cost money', () => {
+    expect(queryOutcomeLabel('unknown')).toMatch(/сверка расхода/)
+    expect(queryOutcomeLabel('refused')).toBe('не отправлялся')
+    expect(queryOutcomeLabel('ok')).toBe('выполнен')
   })
 })

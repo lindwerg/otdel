@@ -18,6 +18,8 @@ pub mod knowledge_read;
 pub mod materials;
 pub mod pages;
 pub mod partners;
+pub mod research;
+pub mod research_read;
 pub mod sessions;
 pub mod tenancy;
 
@@ -43,8 +45,9 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations"
 const MIGRATION_SEARCH_PATH: &str = "public";
 
 /// Tenant tables whose row-level security is verified before the server serves a
-/// request. Grows with the schema: 1A intake, 1B page evidence, 1C product draft.
-const TENANT_TABLES: [&str; 15] = [
+/// request. Grows with the schema: 1A intake, 1B page evidence, 1C product draft,
+/// 1D research money and external sources.
+const TENANT_TABLES: [&str; 22] = [
     "partners",
     "materials",
     "jobs",
@@ -60,6 +63,13 @@ const TENANT_TABLES: [&str; 15] = [
     "knowledge_qa",
     "knowledge_gaps",
     "knowledge_questions",
+    "research_budgets",
+    "research_plans",
+    "research_queries",
+    "research_sources",
+    "research_findings",
+    "research_evidence",
+    "research_spend",
 ];
 
 #[derive(Debug, Clone)]
@@ -156,9 +166,10 @@ impl Database {
             }
         }
 
-        // Every tenant table, including the 1B evidence tables and the 1C draft: a
-        // quoted fragment of a catalogue is partner data exactly as much as the
-        // original file is.
+        // Every tenant table, including the 1B evidence tables, the 1C draft and the 1D
+        // research journal: a quoted fragment of a catalogue is partner data exactly as
+        // much as the original file is, and so is the list of questions this bureau paid
+        // to have answered.
         for (index, table) in TENANT_TABLES.iter().enumerate() {
             if !row.try_get::<bool, _>(format!("rls_{index}").as_str())? {
                 problems.push(format!(

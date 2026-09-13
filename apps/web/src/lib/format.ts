@@ -5,7 +5,10 @@ import type {
   KnowledgeRunStatus,
   MaterialStatus,
   PageStatus,
+  QueryOutcome,
   QuestionAudience,
+  ResearchPlanStatus,
+  SourceStatus,
   TextSource,
 } from '../api/types'
 
@@ -278,6 +281,151 @@ export function factValueLine(fact: KnowledgeFact): string {
 /** Where a quotation comes from, as a sentence: «каталог.pdf, стр. 3». */
 export function evidenceSourceLine(filename: string, pageNumber: number): string {
   return `${filename}, стр. ${pageNumber}`
+}
+
+// --- Phase 1D: bounded industry research -----------------------------------
+
+/**
+ * Labels for a research plan.
+ *
+ * Three of these are deliberately not errors. `needs_provider` means nothing is
+ * configured — no request was made and no money was reserved. `budget_exhausted`
+ * means the run stopped where it was told to stop, which is the feature working.
+ * `cancelled` means the owner pressed stop. Calling any of them "ошибка" would
+ * send somebody looking for a problem that is not there.
+ */
+const PLAN_STATUS: Record<ResearchPlanStatus, StatusPresentation> = {
+  queued: {
+    label: 'В очереди на исследование',
+    defaultHint: 'Вопрос утверждён и ждёт исследователя.',
+    tone: 'neutral',
+  },
+  running: {
+    label: 'Исследуется',
+    defaultHint: 'Исследователь ищет и читает источники.',
+    tone: 'progress',
+  },
+  completed: {
+    label: 'Исследовано',
+    defaultHint: 'Все найденные источники прочитаны, выводы подтверждены цитатами.',
+    tone: 'success',
+  },
+  partial: {
+    label: 'Исследовано частично',
+    defaultHint: 'Часть источников не прочитана или часть выводов отклонена — причины ниже.',
+    tone: 'warn',
+  },
+  failed: {
+    label: 'Исследование не выполнено',
+    defaultHint: 'Выводы не получены.',
+    tone: 'error',
+  },
+  needs_provider: {
+    label: 'Ожидает настройки исследователя',
+    defaultHint: 'Поиск не настроен: внешних запросов не было, бюджет не расходовался.',
+    tone: 'warn',
+  },
+  budget_exhausted: {
+    label: 'Остановлено по бюджету',
+    defaultHint: 'Деньги на исследования закончились; работа остановлена, а не продолжена.',
+    tone: 'warn',
+  },
+  cancelled: {
+    label: 'Остановлено владельцем',
+    defaultHint: 'Исследование прервано по вашей команде.',
+    tone: 'neutral',
+  },
+}
+
+export function planStatusPresentation(status: ResearchPlanStatus): StatusPresentation {
+  return PLAN_STATUS[status] ?? { label: status, defaultHint: '', tone: 'neutral' }
+}
+
+/**
+ * What became of one discovered URL.
+ *
+ * Every value except `fetched` means *no content was obtained*, and each names a
+ * different reason. A journal that said only "не прочитано" would be useless,
+ * and one that silently dropped the row would make the search look empty.
+ */
+const SOURCE_STATUS: Record<SourceStatus, StatusPresentation> = {
+  discovered: {
+    label: 'Найдено, не читалось',
+    defaultHint: 'Ссылка получена от поиска; страница ещё не загружалась.',
+    tone: 'neutral',
+  },
+  skipped_host: {
+    label: 'Хост не разрешён',
+    defaultHint: 'Этот сайт не входит в список разрешённых источников.',
+    tone: 'neutral',
+  },
+  skipped_robots: {
+    label: 'Запрещено robots.txt',
+    defaultHint: 'Сайт просит не читать эту страницу автоматически.',
+    tone: 'neutral',
+  },
+  skipped_limit: {
+    label: 'Не вошло в лимит',
+    defaultHint: 'Предел страниц, времени или бюджета исчерпан до этой ссылки.',
+    tone: 'warn',
+  },
+  skipped_type: {
+    label: 'Формат не читается',
+    defaultHint: 'На этом этапе читаются только HTML и текст.',
+    tone: 'neutral',
+  },
+  fetched: {
+    label: 'Прочитано',
+    defaultHint: 'Страница загружена; сохранены снимок текста и хеш содержимого.',
+    tone: 'success',
+  },
+  failed: {
+    label: 'Ошибка загрузки',
+    defaultHint: 'Страницу не удалось прочитать.',
+    tone: 'error',
+  },
+}
+
+export function sourceStatusPresentation(status: SourceStatus): StatusPresentation {
+  return SOURCE_STATUS[status] ?? { label: status, defaultHint: '', tone: 'neutral' }
+}
+
+const QUERY_OUTCOME_LABEL: Record<QueryOutcome, string> = {
+  ok: 'выполнен',
+  failed: 'ошибка провайдера',
+  // Sent, no answer: charged anyway, because the provider may well have billed it.
+  unknown: 'исход неизвестен — требуется сверка расхода',
+  refused: 'не отправлялся',
+}
+
+export function queryOutcomeLabel(outcome: QueryOutcome): string {
+  return QUERY_OUTCOME_LABEL[outcome] ?? outcome
+}
+
+/**
+ * An amount of research money, as a person reads it: `0,005 USD`.
+ *
+ * Amounts are integers — millionths of a currency unit — everywhere, and are
+ * never converted between currencies. Trailing zeros of the fraction carry no
+ * information and are dropped, so a whole number stays a whole number.
+ */
+export function formatMicros(micros: number, currency: string): string {
+  if (!Number.isFinite(micros)) return `— ${currency}`
+  const negative = micros < 0
+  const absolute = Math.abs(Math.trunc(micros))
+  const units = Math.floor(absolute / 1_000_000)
+  const fraction = absolute % 1_000_000
+
+  const rendered =
+    fraction === 0
+      ? String(units)
+      : `${units},${String(fraction).padStart(6, '0').replace(/0+$/, '')}`
+  return `${negative ? '-' : ''}${rendered} ${currency}`
+}
+
+/** Bytes downloaded, as a sentence. Reuses the upload formatter's units. */
+export function formatFetchedBytes(bytes: number): string {
+  return formatBytes(bytes)
 }
 
 /** Pages whose outcome the owner may still be able to change. */

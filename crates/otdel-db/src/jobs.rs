@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use otdel_core::extraction::page_extraction_idempotency_key;
 use otdel_core::knowledge::understanding_idempotency_key;
 use otdel_core::model::{extraction_idempotency_key, Job, JobKind, JobStatus};
+use otdel_core::research::research_plan_idempotency_key;
 use sqlx::postgres::PgRow;
 use sqlx::Row;
 use uuid::Uuid;
@@ -286,6 +287,91 @@ pub async fn enqueue_understanding(
     })?;
 
     job_from_row(&row)
+}
+
+// --- phase 1D: research jobs -----------------------------------------------------------
+
+/// Enqueue (or re-arm) the job that runs one research plan.
+///
+/// Keyed by the plan, so approving the same question twice — or pressing "исследовать
+/// заново" — reuses one row. A row that is **currently running** is left exactly as it
+/// is and returned unchanged: re-arming it would hand the same plan to a second worker
+/// while the first still holds the lease, and both would spend the budget for the same
+/// question. As with the understanding job, that decision is taken inside the statement
+/// (`ON CONFLICT … WHERE`), not between a read and a write.
+///
+/// `material_id` is the material whose gap raised the question. It is on the row because
+/// every job carries the composite key that ties it to a partner's real material; it is
+/// not what the research reads.
+pub async fn enqueue_research(
+    tx: &mut ScopedTx,
+    partner_id: Uuid,
+    material_id: Uuid,
+    plan_id: Uuid,
+) -> DbResult<Job> {
+    let bureau_id = tx.bureau_id();
+    let key = research_plan_idempotency_key(plan_id);
+
+    let updated = sqlx::query(&format!(
+        "INSERT INTO otdel.jobs \
+             (bureau_id, partner_id, material_id, research_plan_id, kind, status, idempotency_key) \
+         VALUES ($1, $2, $3, $4, 'research_plan', 'queued', $5) \
+         ON CONFLICT (bureau_id, idempotency_key) DO UPDATE \
+            SET status = 'queued', \
+                stage = NULL, \
+                error = NULL, \
+                error_kind = NULL, \
+                run_after = now(), \
+                lease_owner = NULL, \
+                lease_expires_at = NULL, \
+                max_attempts = GREATEST(otdel.jobs.max_attempts, otdel.jobs.attempts + 1), \
+                updated_at = now() \
+          WHERE otdel.jobs.status <> 'running' \
+         RETURNING {COLUMNS}"
+    ))
+    .bind(bureau_id)
+    .bind(partner_id)
+    .bind(material_id)
+    .bind(plan_id)
+    .bind(&key)
+    .fetch_optional(tx.conn())
+    .await?;
+
+    if let Some(row) = updated {
+        return job_from_row(&row);
+    }
+
+    // The `WHERE` refused the update: the job is running right now.
+    let row = sqlx::query(&format!(
+        "SELECT {COLUMNS} FROM otdel.jobs WHERE bureau_id = $1 AND idempotency_key = $2"
+    ))
+    .bind(bureau_id)
+    .bind(&key)
+    .fetch_optional(tx.conn())
+    .await?
+    .ok_or_else(|| {
+        DbError::Decode("research job conflicted but the existing job is not visible".to_owned())
+    })?;
+
+    job_from_row(&row)
+}
+
+/// Is there already an unfinished job for this research plan?
+pub async fn research_pending(tx: &mut ScopedTx, plan_id: Uuid) -> DbResult<bool> {
+    let bureau_id = tx.bureau_id();
+    let row = sqlx::query(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM otdel.jobs \
+              WHERE bureau_id = $1 AND research_plan_id = $2 \
+                AND status IN ('queued', 'running') \
+         ) AS pending",
+    )
+    .bind(bureau_id)
+    .bind(plan_id)
+    .fetch_one(tx.conn())
+    .await?;
+
+    Ok(row.try_get::<bool, _>("pending")?)
 }
 
 /// Is there already an unfinished understanding job for this material?

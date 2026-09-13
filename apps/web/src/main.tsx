@@ -6,6 +6,7 @@ import { AuthProvider } from './auth/AuthContext.tsx'
 import './styles/global.css'
 import './styles/pages.css'
 import './styles/knowledge.css'
+import './styles/research.css'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

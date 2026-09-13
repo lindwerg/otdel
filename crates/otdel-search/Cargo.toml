@@ -1,0 +1,35 @@
+[package]
+name = "otdel-search"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Outward-facing adapters of OTDEL phase 1D: a configured search endpoint and an SSRF-hardened HTTPS document fetcher bounded by an explicit host allowlist — and an honest 'not configured' state that reaches no network."
+
+[features]
+# Scripted in-process adapters for tests. Off by default so nothing test-shaped can end
+# up in a production build and answer as if the internet had been consulted.
+fake = []
+
+[dependencies]
+otdel-core.workspace = true
+
+async-trait.workspace = true
+chrono.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+# `net` is needed for the guarded DNS resolver: the fetcher resolves a host itself,
+# refuses every address that is not globally routable, and hands the connector only the
+# addresses that survived. reqwest already pulls tokio's networking in, so this adds no
+# dependency — it only makes `tokio::net::lookup_host` visible here.
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+otdel-search = { workspace = true, features = ["fake"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

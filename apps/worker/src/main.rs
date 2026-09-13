@@ -15,9 +15,16 @@
 //! candidates whose quotes were found in those pages. Without a configured model key it
 //! calls nothing and records each run as `needs_provider`.
 //!
-//! `probe` reports the state of the external tools and of the model adapter, then exits
-//! — useful before a long run, and honest about a machine where nothing is installed
-//! and no key is set.
+//! Since phase 1D it also researches approved industry questions: it leases
+//! `research_plan` jobs, reserves money before every external call, searches, reads only
+//! pages of hosts the owner declared, and stores conclusions whose quotes were found in
+//! those pages. This is the only part of OTDEL that reaches outside the machine. Without
+//! a configured search endpoint, host allowlist and model it calls nothing, reserves
+//! nothing and records each plan as `needs_provider`.
+//!
+//! `probe` reports the state of the external tools, the model adapter and the research
+//! adapters, then exits — useful before a long run, and honest about a machine where
+//! nothing is installed and no key is set.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -28,7 +35,7 @@ use otdel_core::config::Config;
 use otdel_db::Database;
 use otdel_extract::ToolAvailability;
 use otdel_storage::{FilesystemObjectStore, ObjectStore};
-use otdel_worker::{KnowledgeWorker, Maintenance, MaintenanceSettings};
+use otdel_worker::{KnowledgeWorker, Maintenance, MaintenanceSettings, ResearchWorker};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -37,6 +44,9 @@ const MAX_JOBS_PER_PASS: u32 = 8;
 /// Understanding runs taken in one pass. Lower than the extraction budget: each one
 /// can make several model calls, and a pass should stay short enough to be stopped.
 const MAX_KNOWLEDGE_JOBS_PER_PASS: u32 = 4;
+/// Research plans taken in one pass. Lower again: each one can search, download several
+/// pages and call a model, and each one spends real money.
+const MAX_RESEARCH_JOBS_PER_PASS: u32 = 2;
 /// How often the recovery half runs while the worker is up.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
 
@@ -59,7 +69,11 @@ async fn main() -> ExitCode {
                  `needs_ocr` with the reason when it is not.\n\
                  Understanding drafts product knowledge from the pages that were read.\n\
                  Without a configured model key nothing is called: each run is recorded\n\
-                 as `needs_provider` and no knowledge is stored."
+                 as `needs_provider` and no knowledge is stored.\n\
+                 Research answers approved industry questions from external sources,\n\
+                 within a budget and a declared host allowlist. Without a configured\n\
+                 search endpoint, allowlist and model, nothing leaves this machine and\n\
+                 no money is reserved: each plan is recorded as `needs_provider`."
             );
             Ok(())
         }
@@ -105,6 +119,12 @@ async fn run(mode: Mode) -> Result<()> {
     let provider = otdel_worker::build_llm_provider(&config);
     report_provider(&provider.describe());
 
+    // The research adapters are described before anything runs too. Their absence is the
+    // whole story of phase 1D on this machine, and the operator should not have to wait
+    // for a plan to stop in order to learn it.
+    let (search, fetcher) = otdel_worker::build_research_adapters(&config);
+    report_research(&search.describe(), &fetcher.describe());
+
     if mode == Mode::Probe {
         return Ok(());
     }
@@ -143,6 +163,13 @@ async fn run(mode: Mode) -> Result<()> {
         tools,
     );
     let knowledge = KnowledgeWorker::new(Arc::clone(&config), db.clone(), Arc::clone(&provider));
+    let research = ResearchWorker::new(
+        Arc::clone(&config),
+        db.clone(),
+        Arc::clone(&search),
+        Arc::clone(&fetcher),
+        Arc::clone(&provider),
+    );
     let maintenance = Maintenance::new(
         Arc::clone(&config),
         db.clone(),
@@ -159,13 +186,22 @@ async fn run(mode: Mode) -> Result<()> {
             .run_pass(bureau_id, MAX_KNOWLEDGE_JOBS_PER_PASS)
             .await
             .context("understanding pass")?;
+        let researched = research
+            .run_pass(bureau_id, MAX_RESEARCH_JOBS_PER_PASS)
+            .await
+            .context("research pass")?;
         let recovery = maintenance.run_once().await.context("maintenance pass")?;
         println!(
             "jobs_claimed={} jobs_completed={} jobs_failed={} pages_read={} \
              pages_recognised={} pages_needing_recognition={} pages_failed={} \
              knowledge_jobs_claimed={} knowledge_jobs_completed={} knowledge_jobs_failed={} \
              facts_stored={} candidates_rejected={} runs_awaiting_provider={} \
+             research_jobs_claimed={} research_jobs_completed={} research_jobs_failed={} \
+             research_queries={} research_sources_fetched={} research_findings={} \
+             research_findings_rejected={} plans_awaiting_provider={} \
+             plans_budget_exhausted={} research_micros_spent={} \
              sessions_purged={} leases_reclaimed={} stalled_runs_settled={} \
+             stalled_plans_settled={} reservations_released={} \
              staging_files_removed={} \
              objects_scanned={} orphan_objects={} scan_truncated={}",
             extraction.jobs_claimed,
@@ -181,9 +217,21 @@ async fn run(mode: Mode) -> Result<()> {
             understanding.facts_stored,
             understanding.candidates_rejected,
             understanding.runs_awaiting_provider,
+            researched.jobs_claimed,
+            researched.jobs_completed,
+            researched.jobs_failed,
+            researched.queries_made,
+            researched.sources_fetched,
+            researched.findings_stored,
+            researched.findings_rejected,
+            researched.plans_awaiting_provider,
+            researched.plans_budget_exhausted,
+            researched.micros_spent,
             recovery.sessions_purged,
             recovery.leases_reclaimed,
             recovery.stalled_runs_settled,
+            recovery.stalled_plans_settled,
+            recovery.reservations_released,
             recovery.staging_files_removed,
             recovery.objects_scanned,
             recovery.orphan_objects,
@@ -201,6 +249,7 @@ async fn run(mode: Mode) -> Result<()> {
     serve(
         extractor,
         knowledge,
+        research,
         maintenance,
         bureau_id,
         config.extraction.poll_interval,
@@ -213,6 +262,7 @@ async fn run(mode: Mode) -> Result<()> {
 async fn serve(
     extractor: otdel_worker::Extractor,
     knowledge: KnowledgeWorker,
+    research: ResearchWorker,
     maintenance: Maintenance,
     bureau_id: uuid::Uuid,
     poll_interval: Duration,
@@ -262,6 +312,24 @@ async fn serve(
                     Err(error) => warn!(error = %error, "understanding pass failed"),
                 }
 
+                match research.run_pass(bureau_id, MAX_RESEARCH_JOBS_PER_PASS).await {
+                    Ok(report) if report.jobs_claimed > 0 => info!(
+                        jobs_claimed = report.jobs_claimed,
+                        jobs_completed = report.jobs_completed,
+                        jobs_failed = report.jobs_failed,
+                        queries_made = report.queries_made,
+                        sources_fetched = report.sources_fetched,
+                        findings_stored = report.findings_stored,
+                        findings_rejected = report.findings_rejected,
+                        plans_awaiting_provider = report.plans_awaiting_provider,
+                        plans_budget_exhausted = report.plans_budget_exhausted,
+                        micros_spent = report.micros_spent,
+                        "research pass finished"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => warn!(error = %error, "research pass failed"),
+                }
+
                 if last_maintenance.elapsed() >= MAINTENANCE_INTERVAL {
                     last_maintenance = Instant::now();
                     match maintenance.run_once().await {
@@ -269,6 +337,8 @@ async fn serve(
                             sessions_purged = report.sessions_purged,
                             leases_reclaimed = report.leases_reclaimed,
                             stalled_runs_settled = report.stalled_runs_settled,
+                            stalled_plans_settled = report.stalled_plans_settled,
+                            reservations_released = report.reservations_released,
                             staging_files_removed = report.staging_files_removed,
                             objects_scanned = report.objects_scanned,
                             orphan_objects = report.orphan_objects,
@@ -324,5 +394,34 @@ fn report_provider(description: &otdel_llm::ProviderDescription) {
         "model adapter not configured: materials are read as usual, and each \
          understanding run is recorded as `needs_provider` without calling anything \
          and without storing invented knowledge"
+    );
+}
+
+/// Say plainly whether bounded industry research can happen on this machine.
+///
+/// This is the only half that leaves the machine, so its state is reported with the two
+/// facts an operator actually needs: which service would be asked, and which hosts may be
+/// read. A key is never printed; neither adapter can print one.
+fn report_research(
+    search: &otdel_search::AdapterDescription,
+    fetcher: &otdel_search::AdapterDescription,
+) {
+    if search.is_ready() && fetcher.is_ready() {
+        info!(
+            endpoint_host = search.endpoint_host.clone().unwrap_or_default(),
+            allowed_hosts = ?fetcher.allowed_hosts,
+            "research adapters ready: approved industry questions will be researched \
+             within their budget, reading only the hosts listed above"
+        );
+        return;
+    }
+
+    warn!(
+        search_state = search.state,
+        fetcher_state = fetcher.state,
+        missing = ?search.missing,
+        "research adapters not configured: nothing leaves this machine and no budget is \
+         reserved. An approved question is recorded as `needs_provider` — reading and \
+         understanding materials keep working as usual"
     );
 }

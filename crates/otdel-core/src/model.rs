@@ -133,13 +133,15 @@ impl MaterialStatus {
 /// 1A enqueued whole-document extraction; 1B adds the single-page repeat, which exists
 /// so a problem page can be retried without re-reading the other 31
 /// (`docs/block-01-plan.md`, 1B §2); 1C adds the understanding run that drafts product
-/// knowledge from the pages a material already has.
+/// knowledge from the pages a material already has; 1D adds the research plan, which is
+/// the only kind that reaches outside this machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
     ExtractDocument,
     ExtractPage,
     UnderstandMaterial,
+    ResearchPlan,
 }
 
 impl JobKind {
@@ -148,6 +150,7 @@ impl JobKind {
             Self::ExtractDocument => "extract_document",
             Self::ExtractPage => "extract_page",
             Self::UnderstandMaterial => "understand_material",
+            Self::ResearchPlan => "research_plan",
         }
     }
 
@@ -156,6 +159,7 @@ impl JobKind {
             "extract_document" => Some(Self::ExtractDocument),
             "extract_page" => Some(Self::ExtractPage),
             "understand_material" => Some(Self::UnderstandMaterial),
+            "research_plan" => Some(Self::ResearchPlan),
             _ => None,
         }
     }
@@ -174,6 +178,16 @@ impl JobKind {
     /// Kinds the phase 1C worker half claims.
     pub const fn knowledge_kinds() -> [Self; 1] {
         [Self::UnderstandMaterial]
+    }
+
+    /// Kinds the phase 1D worker half claims.
+    ///
+    /// Kept disjoint from the other two for the same reason, and for one more: this is
+    /// the half that spends money and opens sockets to the outside world. A document
+    /// reader that could claim one of these jobs would be a path from "a PDF arrived"
+    /// to "a paid external request was made".
+    pub const fn research_kinds() -> [Self; 1] {
+        [Self::ResearchPlan]
     }
 }
 
@@ -323,6 +337,7 @@ mod tests {
             JobKind::ExtractDocument,
             JobKind::ExtractPage,
             JobKind::UnderstandMaterial,
+            JobKind::ResearchPlan,
         ] {
             assert_eq!(JobKind::parse(kind.as_str()), Some(kind));
         }
@@ -330,18 +345,31 @@ mod tests {
         assert!(JobKind::ExtractPage.needs_page_number());
         assert!(!JobKind::ExtractDocument.needs_page_number());
         assert!(!JobKind::UnderstandMaterial.needs_page_number());
+        assert!(!JobKind::ResearchPlan.needs_page_number());
     }
 
     #[test]
-    fn the_two_worker_halves_claim_disjoint_kinds() {
-        let extraction = JobKind::extraction_kinds();
-        let knowledge = JobKind::knowledge_kinds();
-        for kind in knowledge {
-            assert!(
-                !extraction.contains(&kind),
-                "{kind:?} must not be claimable by both halves: the reader would try to \
-                 open a knowledge job as a document"
-            );
+    fn the_three_worker_halves_claim_disjoint_kinds() {
+        let halves = [
+            ("extraction", JobKind::extraction_kinds().to_vec()),
+            ("knowledge", JobKind::knowledge_kinds().to_vec()),
+            ("research", JobKind::research_kinds().to_vec()),
+        ];
+
+        for (name, kinds) in &halves {
+            for (other_name, other_kinds) in &halves {
+                if name == other_name {
+                    continue;
+                }
+                for kind in kinds {
+                    assert!(
+                        !other_kinds.contains(kind),
+                        "{kind:?} must not be claimable by both `{name}` and `{other_name}`: \
+                         a half would pick up work it cannot run, and the reader could \
+                         reach the half that spends money"
+                    );
+                }
+            }
         }
     }
 

@@ -17,6 +17,7 @@ use std::time::Duration;
 use crate::error::AppError;
 use crate::extraction_config::ExtractionSettings;
 use crate::llm_config::LlmSettings;
+use crate::research_config::ResearchSettings;
 use crate::secret;
 
 /// Lower bound shared by the session TTL and the idle timeout.
@@ -92,6 +93,11 @@ pub struct Config {
     /// configured at all. Without a key this stays in the "needs configuration" state
     /// and no request is ever made.
     pub llm: LlmSettings,
+    /// Phase 1D: the search endpoint, the hosts the researcher may read, the limits of
+    /// one plan and the declared tariff. Without a search endpoint, a key *and* an
+    /// allowlist this stays in the "needs configuration" state and nothing leaves the
+    /// machine.
+    pub research: ResearchSettings,
 }
 
 impl fmt::Debug for Config {
@@ -123,6 +129,8 @@ impl fmt::Debug for Config {
             // LlmSettings has its own redacting Debug: the key is never printed, the
             // endpoint host is (the owner needs to see which service would be called).
             .field("llm", &self.llm)
+            // ResearchSettings redacts its own key for the same reason.
+            .field("research", &self.research)
             .finish()
     }
 }
@@ -289,6 +297,7 @@ impl Config {
 
         let extraction = ExtractionSettings::load(source)?;
         let llm = LlmSettings::load(source)?;
+        let research = ResearchSettings::load(source)?;
 
         Ok(Self {
             env,
@@ -309,6 +318,7 @@ impl Config {
             log_filter,
             extraction,
             llm,
+            research,
         })
     }
 
@@ -516,13 +526,37 @@ mod tests {
             "OTDEL_LLM_MODEL".to_owned(),
             "openai/gpt-4o-mini".to_owned(),
         );
+        env.insert(
+            "OTDEL_RESEARCH_API_KEY".to_owned(),
+            "srch-alsonotinalog".to_owned(),
+        );
 
         let config = Config::load(&env).unwrap();
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("s3cr3t"));
         assert!(!rendered.contains(&config.owner_password_hash));
         assert!(!rendered.contains("notinalog"), "{rendered}");
+        assert!(!rendered.contains("alsonotinalog"), "{rendered}");
         assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn the_researcher_defaults_to_waiting_for_configuration() {
+        use crate::research_config::SearchAvailability;
+
+        let config = Config::load(&base_env()).unwrap();
+        assert_eq!(
+            config.research.availability(),
+            SearchAvailability::NeedsConfiguration {
+                missing: vec![
+                    "OTDEL_RESEARCH_SEARCH_URL",
+                    "OTDEL_RESEARCH_API_KEY",
+                    "OTDEL_RESEARCH_ALLOWED_HOSTS",
+                ],
+            },
+            "with no search endpoint configured the researcher must report what is \
+             missing instead of reaching for some default service"
+        );
     }
 
     #[test]

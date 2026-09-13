@@ -12,6 +12,8 @@ otdel-core.workspace = true
 otdel-db.workspace = true
 otdel-knowledge.workspace = true
 otdel-llm.workspace = true
+otdel-research.workspace = true
+otdel-search.workspace = true
 otdel-storage.workspace = true
 
 axum.workspace = true
@@ -32,6 +34,10 @@ otdel-extract = { workspace = true, features = ["fixtures"] }
 # The 1C suites drive the product role end to end with a scripted provider: no key,
 # no network, and the same validation and storage path as a real run.
 otdel-llm = { workspace = true, features = ["fake"] }
+# The 1D suites do the same for the researcher: a scripted search endpoint and a scripted
+# fetcher, so the budget, the source journal and the citation checks run for real while
+# nothing leaves the machine and nothing is paid for.
+otdel-search = { workspace = true, features = ["fake"] }
 otdel-worker.workspace = true
 
 async-trait.workspace = true

@@ -11,6 +11,7 @@ pub mod knowledge;
 pub mod materials;
 pub mod pages;
 pub mod partners;
+pub mod research;
 pub mod session;
 
 use axum::extract::DefaultBodyLimit;
@@ -97,6 +98,31 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/partners/{partner_id}/materials/{material_id}/understand",
             post(knowledge::understand),
+        )
+        // Phase 1D: bounded industry research, its money and its sources. No handler
+        // here reaches the network — approving a question queues a job.
+        .route("/research/provider", get(research::provider))
+        .route("/research/budget", get(research::budget))
+        .route("/partners/{partner_id}/research", get(research::overview))
+        .route(
+            "/partners/{partner_id}/research/findings",
+            get(research::findings),
+        )
+        .route(
+            "/partners/{partner_id}/research/plans/{plan_id}/sources",
+            get(research::sources),
+        )
+        .route(
+            "/partners/{partner_id}/research/plans/{plan_id}/queries",
+            get(research::queries),
+        )
+        .route(
+            "/partners/{partner_id}/research/plans/{plan_id}/stop",
+            post(research::stop),
+        )
+        .route(
+            "/partners/{partner_id}/research/questions/{question_id}/plan",
+            post(research::approve),
         )
         .route("/partners/{partner_id}/jobs", get(jobs::list))
         .layer(DefaultBodyLimit::max(upload_limit));

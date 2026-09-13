@@ -53,6 +53,23 @@ pub enum WorkerError {
     /// The material has no page with usable text yet.
     #[error("в материале нет ни одной прочитанной страницы с текстом")]
     NothingToUnderstand,
+
+    // --- phase 1D ---------------------------------------------------------------
+    /// The job names a research plan that is not there. Permanent: a job without its
+    /// plan cannot be run by anybody.
+    #[error("план исследования для задания не найден")]
+    ResearchPlanMissing,
+
+    /// The search provider was called and the call failed. The adapter's own
+    /// classification decides whether repeating is worth anything.
+    #[error("{diagnostic}")]
+    SearchCallFailed { diagnostic: String, retryable: bool },
+
+    /// The pass ended for a reason that is not a failure of the machinery: the owner
+    /// stopped it, the money ran out, the pass limit was reached. `permanent` says
+    /// whether the queue should stop trying.
+    #[error("{reason}")]
+    ResearchStopped { reason: String, permanent: bool },
 }
 
 impl WorkerError {
@@ -62,8 +79,12 @@ impl WorkerError {
             Self::MaterialMissing
             | Self::UnsupportedMediaType(_)
             | Self::ProviderNotConfigured(_)
-            | Self::NothingToUnderstand => true,
-            Self::ModelCallFailed { retryable, .. } => !*retryable,
+            | Self::NothingToUnderstand
+            | Self::ResearchPlanMissing => true,
+            Self::ModelCallFailed { retryable, .. } | Self::SearchCallFailed { retryable, .. } => {
+                !*retryable
+            }
+            Self::ResearchStopped { permanent, .. } => *permanent,
             Self::Db(_)
             | Self::Storage(_)
             | Self::Workspace(_)
@@ -118,6 +139,28 @@ mod tests {
             retryable: false,
         }
         .is_permanent());
+    }
+
+    #[test]
+    fn a_research_pass_that_ran_out_of_money_does_not_keep_retrying() {
+        // Raising the budget is the owner's decision; a queue that kept trying would
+        // spend nothing and hide the one thing to do.
+        let exhausted = WorkerError::ResearchStopped {
+            reason: "бюджет бюро на исследования исчерпан".to_owned(),
+            permanent: true,
+        };
+        assert!(exhausted.is_permanent());
+        assert!(exhausted.diagnostic().contains("бюджет"));
+
+        // A rate-limited search provider, on the other hand, is worth another attempt.
+        assert!(!WorkerError::SearchCallFailed {
+            diagnostic: "превышен лимит запросов поискового провайдера".to_owned(),
+            retryable: true,
+        }
+        .is_permanent());
+
+        // A job whose plan is gone cannot be run by anybody.
+        assert!(WorkerError::ResearchPlanMissing.is_permanent());
     }
 
     #[test]

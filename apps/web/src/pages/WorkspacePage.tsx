@@ -7,13 +7,16 @@ import { KnowledgePanel } from '../components/knowledge/KnowledgePanel'
 import { MaterialsPanel } from '../components/MaterialsPanel'
 import { PartnerFormDialog } from '../components/PartnerFormDialog'
 import { PartnerSidebar } from '../components/PartnerSidebar'
+import { ResearchPanel } from '../components/research/ResearchPanel'
 import { StatusMessage } from '../components/StatusMessage'
 
-/** Sections of the partner card that exist today. Knowledge is phase 1C; versions
- *  and history arrive with 1E/1F and are deliberately absent rather than stubbed. */
+/** Sections of the partner card that exist today. Knowledge is phase 1C and
+ *  research phase 1D; versions and history arrive with 1E/1F and are deliberately
+ *  absent rather than stubbed. */
 const TABS = [
   { id: 'materials', label: 'Материалы' },
   { id: 'knowledge', label: 'Знания' },
+  { id: 'research', label: 'Исследование' },
 ] as const
 
 type TabId = (typeof TABS)[number]['id']
@@ -229,8 +232,10 @@ export function WorkspacePage() {
                   ever land on the new one. */}
               {activeTab === 'materials' ? (
                 <MaterialsPanel key={selectedPartner.id} partnerId={selectedPartner.id} partnerName={selectedPartner.name} />
-              ) : (
+              ) : activeTab === 'knowledge' ? (
                 <KnowledgePanel key={selectedPartner.id} partnerId={selectedPartner.id} />
+              ) : (
+                <ResearchPanel key={selectedPartner.id} partnerId={selectedPartner.id} />
               )}
             </>
           ) : null}

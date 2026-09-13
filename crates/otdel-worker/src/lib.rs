@@ -9,9 +9,15 @@
 //!   into a structured product draft, every fact tied to a verbatim source. It runs
 //!   only when the model adapter is configured; otherwise the run is recorded as
 //!   `needs_provider` and nothing is stored;
+//! * **research** ([`research`]) — the phase 1D pipeline that turns an approved industry
+//!   question into bounded external work. It is the only half that opens a socket to
+//!   somebody else's machine and the only one that spends money, which is why it claims
+//!   its own job kind and refuses to start until a search endpoint, a host allowlist and
+//!   a model are all configured;
 //! * **maintenance** ([`Maintenance`]) — the recovery work that must not require a
-//!   human: expired sessions, jobs whose lease died with their worker, staging files of
-//!   interrupted uploads, and orphan objects.
+//!   human: expired sessions, jobs whose lease died with their worker, runs and plans
+//!   whose worker is gone, money reserved for calls that will never happen, staging files
+//!   of interrupted uploads, and orphan objects.
 //!
 //! Orphans are reported, never deleted: an object without a row can also be a request
 //! that is committing right now, and silently deleting an original is worse than a log
@@ -21,6 +27,7 @@ pub mod error;
 pub mod extraction;
 pub mod knowledge;
 pub mod pagemap;
+pub mod research;
 pub mod workspace;
 
 use std::sync::Arc;
@@ -32,6 +39,7 @@ use otdel_extract::{
     Disabled, OcrEngine, PageProcessor, PageRasteriser, PopplerRasteriser, TesseractEngine,
 };
 use otdel_llm::LlmProvider;
+use otdel_search::{DocumentFetcher, SearchProvider};
 use otdel_storage::ObjectStore;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -39,6 +47,7 @@ use uuid::Uuid;
 pub use error::WorkerError;
 pub use extraction::{ExtractionReport, Extractor, ToolReport};
 pub use knowledge::{KnowledgeReport, KnowledgeWorker};
+pub use research::{ResearchReport, ResearchWorker};
 
 /// Build the page processor from configuration.
 ///
@@ -97,6 +106,22 @@ pub fn build_llm_provider(config: &Config) -> Arc<dyn LlmProvider> {
     otdel_llm::build_provider(&config.llm)
 }
 
+/// The phase 1D adapters described by the configuration.
+///
+/// Both come from builders that return a *client-less* object when the configuration is
+/// incomplete, so the research worker is built and started in either case — it has to be,
+/// so it can record "нужен поисковый провайдер" on the plan instead of leaving an approved
+/// question silently unprocessed. Returned as a pair because the binary also reports their
+/// state at startup, and building them twice would be two different objects.
+pub fn build_research_adapters(
+    config: &Config,
+) -> (Arc<dyn SearchProvider>, Arc<dyn DocumentFetcher>) {
+    (
+        otdel_search::build_search_provider(&config.research),
+        otdel_search::build_fetcher(&config.research),
+    )
+}
+
 /// Assemble the extraction half from configuration.
 pub fn build_extractor(
     config: Arc<Config>,
@@ -143,6 +168,11 @@ pub struct MaintenanceReport {
     pub leases_reclaimed: u64,
     /// Understanding runs that said `running` with no job behind them.
     pub stalled_runs_settled: u64,
+    /// Research plans in the same situation.
+    pub stalled_plans_settled: u64,
+    /// Reservations of plans that are no longer running — money a dead worker was
+    /// holding, given back to the budget.
+    pub reservations_released: u64,
     pub staging_files_removed: u64,
     pub objects_scanned: usize,
     pub orphan_objects: usize,
@@ -206,6 +236,14 @@ impl Maintenance {
         // A run whose worker died is corrected here too: the job queue recovers the
         // job, and this recovers the record the owner is actually looking at.
         report.stalled_runs_settled = otdel_db::knowledge::reclaim_stalled_runs(&mut tx).await?;
+        // The same correction for research, and then the money: a worker that died
+        // between reserving and settling would otherwise hold that amount for ever, and
+        // the bureau's research budget would shrink with every crash. The order matters —
+        // plans are settled first, so their reservations become releasable in the same
+        // pass rather than the next one.
+        report.stalled_plans_settled = otdel_db::research::reclaim_stalled_plans(&mut tx).await?;
+        report.reservations_released =
+            otdel_db::research::release_orphan_reservations(&mut tx).await?;
         tx.commit().await?;
 
         let sweep = self
@@ -278,6 +316,8 @@ impl Maintenance {
                             sessions_purged = report.sessions_purged,
                             leases_reclaimed = report.leases_reclaimed,
                             stalled_runs_settled = report.stalled_runs_settled,
+                            stalled_plans_settled = report.stalled_plans_settled,
+                            reservations_released = report.reservations_released,
                             staging_files_removed = report.staging_files_removed,
                             objects_scanned = report.objects_scanned,
                             orphan_objects = report.orphan_objects,

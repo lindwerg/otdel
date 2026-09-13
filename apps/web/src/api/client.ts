@@ -13,6 +13,13 @@ import type {
   ProductNode,
   ProviderState,
   QaEntry,
+  ResearchBudget,
+  ResearchFinding,
+  ResearchOverview,
+  ResearchPlan,
+  ResearchProviderState,
+  ResearchQueryRecord,
+  ResearchSource,
   SessionResponse,
 } from './types'
 
@@ -294,6 +301,93 @@ export function understandMaterial(
 ): Promise<KnowledgeRun> {
   return apiRequest<KnowledgeRun>(
     `/partners/${encodeURIComponent(partnerId)}/materials/${encodeURIComponent(materialId)}/understand`,
+    { method: 'POST', csrfToken },
+  )
+}
+
+// --- Research (phase 1D) ---------------------------------------------------
+
+function researchPath(partnerId: string, suffix = ''): string {
+  return `/partners/${encodeURIComponent(partnerId)}/research${suffix}`
+}
+
+/**
+ * State of the researcher. Not partner data: it describes the installation, and
+ * it never contains a key — only which endpoint, which hosts and which model
+ * would be used.
+ */
+export function fetchResearchProviderState(): Promise<ResearchProviderState> {
+  return apiRequest<ResearchProviderState>('/research/provider')
+}
+
+export function fetchResearchBudget(): Promise<ResearchBudget> {
+  return apiRequest<ResearchBudget>('/research/budget')
+}
+
+export function fetchResearchOverview(partnerId: string): Promise<ResearchOverview> {
+  return apiRequest<ResearchOverview>(researchPath(partnerId))
+}
+
+export async function listResearchFindings(partnerId: string): Promise<ResearchFinding[]> {
+  const res = await apiRequest<ListResponse<ResearchFinding>>(
+    researchPath(partnerId, '/findings'),
+  )
+  return res.items
+}
+
+export async function listResearchSources(
+  partnerId: string,
+  planId: string,
+): Promise<ResearchSource[]> {
+  const res = await apiRequest<ListResponse<ResearchSource>>(
+    researchPath(partnerId, `/plans/${encodeURIComponent(planId)}/sources`),
+  )
+  return res.items
+}
+
+export async function listResearchQueries(
+  partnerId: string,
+  planId: string,
+): Promise<ResearchQueryRecord[]> {
+  const res = await apiRequest<ListResponse<ResearchQueryRecord>>(
+    researchPath(partnerId, `/plans/${encodeURIComponent(planId)}/queries`),
+  )
+  return res.items
+}
+
+/**
+ * Approve one industry question for bounded research.
+ *
+ * Idempotent server-side: while a plan is queued or running this returns that
+ * plan. A settled plan is put back in the queue, bounded by the pass limit. A
+ * 409 means the server refused with a stated reason — nothing configured, the
+ * budget is empty, or the question has used every pass it was allowed — and the
+ * caller shows that reason rather than a generic failure.
+ */
+export function approveResearch(
+  partnerId: string,
+  questionId: string,
+  csrfToken: string,
+): Promise<ResearchPlan> {
+  return apiRequest<ResearchPlan>(
+    researchPath(partnerId, `/questions/${encodeURIComponent(questionId)}/plan`),
+    { method: 'POST', csrfToken },
+  )
+}
+
+/**
+ * Ask a running plan to stop.
+ *
+ * The worker settles it at its next checkpoint, which is always *before* a
+ * chargeable call — so stopping never leaves money half-spent.
+ */
+export function stopResearch(
+  partnerId: string,
+  planId: string,
+  csrfToken: string,
+): Promise<ResearchPlan> {
+  return apiRequest<ResearchPlan>(
+    researchPath(partnerId, `/plans/${encodeURIComponent(planId)}/stop`),
     { method: 'POST', csrfToken },
   )
 }

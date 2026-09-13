@@ -7,6 +7,8 @@ members = [
     "crates/otdel-extract",
     "crates/otdel-llm",
     "crates/otdel-knowledge",
+    "crates/otdel-search",
+    "crates/otdel-research",
     "crates/otdel-api",
     "crates/otdel-worker",
     "apps/api",
@@ -27,6 +29,8 @@ otdel-db = { path = "crates/otdel-db" }
 otdel-extract = { path = "crates/otdel-extract" }
 otdel-llm = { path = "crates/otdel-llm" }
 otdel-knowledge = { path = "crates/otdel-knowledge" }
+otdel-search = { path = "crates/otdel-search" }
+otdel-research = { path = "crates/otdel-research" }
 otdel-api = { path = "crates/otdel-api" }
 otdel-worker = { path = "crates/otdel-worker" }
 

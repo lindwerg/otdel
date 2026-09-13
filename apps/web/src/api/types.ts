@@ -367,6 +367,239 @@ export interface KnowledgeGap {
   created_at: string
 }
 
+// --- Phase 1D: bounded industry research -----------------------------------
+
+/**
+ * State of one 1D adapter. Never contains a key — the server does not send one.
+ */
+export interface ResearchAdapterState {
+  state: 'ready' | 'needs_configuration' | 'disabled'
+  provider: string
+  endpoint_host: string | null
+  model: string | null
+  message: string
+}
+
+/** The bounds of one plan, stated before anything runs. */
+export interface ResearchLimits {
+  max_queries_per_plan: number
+  max_results_per_query: number
+  max_sources_per_plan: number
+  max_page_bytes: number
+  max_page_chars: number
+  request_timeout_seconds: number
+  plan_time_budget_seconds: number
+  max_passes_per_plan: number
+}
+
+/**
+ * Whether the researcher can run at all.
+ *
+ * `ready` requires all three halves: a search endpoint, a declared host
+ * allowlist, and a model to interpret what was read. `needs_configuration` is
+ * the normal state of this pilot — no search provider has been chosen — and it
+ * means **nothing leaves the machine and no budget is reserved**.
+ */
+export interface ResearchProviderState {
+  state: 'ready' | 'needs_configuration' | 'disabled'
+  search: ResearchAdapterState
+  fetcher: ResearchAdapterState
+  model: ResearchAdapterState
+  /** Environment variables the owner still has to set. */
+  missing: string[]
+  /** Hosts the researcher may read, exactly as declared. */
+  allowed_hosts: string[]
+  limits: ResearchLimits
+  message: string
+}
+
+/**
+ * The bureau's research money, in millionths of one currency unit.
+ *
+ * Integers, never floats: a budget compared as a float eventually lets one more
+ * paid call through than it should. The prices are the owner's *declared*
+ * tariff — not a provider's invoice — and the interface says so.
+ */
+export interface ResearchBudget {
+  currency: string
+  limit_micros: number
+  reserved_micros: number
+  spent_micros: number
+  /** Part of `spent_micros` whose outcome nobody could confirm. Needs reconciliation. */
+  unknown_micros: number
+  available_micros: number
+  plan_budget_micros: number
+  cost_per_search_micros: number
+  cost_per_fetch_micros: number
+  /** Per model request made while interpreting a plan's sources. */
+  cost_per_model_call_micros: number
+  updated_at: string
+}
+
+export type ResearchPlanStatus =
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'partial'
+  | 'failed'
+  | 'needs_provider'
+  | 'budget_exhausted'
+  | 'cancelled'
+
+export interface ResearchPlan {
+  id: string
+  partner_id: string
+  material_id: string
+  material_filename: string
+  /** `null` once phase 1C has re-drafted that material: the research survives, the link does not. */
+  question_id: string | null
+  /** The question as approved, copied verbatim. This is what was researched. */
+  question_text: string
+  topic: string | null
+  status: ResearchPlanStatus
+  provider: string | null
+  model: string | null
+  prompt_profile: string
+  passes: number
+  max_passes: number
+  budget_micros: number
+  reserved_micros: number
+  spent_micros: number
+  queries_made: number
+  results_seen: number
+  sources_fetched: number
+  sources_skipped: number
+  bytes_fetched: number
+  findings_accepted: number
+  findings_rejected: number
+  duration_ms: number | null
+  /** Why sources or conclusions were refused, in the server's own words. Shown as-is. */
+  rejections: string[]
+  diagnostic: string | null
+  cancel_requested: boolean
+  started_at: string | null
+  finished_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export type QueryOutcome = 'ok' | 'failed' | 'unknown' | 'refused'
+
+export interface ResearchQueryRecord {
+  id: string
+  plan_id: string
+  ordinal: number
+  /** Exactly the text that was sent — not a reconstruction. */
+  query_text: string
+  provider: string
+  results_count: number
+  cost_micros: number
+  outcome: QueryOutcome
+  diagnostic: string | null
+  created_at: string
+}
+
+export type SourceStatus =
+  | 'discovered'
+  | 'skipped_host'
+  | 'skipped_robots'
+  | 'skipped_limit'
+  | 'skipped_type'
+  | 'fetched'
+  | 'failed'
+
+export interface ResearchSource {
+  id: string
+  plan_id: string
+  query_id: string | null
+  url: string
+  host: string
+  title: string | null
+  /** The search engine's summary. Discovery, never evidence. */
+  snippet: string | null
+  status: SourceStatus
+  http_status: number | null
+  content_type: string | null
+  content_bytes: number | null
+  content_chars: number | null
+  content_hash: string | null
+  /** Only when the page declares one. `null` means "not stated", never "free to use". */
+  license: string | null
+  license_note: string | null
+  retrieved_at: string | null
+  published_at: string | null
+  cost_micros: number
+  diagnostic: string | null
+  created_at: string
+}
+
+/** A verbatim fragment of an external page, with where and when it was read. */
+export interface ExternalEvidence {
+  id: string
+  source_id: string
+  url: string
+  host: string
+  retrieved_at: string | null
+  content_hash: string | null
+  license: string | null
+  quote: string
+  char_start: number
+  char_end: number
+}
+
+export interface ResearchFinding {
+  id: string
+  partner_id: string
+  plan_id: string
+  /** Always `industry`. Never a claim about this partner's products. */
+  scope: 'industry'
+  /** Always `candidate`: nothing here has been verified. */
+  status: 'candidate'
+  topic: string
+  attribute: string
+  value_text: string
+  unit: string | null
+  conditions: string | null
+  /** The model's own words. Shown as explicitly not a quotation. */
+  model_context: string | null
+  evidence: ExternalEvidence[]
+  created_at: string
+}
+
+/** A 1C question addressed to industry research, and the plan approved from it. */
+export interface IndustryQuestion {
+  id: string
+  partner_id: string
+  material_id: string
+  material_filename: string
+  gap_id: string
+  gap_topic: string
+  gap_missing: string
+  text: string
+  status: string
+  /** `null` while nobody has approved it — and nothing happens until somebody does. */
+  plan_id: string | null
+  created_at: string
+}
+
+export interface ResearchSummary {
+  plans_total: number
+  plans_active: number
+  questions_open: number
+  sources_fetched: number
+  sources_skipped: number
+  findings_total: number
+  spent_micros: number
+}
+
+export interface ResearchOverview {
+  provider: ResearchProviderState
+  budget: ResearchBudget
+  summary: ResearchSummary
+  plans: ResearchPlan[]
+  questions: IndustryQuestion[]
+}
+
 export interface ApiErrorBody {
   error: {
     code: string

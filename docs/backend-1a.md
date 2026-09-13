@@ -45,8 +45,12 @@ regenerates them, which invalidates the database roles already created.
 | `crates/otdel-storage` | `ObjectStore` trait + local filesystem backend (streaming, hashing, staging). |
 | `crates/otdel-db` | PostgreSQL: bureau-scoped transactions, partners, materials, jobs, sessions, pages. |
 | `crates/otdel-extract` | Phase 1B: PDF text layer (pure Rust), layout/tables, OCR adapters. |
+| `crates/otdel-llm` | Phase 1C: the single model adapter — bounded calls, redacted logs, an honest "not configured". |
+| `crates/otdel-knowledge` | Phase 1C as a pure pipeline: source catalogue, prompt, quotation matching, validation. |
+| `crates/otdel-search` | Phase 1D: the outward-facing adapters — configured search endpoint, SSRF-hardened fetcher. |
+| `crates/otdel-research` | Phase 1D as a pure pipeline: query building, external catalogue, budget arithmetic, validation. |
 | `crates/otdel-api` | Axum router, session/CSRF, upload/download handlers, integration tests. |
-| `crates/otdel-worker` | Extraction pipeline (1B) + recovery maintenance. |
+| `crates/otdel-worker` | Extraction (1B), understanding (1C) and research (1D) + recovery maintenance. |
 | `apps/api`, `apps/worker` | Thin binaries: `otdel-api`, `otdel-worker`. |
 | `migrations/` | SQL, applied by the migration role only. |
 | `infra/postgres/initdb/` | Role and test-database creation on first container start. |

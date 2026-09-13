@@ -1,6 +1,10 @@
 import type {
   AnswerState,
+  ChangeCounts,
+  ChangeKind,
   ClaimStatus,
+  EventActor,
+  EventKind,
   ExtractionSummary,
   FactKind,
   KnowledgeFact,
@@ -13,9 +17,13 @@ import type {
   QuestionAudience,
   ReadinessState,
   ReadinessTopic,
+  RefreshState,
+  RefreshStepKind,
+  RefreshStepOutcome,
   ResearchPlanStatus,
   SearchMode,
   SearchState,
+  SourceState,
   SourceStatus,
   TextSource,
   ValidationRunStatus,
@@ -755,4 +763,185 @@ export function pagesNeedingAttention(summary: ExtractionSummary): number {
     summary.pages_failed +
     summary.pages_pending
   )
+}
+
+// --- phase 1F: the update cycle -------------------------------------------------------
+
+/**
+ * Labels for the refresh status.
+ *
+ * `current` is deliberately not called «актуально»: what the server checked is
+ * that the published version was built from the candidates that exist now, and
+ * that is what the sentence says.
+ */
+const REFRESH_STATE: Record<RefreshState, StatusPresentation> = {
+  never_published: {
+    label: 'Ещё ничего не опубликовано',
+    defaultHint: 'Версии знаний у партнёра пока нет. Причины перечислены ниже.',
+    tone: 'neutral',
+  },
+  current: {
+    label: 'Опубликованная версия построена из текущих кандидатов',
+    defaultHint: 'Перепроверка ничего бы не изменила.',
+    tone: 'success',
+  },
+  revalidation_required: {
+    label: 'Нужна перепроверка',
+    defaultHint:
+      'Что-то изменилось после публикации. Опубликованная версия остаётся прежней, пока новая не пройдёт правила.',
+    tone: 'warn',
+  },
+  checking: {
+    label: 'Проверка идёт',
+    defaultHint: 'Опубликованная версия не меняется, пока проверка не закончится.',
+    tone: 'progress',
+  },
+  retracted: {
+    label: 'Версия отозвана',
+    defaultHint: 'Поиск и ответы по опубликованной версии недоступны, пока не выйдет новая.',
+    tone: 'error',
+  },
+}
+
+export function refreshStatePresentation(state: RefreshState): StatusPresentation {
+  return REFRESH_STATE[state] ?? { label: state, defaultHint: '', tone: 'neutral' }
+}
+
+/** Where one document stands in the cycle. */
+const SOURCE_STATE: Record<SourceState, StatusPresentation> = {
+  reading: {
+    label: 'Читается',
+    defaultHint: 'Материал в очереди на чтение или читается сейчас.',
+    tone: 'progress',
+  },
+  unreadable: {
+    label: 'Пригодного текста нет',
+    defaultHint: 'Из материала не получено текста, разбирать нечего.',
+    tone: 'warn',
+  },
+  not_drafted: {
+    label: 'Не разобран',
+    defaultHint: 'Материал прочитан, но продуктолог его ещё не разбирал.',
+    tone: 'warn',
+  },
+  drafted: {
+    label: 'Разобран по текущему чтению',
+    defaultHint: 'Кандидаты сделаны из того текста, который сейчас хранится.',
+    tone: 'success',
+  },
+  reread_after_draft: {
+    label: 'Перечитан после разбора',
+    defaultHint: 'Кандидаты описывают прежнее чтение документа.',
+    tone: 'warn',
+  },
+}
+
+export function sourceStatePresentation(state: SourceState): StatusPresentation {
+  return SOURCE_STATE[state] ?? { label: state, defaultHint: '', tone: 'neutral' }
+}
+
+/**
+ * What happened to one stage of a requested refresh.
+ *
+ * Only `queued` means work will happen. Every other value is a refusal with a
+ * reason, and the interface shows the server's sentence rather than implying
+ * progress.
+ */
+const REFRESH_OUTCOME: Record<RefreshStepOutcome, StatusPresentation> = {
+  queued: {
+    label: 'Поставлено в очередь',
+    defaultHint: 'Работа принята. Сколько она займёт — неизвестно, и оценка не показывается.',
+    tone: 'progress',
+  },
+  already_running: {
+    label: 'Уже выполняется',
+    defaultHint: 'Второй запуск не создаётся: работа уже идёт.',
+    tone: 'neutral',
+  },
+  up_to_date: {
+    label: 'Не требуется',
+    defaultHint: 'На этом шаге нечего делать.',
+    tone: 'success',
+  },
+  needs_provider: {
+    label: 'Нужна настройка',
+    defaultHint: 'Шаг не запускался: адаптер не настроен. Недостающие переменные названы рядом.',
+    tone: 'warn',
+  },
+  waiting: {
+    label: 'Ждёт предыдущий шаг',
+    defaultHint: 'Запускать нечего, пока предыдущий этап ничего не дал.',
+    tone: 'neutral',
+  },
+}
+
+export function refreshOutcomePresentation(outcome: RefreshStepOutcome): StatusPresentation {
+  return REFRESH_OUTCOME[outcome] ?? { label: outcome, defaultHint: '', tone: 'neutral' }
+}
+
+const REFRESH_STEP_KIND: Record<RefreshStepKind, string> = {
+  extraction: 'Чтение документа',
+  understanding: 'Разбор продуктологом',
+  validation: 'Проверка и публикация',
+}
+
+export function refreshStepLabel(kind: RefreshStepKind): string {
+  return REFRESH_STEP_KIND[kind] ?? kind
+}
+
+/** One line of the history, titled. The sentence itself comes from the server. */
+const EVENT_KIND: Record<EventKind, string> = {
+  material_uploaded: 'Материал загружен',
+  material_duplicate: 'Повторная загрузка',
+  material_reprocess_requested: 'Запрошено повторное чтение',
+  material_extraction_finished: 'Чтение завершено',
+  understanding_queued: 'Разбор поставлен в очередь',
+  understanding_finished: 'Разбор завершён',
+  validation_queued: 'Проверка поставлена в очередь',
+  validation_finished: 'Проверка завершена',
+  version_published: 'Версия опубликована',
+  version_blocked: 'Версия не опубликована',
+  version_superseded: 'Версия заменена',
+  version_retracted: 'Версия отозвана',
+  refresh_requested: 'Запрошено обновление',
+  export_read: 'Версия выгружена',
+  job_failed: 'Задание не выполнено',
+  retention_applied: 'Очистка истории',
+}
+
+export function eventKindLabel(kind: EventKind): string {
+  return EVENT_KIND[kind] ?? kind
+}
+
+const EVENT_ACTOR: Record<EventActor, string> = {
+  owner: 'владелец',
+  worker: 'обработчик',
+  system: 'обслуживание',
+}
+
+export function eventActorLabel(actor: EventActor): string {
+  return EVENT_ACTOR[actor] ?? actor
+}
+
+const CHANGE_KIND: Record<ChangeKind, string> = {
+  added: 'добавлено',
+  removed: 'исчезло',
+  changed: 'изменилось',
+}
+
+export function changeKindLabel(kind: ChangeKind): string {
+  return CHANGE_KIND[kind] ?? kind
+}
+
+/**
+ * Counts of a comparison. Counts, never a percentage: "версия обновилась на
+ * 30%" would be a measure of change that nothing here computes.
+ */
+export function changeCountsLine(counts: ChangeCounts): string {
+  return [
+    `изменилось: ${counts.changed}`,
+    `добавлено: ${counts.added}`,
+    `исчезло: ${counts.removed}`,
+    `без изменений: ${counts.unchanged}`,
+  ].join(' · ')
 }

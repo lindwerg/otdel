@@ -70,6 +70,8 @@ function version(overrides: Partial<KnowledgeVersion> = {}): KnowledgeVersion {
     status: 'published',
     validation_run_id: 'run-1',
     input_fingerprint: 'sha256:ab12',
+    // Phase 1F records this alongside the verdict-sensitive fingerprint.
+    candidate_fingerprint: 'sha256:cd34',
     claims_total: 3,
     claims_source_supported: 2,
     claims_hypothesis: 1,

@@ -12,7 +12,10 @@
 //! sources ([`research`]) and the configuration that bounds it ([`research_config`]);
 //! phase 1E adds verification, the immutable published version and the search over it
 //! ([`publication`]), with the optional embedding adapter and the bounds on reading it
-//! ([`retrieval_config`]).
+//! ([`retrieval_config`]); phase 1F adds the update cycle around a published version —
+//! its history, its refresh status, the comparison of two versions and the export a
+//! downstream agent reads ([`updates`]) — together with how long operational history is
+//! kept ([`retention_config`]).
 
 pub mod config;
 pub mod error;
@@ -25,8 +28,10 @@ pub mod model;
 pub mod publication;
 pub mod research;
 pub mod research_config;
+pub mod retention_config;
 pub mod retrieval_config;
 pub mod secret;
+pub mod updates;
 pub mod validate;
 
 pub use error::{AppError, ErrorCode, Result};

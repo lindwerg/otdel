@@ -36,6 +36,8 @@ pub mod answer;
 pub mod check;
 pub mod chunk;
 pub mod claim;
+/// Phase 1F: what changed between two published snapshots.
+pub mod diff;
 pub mod prompt;
 pub mod readiness;
 pub mod review;
@@ -54,7 +56,7 @@ pub use claim::{
 };
 pub use readiness::{assess, gap_blocks, GapText};
 pub use review::PROMPT_PROFILE;
-pub use version::{decide, fingerprint, PublicationDecision};
+pub use version::{candidate_fingerprint, decide, fingerprint, PublicationDecision};
 
 /// Purpose label of a review call. Appears in logs; never the content.
 pub const REVIEW_PURPOSE: &str = "claim_review";

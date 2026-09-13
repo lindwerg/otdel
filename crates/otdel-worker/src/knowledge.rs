@@ -24,11 +24,14 @@ use std::time::Duration;
 use otdel_core::config::Config;
 use otdel_core::knowledge::KnowledgeRunStatus;
 use otdel_core::model::{Job, JobKind};
+use otdel_core::updates::{EventActor, EventKind};
 use otdel_db::knowledge::{
     self, NewCategory, NewDraft, NewEvidence, NewFact, NewGap, NewProduct, NewQa, NewQuestion,
     NewTerm, RunOutcome,
 };
-use otdel_db::{jobs, materials, pages, partners, Database};
+use otdel_db::{
+    events, jobs, materials, pages, partners, publication, publication_read, updates, Database,
+};
 use otdel_knowledge::{
     draft_knowledge, CandidateDraft, DraftLimits, KnowledgeError, PromptContext, SourceCatalog,
     SourcePage, PROMPT_PROFILE,
@@ -185,6 +188,12 @@ impl KnowledgeWorker {
         let readable = pages::readable_with_text(&mut tx, material_id).await?;
         let run =
             knowledge::start_run(&mut tx, job.partner_id, material_id, PROMPT_PROFILE).await?;
+        // Phase 1F: which reading of the document this draft is about to be made from.
+        // Recorded before the model is called, so a document re-read while this run is in
+        // flight leaves the draft carrying the older number — which is what it is, and
+        // what makes "перечитан после разбора" detectable afterwards.
+        updates::set_draft_source_revision(&mut tx, run.id, stored.material.content_revision)
+            .await?;
         tx.commit().await?;
 
         let catalog = SourceCatalog::build(
@@ -315,6 +324,56 @@ impl KnowledgeWorker {
             },
         )
         .await?;
+
+        events::record(
+            &mut tx,
+            &events::NewEvent::new(
+                EventKind::UnderstandingFinished,
+                EventActor::Worker,
+                format!(
+                    "разбор материала «{}» завершён ({}): фактов {}, отклонено {}",
+                    stored.material.filename,
+                    status.as_str(),
+                    counts.facts,
+                    drafted.draft.rejected
+                ),
+            )
+            .for_partner(job.partner_id)
+            .about_material(material_id)
+            .about_run(run.id)
+            .with_detail(serde_json::json!({
+                "status": status.as_str(),
+                "facts": counts.facts,
+                "rejected": drafted.draft.rejected,
+                "source_revision": stored.material.content_revision,
+            })),
+        )
+        .await?;
+
+        // Phase 1F: the draft is the last stage a person had to start by hand.
+        //
+        // `block-01-spec.md` §11 — «нормальный путь не требует ручной работы между
+        // этапами» — and until now the chain stopped here: extraction queued the draft,
+        // and the draft queued nothing. A partner who uploaded a new catalogue got new
+        // candidates and an unchanged published version, with no indication that the
+        // remaining step was a button.
+        //
+        // Three things keep this from being a loop or a surprise:
+        //
+        //   * the check is queued only when there is something to check. A draft that
+        //     stored nothing leaves the published version alone;
+        //   * `validation_pending` means a check already queued or running is joined
+        //     rather than re-armed, so two materials finishing together produce one
+        //     check over both — which is also the only way a contradiction between them
+        //     can be seen;
+        //   * a check queues nothing in turn. The chain ends here, on purpose.
+        //
+        // The check itself decides whether anything is published. An unchanged candidate
+        // set produces no new version (`version::decide`), so this cannot manufacture
+        // versions out of repeated drafting.
+        self.queue_check(&mut tx, job.partner_id, material_id)
+            .await?;
+
         tx.commit().await?;
 
         info!(
@@ -333,6 +392,69 @@ impl KnowledgeWorker {
             facts_stored: u32::try_from(counts.facts).unwrap_or(0),
             rejected: drafted.draft.rejected,
         })
+    }
+
+    /// Hand the partner to the checker, unless there is nothing to check or a check is
+    /// already on its way.
+    ///
+    /// Runs in the caller's transaction, so the draft and the check that will read it
+    /// commit together: a check queued for a draft that rolled back would read the
+    /// previous candidates and publish a version the owner never asked for.
+    async fn queue_check(
+        &self,
+        tx: &mut otdel_db::ScopedTx,
+        partner_id: Uuid,
+        material_id: Uuid,
+    ) -> Result<(), WorkerError> {
+        let candidates = publication_read::candidate_summary(tx, partner_id).await?;
+        if candidates.is_empty() {
+            info!(
+                material_id = %material_id,
+                "draft produced no candidates; the published version is left alone"
+            );
+            return Ok(());
+        }
+
+        // A check that is queued but not started will read this draft too, so joining it
+        // is right. A check that is already *running* has read its candidates already and
+        // cannot see this one — but its job row is leased and cannot be re-armed from
+        // here. That case is handled where it can be: `ValidationWorker::follow_up` queues
+        // another check when the run it just finished turns out to have read a different
+        // candidate set than the one that exists now.
+        if jobs::validation_pending(tx, partner_id).await? {
+            info!(
+                partner_id = %partner_id,
+                "a check is already queued or running; the checker queues a follow-up if \
+                 this draft arrived too late for it"
+            );
+            return Ok(());
+        }
+
+        let run = publication::enqueue_run(tx, partner_id, otdel_publish::PROMPT_PROFILE).await?;
+        let queued = jobs::enqueue_validation(tx, partner_id, run.id).await?;
+        events::record(
+            tx,
+            &events::NewEvent::new(
+                EventKind::ValidationQueued,
+                EventActor::Worker,
+                "проверка поставлена в очередь автоматически: появились новые кандидаты \
+                 после разбора материала"
+                    .to_owned(),
+            )
+            .for_partner(partner_id)
+            .about_material(material_id)
+            .about_job(queued.id)
+            .about_run(run.id)
+            .with_detail(serde_json::json!({ "trigger": "understanding_finished" })),
+        )
+        .await?;
+
+        info!(
+            partner_id = %partner_id,
+            job_id = %queued.id,
+            "partner queued for verification after a new draft"
+        );
+        Ok(())
     }
 }
 

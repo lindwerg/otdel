@@ -13,6 +13,10 @@ base64.workspace = true
 chrono.workspace = true
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde.workspace = true
+# Phase 1F: an event carries a small structured payload alongside its sentence, and the
+# payload is `jsonb` in the database and JSON on the wire. Nothing else in this crate
+# needs a dynamic value.
+serde_json.workspace = true
 tracing.workspace = true
 sha2.workspace = true
 subtle.workspace = true

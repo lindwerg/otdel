@@ -238,6 +238,9 @@ pub struct NewGap {
 #[derive(Debug, Clone)]
 pub struct NewVersion {
     pub input_fingerprint: String,
+    /// Phase 1F: the same candidate set without its verdicts, so the refresh status can
+    /// tell whether a new check would produce something different without running one.
+    pub candidate_fingerprint: String,
     pub validation_run_id: Uuid,
     pub claims: Vec<NewClaim>,
     pub gaps: Vec<NewGap>,
@@ -284,8 +287,9 @@ pub async fn write_version(
 
     let version_id: Uuid = sqlx::query(
         "INSERT INTO otdel.knowledge_versions \
-             (bureau_id, partner_id, number, status, validation_run_id, input_fingerprint) \
-         VALUES ($1, $2, $3, 'draft', $4, $5) \
+             (bureau_id, partner_id, number, status, validation_run_id, input_fingerprint, \
+              candidate_fingerprint) \
+         VALUES ($1, $2, $3, 'draft', $4, $5, $6) \
          RETURNING id",
     )
     .bind(bureau_id)
@@ -293,6 +297,7 @@ pub async fn write_version(
     .bind(number)
     .bind(version.validation_run_id)
     .bind(&version.input_fingerprint)
+    .bind(&version.candidate_fingerprint)
     .fetch_one(tx.conn())
     .await?
     .try_get("id")?;
@@ -565,6 +570,13 @@ pub async fn publish_version(
 /// retraction is history, not deletion, and the database refuses to delete a version that
 /// was ever published. Search resolves the pointer on every request, so the version is
 /// gone from search the moment this commits.
+///
+/// Phase 1F added one thing: the version's **chunks** are removed in the same
+/// transaction. They are not part of the snapshot — they are the rebuildable rendering
+/// that makes claims findable, and any vectors that were computed for them. Retrieval
+/// already refuses a `revoked` version at the pointer, so this is the second wall rather
+/// than the first, and it is the one that matters if a future query path ever reaches the
+/// index before it asks about status.
 pub async fn retract_version(
     tx: &mut ScopedTx,
     partner_id: Uuid,
@@ -583,7 +595,13 @@ pub async fn retract_version(
     .bind(reason)
     .execute(tx.conn())
     .await?;
-    Ok(result.rows_affected() == 1)
+
+    if result.rows_affected() != 1 {
+        return Ok(false);
+    }
+
+    crate::updates::purge_version_chunks(tx, version_id).await?;
+    Ok(true)
 }
 
 /// Attach vectors to a version's chunks.

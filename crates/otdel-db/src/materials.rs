@@ -17,8 +17,8 @@ use uuid::Uuid;
 use crate::error::{DbError, DbResult};
 use crate::tenancy::ScopedTx;
 
-const COLUMNS: &str =
-    "id, partner_id, filename, media_type, size_bytes, sha256, status, page_count, created_at, error";
+const COLUMNS: &str = "id, partner_id, filename, media_type, size_bytes, sha256, status, \
+     page_count, created_at, error, content_revision";
 
 /// Phase 1B bookkeeping of the extraction run, prefixed for the joined query below.
 const EXTRACTION_COLUMNS: &str = "m.extraction_started_at, m.extraction_finished_at, \
@@ -65,6 +65,7 @@ fn material_from_row(row: &PgRow) -> DbResult<Material> {
         page_count: row.try_get("page_count")?,
         created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
         error: row.try_get("error")?,
+        content_revision: row.try_get("content_revision")?,
         // Filled in only by the queries that join the page counts: a material read
         // without them reports "no summary", never an empty one that would read as
         // "zero pages, nothing wrong".
@@ -249,6 +250,16 @@ pub async fn get_in_partner_with_extraction(
 }
 
 /// Mark the start of an extraction run.
+/// Mark the material as being read, and count the reading.
+///
+/// Phase 1F added `content_revision` here rather than at the end of a pass, and the
+/// ordering matters: a draft made *during* a re-read must not be able to claim the
+/// revision that re-read is about to produce. Incrementing at the start means a draft
+/// either carries the revision it really read, or a lower one — and a lower one is
+/// reported as "перечитан после разбора", which is the safe direction.
+///
+/// A changed file is always a new material row (deduplication is by content), so this
+/// only ever counts *re*-readings of one stored original.
 pub async fn begin_extraction(
     tx: &mut ScopedTx,
     material_id: Uuid,
@@ -265,6 +276,7 @@ pub async fn begin_extraction(
                 extraction_finished_at = NULL, \
                 parser_name = $3, \
                 parser_version = $4, \
+                content_revision = content_revision + 1, \
                 updated_at = now() \
           WHERE bureau_id = $1 AND id = $2",
     )
@@ -272,6 +284,49 @@ pub async fn begin_extraction(
     .bind(material_id)
     .bind(parser_name)
     .bind(parser_version)
+    .execute(tx.conn())
+    .await?;
+    Ok(())
+}
+
+/// Count a **single-page** re-read as a reading of the document.
+///
+/// Phase 1F. `begin_extraction` covers the whole-document path; this is the other one, and
+/// leaving it out was a hole worth naming: re-reading one page rewrites that page's
+/// `text_content`, so a draft that cited it was made from text this material no longer
+/// has. Without this the refresh status would call such a document `drafted` — up to date
+/// — while the citation behind its facts had moved underneath.
+///
+/// It is deliberately the *document's* counter that moves, not a per-page one. A draft is
+/// made from a material, not from a page, so "this draft was made from an earlier reading
+/// of this document" is exactly the true statement, and the safe direction when it is
+/// imprecise is the one that suggests checking again.
+///
+/// Two known imprecisions, both in that safe direction, and both reflected in the wording
+/// the refresh status uses (it says the document "перечитывался", not that its text
+/// changed):
+///
+///  * the increment happens before the page is parsed and is not rolled back if that
+///    parse then fails, so a page retried five times counts five readings of text that
+///    never moved;
+///  * a page whose re-read produced exactly what it produced before also counts.
+///
+/// Both cost one unnecessary re-check and nothing else. The opposite error — counting a
+/// reading that changed the text as "no reading" — would leave a draft silently describing
+/// a document that no longer says that.
+///
+/// Nothing about the published version changes: a snapshot carries copies of its
+/// quotations, and the checker re-locates every citation in today's text at the next run
+/// regardless of this counter.
+pub async fn note_page_reread(tx: &mut ScopedTx, material_id: Uuid) -> DbResult<()> {
+    let bureau_id = tx.bureau_id();
+    sqlx::query(
+        "UPDATE otdel.materials \
+            SET content_revision = content_revision + 1, updated_at = now() \
+          WHERE bureau_id = $1 AND id = $2",
+    )
+    .bind(bureau_id)
+    .bind(material_id)
     .execute(tx.conn())
     .await?;
     Ok(())

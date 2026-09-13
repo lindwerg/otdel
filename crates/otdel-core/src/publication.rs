@@ -469,6 +469,12 @@ pub struct KnowledgeVersion {
     /// repeated upload from producing a second published result (`block-01-spec.md`
     /// §13.4), and what keeps a late run from overwriting a newer one (§7).
     pub input_fingerprint: String,
+    /// Phase 1F: SHA-256 over the same candidate set **without** the verdicts.
+    ///
+    /// `null` for a version published before this was recorded. That is reported as a
+    /// comparison the refresh status cannot make, never as "ничего не изменилось" —
+    /// answering a question nobody computed is the failure this field exists to avoid.
+    pub candidate_fingerprint: Option<String>,
     pub claims_total: i32,
     pub claims_source_supported: i32,
     pub claims_hypothesis: i32,

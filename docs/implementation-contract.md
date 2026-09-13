@@ -464,7 +464,176 @@ readiness: [ReadinessEntry], limitations[], rejections[], message}`.
   `stale` источник. Частичная готовность не выглядит как полный коммерческий допуск
   (§13.7).
 
+## API этапа 1F — обновления, история, сравнение версий, выгрузка и хранение
+
+Те же правила конверта, авторизации и CSRF. Дополнения строго аддитивные, за одним
+исключением, названным ниже.
+
+**Что здесь решается.** Новый материал партнёра должен запускать новый цикл, не трогая
+опубликованное. Пользователь должен видеть, что именно устарело и почему, чем новая
+версия отличается от прежней, что вообще происходило и что из этого будет сохранено.
+Другой агент должен уметь забрать опубликованную версию целиком.
+
+**Состояние адаптеров.** 1F, как и 1E, не требует ничего настроенного. Статус
+актуальности, журнал, сравнение версий, выгрузка и хранение детерминированы. Единственное
+место, где настройка видна, — шаг разбора в `POST .../refresh`: без модели продуктолога он
+возвращается с исходом `needs_provider` и перечисляет недостающие переменные, а не
+пропускается молча.
+
+**Изменение существующего объекта.** `Material` получает поле `content_revision` —
+сколько раз этот сохранённый оригинал был **прочитан**. Не сколько раз загружен:
+изменённый файл — всегда другой материал (дедупликация по содержимому), поэтому счётчик
+растёт только при повторном чтении. `0` — не читался ни разу. `KnowledgeVersion` получает
+`candidate_fingerprint` (см. ниже); `null` у версий, опубликованных этапом 1E.
+
+**Актуальность.**
+
+- `GET /api/partners/{id}/refresh` → `RefreshStatus`. Вычисляется на каждом запросе из
+  существующих строк: хранимого флага «устарело» нет намеренно — его пришлось бы
+  кому-то обновлять, и в первый же раз, когда забыли, он молча врёт.
+
+`RefreshStatus`: `{state, published, latest, reasons: [RefreshReason], sources:
+[SourceRefresh], candidate_fingerprint, published_candidate_fingerprint, checking,
+message, computed_at}`.
+
+- `state`: `never_published` | `current` | `revalidation_required` | `checking` |
+  `retracted`. `current` означает «опубликованная версия построена из тех кандидатов,
+  что есть сейчас», а не «сведения верны».
+- `published`/`latest` — `VersionRef` = `{id, number, status, published_at}`.
+- `candidate_fingerprint` — SHA-256 по набору кандидатов **без вердиктов**.
+  `input_fingerprint` этапа 1E включает вердикт каждого утверждения, а вердикт известен
+  только после перечитывания всех источников — то есть после самой проверки. Поэтому для
+  вопроса «даст ли новая проверка другую версию» нужен второй отпечаток, который считается
+  дешёвым чтением. `published_candidate_fingerprint = null` у версии 1E — это состояние
+  `comparison_unavailable`, а не «ничего не изменилось».
+
+`RefreshReason`: `{code, message, material_id, material_filename, version_id,
+version_number, content_revision, drafted_revision}`.
+
+- `code`: `material_not_read` | `material_not_drafted` | `source_reread` |
+  `candidates_changed` | `comparison_unavailable` | `last_check_blocked` |
+  `last_check_failed` | `version_retracted` | `nothing_published`.
+- Причина о документе всегда называет документ и оба номера чтений: «что-то устарело» —
+  не тот ответ, с которым можно что-то сделать.
+
+`SourceRefresh`: `{material_id, filename, material_status, state, content_revision,
+drafted_revision, draft_status, facts_drafted, claims_in_published, message}`.
+
+- `state`: `reading` | `unreadable` | `not_drafted` | `drafted` | `reread_after_draft`.
+  `not_drafted` покрывает четыре положения — ни разу не разбирался, разбор в очереди,
+  разбор идёт, разбор не удался (в том числе из-за ненастроенной модели), — потому что со
+  всеми четырьмя нужно сделать одно и то же. Какое именно, говорит `draft_status`.
+- `draft_status` — статус самого запуска 1C (`queued`, `running`, `completed`, `partial`,
+  `failed`, `needs_provider`) либо `null`, если продуктолог по материалу не запускался.
+  Поле обязано быть на проводе: `drafted_revision` записывается при **старте** запуска, до
+  обращения к модели, поэтому упавший запуск оставляет номер, неотличимый от успешного.
+- `drafted_revision` — по какому чтению сделан текущий разбор. `null` — неизвестно (разбор
+  сделан до появления поля), и это сообщается как неизвестность, не как актуальность.
+- `claims_in_published` — сколько утверждений опубликованной версии ссылаются на этот
+  документ. Отличие от `facts_drafted` — честный ответ на «почему этого нет в версии».
+
+**Запуск нового цикла.**
+
+- `POST /api/partners/{id}/refresh` → `RefreshPlan`. Ставит в очередь то, чего не хватает,
+  в порядке зависимостей, и отчитывается по каждому шагу.
+
+`RefreshPlan`: `{steps: [RefreshStep], queued, message, requested_at}`.
+`RefreshStep`: `{kind, outcome, material_id, material_filename, job_id, message}`.
+
+- `kind`: `extraction` | `understanding` | `validation`.
+- `outcome`: `queued` | `already_running` | `up_to_date` | `needs_provider` | `waiting`.
+  **Только `queued` означает, что работа будет выполнена**; `queued` в ответе — это
+  счётчик реально поставленных шагов, а не оценка прогресса. Процентов и сроков здесь нет
+  и быть не может: ничто в системе их не измеряет.
+- Проверка ставится одна на партнёра: противоречие между двумя документами видно только
+  оттуда.
+
+**Повторное чтение документа.**
+
+- `POST /api/partners/{id}/materials/{material_id}/reprocess` → `Material`. Допустим для
+  `completed`, `partial`, `failed`; 409 `conflict` для `queued`, `processing` и
+  `quarantined`. Отличается от `.../retry` намеренно: retry продолжает незавершённую
+  работу и отказывает завершённому материалу, reprocess — это «явный запуск новой версии
+  обработчика» (`block-01-spec.md` §6.1). Оригинал не меняется; `content_revision` растёт,
+  и разбор, сделанный по прежнему чтению, становится различим как таковой.
+
+**История.**
+
+- `GET /api/partners/{id}/events?limit=&before=` → `{items: [Event]}`, новые первыми.
+  `limit` по умолчанию 50, максимум 200; `before` — страница назад по времени.
+
+`Event`: `{id, partner_id, kind, actor, material_id, version_id, job_id, run_id, summary,
+detail, occurred_at}`.
+
+- `kind` — закрытый словарь: `material_uploaded`, `material_duplicate`,
+  `material_reprocess_requested`, `material_extraction_finished`, `understanding_queued`,
+  `understanding_finished`, `validation_queued`, `validation_finished`,
+  `version_published`, `version_blocked`, `version_superseded`, `version_retracted`,
+  `refresh_requested`, `export_read`, `job_failed`, `retention_applied`.
+- `actor`: `owner` | `worker` | `system`. В локальном пилоте один человеческий аккаунт,
+  поэтому `owner` — максимально точное, что можно сказать честно.
+- `summary` — предложение, написанное сервером; интерфейс показывает его как есть.
+- `detail` — небольшой объект (счётчики, номер версии). Секретов там нет: у того, что
+  пишет события, нет к ним доступа.
+- Журнал **дописывается**: UPDATE запрещён всем, включая владельца схемы, DELETE — только
+  проходу очистки, который записывает сам себя.
+
+**Сравнение версий.**
+
+- `GET /api/partners/{id}/versions/{version_id}/changes?against=` → `VersionChanges`.
+  По умолчанию сравнение с предыдущей **опубликованной** версией по номеру.
+
+`VersionChanges`: `{from, to, counts, claims: [ClaimChange], readiness: [ReadinessChange],
+gaps: [GapChange], limitations[], message}`.
+
+- `counts` = `{added, removed, changed, unchanged}` — счётчики, не проценты.
+- `ClaimChange`: `{kind, scope, product_name, attribute, before, after, fields[], message}`;
+  `kind`: `added` | `removed` | `changed`; `fields` — какие поля разошлись
+  (`value_text`, `unit`, `conditions`, `status`, `sources`).
+- `ClaimSide`: `{claim_id, status, value_text, unit, conditions, sources[]}`;
+  `sources` — `файл#страница` либо хост, как их записала версия.
+- Совпадение утверждений определяется по **области, изделию и названию свойства**, а не по
+  `origin_id`: повторный разбор пишет новые строки кандидатов, и сравнение по
+  идентификатору объявило бы изменение одной цифры полной заменой версии.
+  Переименование свойства выглядит как удаление и добавление — это сказано в
+  `limitations[]` рядом с результатом.
+- Исчезнувшее утверждение не называется опровержением: `message` говорит, что источник мог
+  быть перечитан, изменён или стать недоступным.
+
+**Выгрузка для других агентов.**
+
+- `GET /api/partners/{id}/versions/{version_id}/export` → `ExportDocument`.
+  `{manifest, version, claims, gaps}`. Правила статусов те же, что у закрепления версии в
+  поиске: `published` и `superseded` отдаются, `revoked` — 409 с причиной,
+  `draft`/`validating`/`blocked` — 404, потому что для читателя они никогда не
+  публиковались.
+- `manifest`: `{schema, generated_at, bureau_slug, partner_id, partner_name, version_id,
+  version_number, version_status, published_at, superseded_at, input_fingerprint,
+  candidate_fingerprint, claims_total, claims_source_supported, gaps_total, disclosure[]}`.
+  `schema` = `otdel.knowledge-version.v1`. `disclosure[]` — оговорки словами: что
+  «подтверждено источником» не является независимой проверкой, что готовность ничего не
+  разрешает, что отсутствующие коммерческие условия не дополняются и что это снимок одной
+  версии.
+- Чтение выгрузки записывается событием `export_read`. Это GET, который пишет строку, и
+  так задумано: иначе на вопрос «кто и когда забрал копию отозванной версии» ответа нет.
+
+**Хранение.**
+
+- `GET /api/retention` → `RetentionPolicy` = `{state, event_days, job_days, keep_per_kind,
+  sweep_interval_seconds, preview, protected[], last_sweep, message}`.
+- `state`: `keep_everything` (по умолчанию) | `enabled`. Очистка включается переменными
+  `OTDEL_RETENTION_EVENT_DAYS` и `OTDEL_RETENTION_JOB_DAYS`; горизонт задания не может
+  превышать горизонт журнала, и конфигурация с таким сочетанием не запускает сервер.
+- `preview` = `{events_prunable, jobs_prunable, events_total, jobs_total, oldest_event}` —
+  что удалил бы проход прямо сейчас.
+- `protected[]` — что не удаляется никогда: опубликованные версии и их снимки (в том числе
+  замещённые и отозванные), оригиналы и страницы, незавершённые задания, запись о самой
+  очистке.
+- Удаление выполняется функцией БД с встроенным порогом (минимум 1 день); у рабочей роли
+  нет права DELETE ни на журнал, ни на очередь.
+
 ## Следующие контракты
 
-1F — обновления, расширение входов и приёмка. Контракт фиксируется до соответствующей
-UI-интеграции. Не создавать работающие на вид заглушки этих разделов раньше времени.
+Блок 1 контрактов больше не добавляет. Расширение входов (DOCX/XLSX/PPTX, веб-ссылки,
+ссылка загрузки партнёру, почта, мессенджеры) — отдельные подключаемые задачи; пока они не
+реализованы, они не значатся поддерживаемыми и не имеют здесь контракта.

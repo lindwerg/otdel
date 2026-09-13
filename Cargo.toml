@@ -76,6 +76,10 @@ serde_json = "1"
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = [
     "chrono",
+    # Phase 1F: the event log's `detail` column is `jsonb`. Without this feature a
+    # `serde_json::Value` can be neither bound nor decoded, and the payload would have to
+    # be stored as text — which would make the column unqueryable for no gain.
+    "json",
     "macros",
     "migrate",
     "postgres",

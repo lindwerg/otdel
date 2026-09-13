@@ -2,7 +2,9 @@ import type {
   AnswerRequest,
   AnswerResponse,
   ApiErrorBody,
+  ExportDocument,
   GlossaryTerm,
+  HistoryEvent,
   Job,
   KnowledgeGap,
   KnowledgeOverview,
@@ -16,6 +18,8 @@ import type {
   ProductNode,
   ProviderState,
   QaEntry,
+  RefreshPlan,
+  RefreshStatus,
   ResearchBudget,
   ResearchFinding,
   ResearchOverview,
@@ -23,12 +27,14 @@ import type {
   ResearchProviderState,
   ResearchQueryRecord,
   ResearchSource,
+  RetentionPolicy,
   RetrievalProviderState,
   SearchRequest,
   SearchResponse,
   SessionResponse,
   ValidationOverview,
   ValidationRun,
+  VersionChanges,
   VersionClaim,
   VersionGap,
 } from './types'
@@ -531,6 +537,83 @@ export async function listJobs(partnerId: string): Promise<Job[]> {
     `/partners/${encodeURIComponent(partnerId)}/jobs`,
   )
   return res.items
+}
+
+// --- phase 1F: updates, history, comparison, export, retention -----------------------
+
+function partnerPath(partnerId: string, suffix: string): string {
+  return `/partners/${encodeURIComponent(partnerId)}${suffix}`
+}
+
+/** Where the published version stands relative to the partner's documents, and why. */
+export function fetchRefreshStatus(partnerId: string): Promise<RefreshStatus> {
+  return apiRequest<RefreshStatus>(partnerPath(partnerId, '/refresh'))
+}
+
+/**
+ * Start whatever is missing, in dependency order.
+ *
+ * The answer is a report of what was really queued and why the rest was not —
+ * never an assertion that a cycle is "in progress".
+ */
+export function requestRefresh(partnerId: string, csrfToken: string): Promise<RefreshPlan> {
+  return apiRequest<RefreshPlan>(partnerPath(partnerId, '/refresh'), {
+    method: 'POST',
+    body: {},
+    csrfToken,
+  })
+}
+
+/** Read one document again, on purpose. Allowed only for a finished material. */
+export function reprocessMaterial(
+  partnerId: string,
+  materialId: string,
+  csrfToken: string,
+): Promise<Material> {
+  return apiRequest<Material>(
+    partnerPath(partnerId, `/materials/${encodeURIComponent(materialId)}/reprocess`),
+    { method: 'POST', body: {}, csrfToken },
+  )
+}
+
+export async function listEvents(partnerId: string, limit?: number): Promise<HistoryEvent[]> {
+  const query = limit == null ? '' : `?limit=${encodeURIComponent(String(limit))}`
+  const res = await apiRequest<ListResponse<HistoryEvent>>(
+    partnerPath(partnerId, `/events${query}`),
+  )
+  return res.items
+}
+
+/** What this version says that the previous published one did not. */
+export function fetchVersionChanges(
+  partnerId: string,
+  versionId: string,
+  against?: string,
+): Promise<VersionChanges> {
+  const query = against == null ? '' : `?against=${encodeURIComponent(against)}`
+  return apiRequest<VersionChanges>(
+    partnerPath(partnerId, `/versions/${encodeURIComponent(versionId)}/changes${query}`),
+  )
+}
+
+/**
+ * The read-only copy of one published (or once-published) version.
+ *
+ * Used by the interface to offer a download; a downstream agent calls the same
+ * endpoint directly. Reading it is recorded in the partner's history.
+ */
+export function fetchVersionExport(
+  partnerId: string,
+  versionId: string,
+): Promise<ExportDocument> {
+  return apiRequest<ExportDocument>(
+    partnerPath(partnerId, `/versions/${encodeURIComponent(versionId)}/export`),
+  )
+}
+
+/** The installation's retention policy, what it protects, and what a sweep would remove. */
+export function fetchRetentionPolicy(): Promise<RetentionPolicy> {
+  return apiRequest<RetentionPolicy>('/retention')
 }
 
 // --- Upload (real progress via XMLHttpRequest; fetch has no portable

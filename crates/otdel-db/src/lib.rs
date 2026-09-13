@@ -12,6 +12,7 @@
 //! [`tenancy`] for details.
 
 pub mod error;
+pub mod events;
 pub mod jobs;
 pub mod knowledge;
 pub mod knowledge_read;
@@ -25,6 +26,7 @@ pub mod research_read;
 pub mod retrieval;
 pub mod sessions;
 pub mod tenancy;
+pub mod updates;
 
 use std::time::Duration;
 
@@ -49,8 +51,8 @@ const MIGRATION_SEARCH_PATH: &str = "public";
 
 /// Tenant tables whose row-level security is verified before the server serves a
 /// request. Grows with the schema: 1A intake, 1B page evidence, 1C product draft,
-/// 1D research money and external sources.
-const TENANT_TABLES: [&str; 29] = [
+/// 1D research money and external sources, 1E published versions, 1F the event log.
+const TENANT_TABLES: [&str; 30] = [
     "partners",
     "materials",
     "jobs",
@@ -80,6 +82,7 @@ const TENANT_TABLES: [&str; 29] = [
     "version_gaps",
     "version_readiness",
     "version_chunks",
+    "events",
 ];
 
 #[derive(Debug, Clone)]

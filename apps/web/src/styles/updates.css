@@ -1,0 +1,369 @@
+/* Phase 1F — updates, history, comparison and retention.
+ *
+ * Same conventions as the other panels: BEM-ish blocks, state expressed through
+ * `data-state` / `data-tone` / `data-kind` attributes so CSS decides how a state
+ * looks and the components only say which state it is. No progress bar anywhere
+ * in this file, on purpose — nothing in this phase measures how long server work
+ * takes, so there is nothing for a bar to be the length of.
+ */
+
+/* --- actuality of the published knowledge ---------------------------------- */
+
+.refresh {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  padding: 1.25rem;
+  margin-bottom: 1.5rem;
+}
+
+.refresh__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.refresh__status {
+  margin: 0.35rem 0 0;
+  font-weight: 600;
+}
+
+.refresh__status[data-tone='success'] {
+  color: var(--success);
+}
+
+.refresh__status[data-tone='warn'] {
+  color: var(--warn);
+}
+
+.refresh__status[data-tone='error'] {
+  color: var(--warn-strong);
+}
+
+.refresh__status[data-tone='progress'] {
+  color: var(--accent);
+}
+
+.refresh__hint,
+.refresh__version {
+  margin: 0.5rem 0 0;
+  color: var(--muted);
+}
+
+.refresh__reasons,
+.refresh__plan,
+.refresh__sources {
+  margin-top: 1.25rem;
+}
+
+.refresh__reasons ul,
+.refresh__plan ul,
+.refresh__sources ul {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.refresh__reasons li,
+.refresh__plan li {
+  display: grid;
+  gap: 0.2rem;
+  border-left: 2px solid var(--line);
+  padding-left: 0.75rem;
+}
+
+/* The machine-readable code, kept small and quiet: the sentence beside it is
+   what the owner reads. */
+.refresh__reason-code,
+.refresh__step-kind {
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.refresh__reason-source,
+.refresh__source-counts,
+.refresh__step-message {
+  font-size: 0.86rem;
+  color: var(--muted);
+}
+
+.refresh__step-outcome {
+  font-weight: 600;
+}
+
+.refresh__step-outcome[data-tone='warn'] {
+  color: var(--warn);
+}
+
+.refresh__step-outcome[data-tone='success'] {
+  color: var(--success);
+}
+
+.refresh__step-outcome[data-tone='progress'] {
+  color: var(--accent);
+}
+
+.refresh__sources li {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 0.75rem;
+  background: var(--surface-2);
+}
+
+.refresh__source-head {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.refresh__source-name {
+  font-weight: 600;
+}
+
+.refresh__source-state[data-tone='warn'] {
+  color: var(--warn);
+}
+
+.refresh__source-state[data-tone='success'] {
+  color: var(--success);
+}
+
+.refresh__source-state[data-tone='progress'] {
+  color: var(--accent);
+}
+
+.refresh__source-message {
+  margin: 0.4rem 0 0.2rem;
+}
+
+.updates__actions {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 1.5rem;
+}
+
+/* --- comparison of two versions -------------------------------------------- */
+
+.changes {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  padding: 1.25rem;
+  margin-bottom: 1.5rem;
+}
+
+.changes__status {
+  margin: 0.35rem 0 0;
+  font-weight: 600;
+}
+
+.changes__status[data-tone='success'] {
+  color: var(--success);
+}
+
+.changes__status[data-tone='warn'] {
+  color: var(--warn);
+}
+
+.changes__status[data-tone='error'] {
+  color: var(--warn-strong);
+}
+
+.changes__not-live {
+  margin: 0.2rem 0 0;
+  color: var(--warn);
+  font-size: 0.9rem;
+}
+
+.changes__summary {
+  margin: 0.5rem 0 0.25rem;
+}
+
+.changes__counts {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.changes__claims,
+.changes__readiness ul,
+.changes__gaps ul,
+.changes__limitations ul {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.changes__claim {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 0.75rem;
+  background: var(--surface-2);
+}
+
+.changes__claim[data-kind='removed'] {
+  border-left: 3px solid var(--warn);
+}
+
+.changes__claim[data-kind='added'] {
+  border-left: 3px solid var(--success);
+}
+
+.changes__claim[data-kind='changed'] {
+  border-left: 3px solid var(--accent);
+}
+
+.changes__claim-head {
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  align-items: baseline;
+}
+
+.changes__kind {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.changes__attribute {
+  font-weight: 600;
+}
+
+.changes__message {
+  margin: 0.4rem 0;
+}
+
+.changes__sides {
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: 1fr;
+}
+
+.changes__side {
+  display: grid;
+  gap: 0.2rem;
+  border-left: 2px solid var(--line);
+  padding-left: 0.6rem;
+}
+
+.changes__side-label,
+.changes__sources,
+.changes__reason {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.changes__value {
+  font-weight: 600;
+}
+
+.changes__limitations {
+  margin-top: 1.25rem;
+  border-top: 1px solid var(--line);
+  padding-top: 0.75rem;
+}
+
+/* --- history ----------------------------------------------------------------- */
+
+.history {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  padding: 1.25rem;
+  margin-bottom: 1.5rem;
+}
+
+.history__list {
+  list-style: none;
+  margin: 0.75rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 0.6rem;
+}
+
+.history__item {
+  border-left: 2px solid var(--line);
+  padding-left: 0.75rem;
+}
+
+.history__item[data-kind='version_published'] {
+  border-left-color: var(--success);
+}
+
+.history__item[data-kind='version_retracted'],
+.history__item[data-kind='version_blocked'],
+.history__item[data-kind='job_failed'] {
+  border-left-color: var(--warn);
+}
+
+.history__head {
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  align-items: baseline;
+}
+
+.history__kind {
+  font-weight: 600;
+}
+
+.history__actor,
+.history__time {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.history__summary {
+  margin: 0.2rem 0 0;
+}
+
+/* --- retention and export ------------------------------------------------------ */
+
+.retention,
+.export {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  padding: 1.25rem;
+  margin-bottom: 1.5rem;
+}
+
+.retention__message {
+  margin: 0.5rem 0;
+}
+
+.retention__counts,
+.retention__oldest,
+.retention__last {
+  margin: 0.25rem 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.retention__protected ul,
+.export__disclosure ul {
+  list-style: disc;
+  margin: 0.5rem 0 0 1.1rem;
+  padding: 0;
+  display: grid;
+  gap: 0.4rem;
+  color: var(--muted);
+}
+
+@media (min-width: 768px) {
+  .changes__sides {
+    grid-template-columns: 1fr 1fr;
+  }
+}

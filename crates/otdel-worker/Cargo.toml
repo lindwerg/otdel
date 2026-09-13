@@ -21,6 +21,8 @@ otdel-storage.workspace = true
 
 chrono.workspace = true
 futures-util.workspace = true
+# Phase 1F: the structured half of an event the worker records.
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
 tracing.workspace = true

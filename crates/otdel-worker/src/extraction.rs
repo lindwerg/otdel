@@ -25,8 +25,9 @@ use otdel_core::extraction::{
     aggregate_material_status, ExtractionSummary, PageStatus, TextSource,
 };
 use otdel_core::model::{Job, JobKind, MaterialStatus};
+use otdel_core::updates::{EventActor, EventKind};
 use otdel_db::materials::StoredMaterial;
-use otdel_db::{jobs, materials, pages, Database};
+use otdel_db::{events, jobs, materials, pages, Database};
 use otdel_extract::{
     ExtractError, OcrPermission, PageProcessor, PageSource, PageText, PdfDocument,
     ToolAvailability, PARSER_NAME, PARSER_VERSION,
@@ -303,6 +304,14 @@ impl Extractor {
             )
             .await?;
             tx.commit().await?;
+        } else {
+            // Phase 1F: a single-page re-read is still a re-read of this document. The
+            // page's `text_content` is about to be rewritten, so any draft that cited it
+            // was made from text this material will no longer have — and the refresh
+            // status has to be able to say so.
+            let mut tx = self.db.begin_scoped(bureau_id).await?;
+            materials::note_page_reread(&mut tx, stored.material.id).await?;
+            tx.commit().await?;
         }
 
         let targets: Vec<_> = match job.page_number {
@@ -512,6 +521,43 @@ impl Extractor {
         // queued or running, so finishing a single-page retry cannot start a second
         // draft of the same material.
         let readable = summary.pages_extracted + summary.pages_partial > 0;
+
+        // Phase 1F: the history line for the reading itself, written in the same
+        // transaction as the status it describes.
+        let filename = material
+            .as_ref()
+            .map_or_else(|| "документ".to_owned(), |item| item.filename.clone());
+        events::record(
+            &mut tx,
+            &events::NewEvent::new(
+                EventKind::MaterialExtractionFinished,
+                EventActor::Worker,
+                format!(
+                    "чтение материала «{filename}» завершено ({}): страниц {}, прочитано \
+                     {}, требуют распознавания {}, с ошибкой {}",
+                    status.as_str(),
+                    summary.pages_total,
+                    summary.pages_extracted,
+                    summary.pages_needs_ocr,
+                    summary.pages_failed
+                ),
+            )
+            .for_partner(job.partner_id)
+            .about_material(material_id)
+            .about_job(job.id)
+            .with_detail(serde_json::json!({
+                "status": status.as_str(),
+                "pages_total": summary.pages_total,
+                "pages_extracted": summary.pages_extracted,
+                "pages_needs_ocr": summary.pages_needs_ocr,
+                "pages_failed": summary.pages_failed,
+                "content_revision": material
+                    .as_ref()
+                    .map(|item| item.content_revision),
+            })),
+        )
+        .await?;
+
         if failure.is_none() && readable {
             if jobs::understanding_pending(&mut tx, material_id).await? {
                 info!(
@@ -526,6 +572,21 @@ impl Extractor {
                     job.partner_id,
                     material_id,
                     otdel_knowledge::PROMPT_PROFILE,
+                )
+                .await?;
+                events::record(
+                    &mut tx,
+                    &events::NewEvent::new(
+                        EventKind::UnderstandingQueued,
+                        EventActor::Worker,
+                        format!(
+                            "материал «{filename}» передан продуктологу: страниц с текстом {}",
+                            summary.pages_extracted + summary.pages_partial
+                        ),
+                    )
+                    .for_partner(job.partner_id)
+                    .about_material(material_id)
+                    .about_job(queued.id),
                 )
                 .await?;
                 info!(

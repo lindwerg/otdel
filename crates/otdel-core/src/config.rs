@@ -18,6 +18,7 @@ use crate::error::AppError;
 use crate::extraction_config::ExtractionSettings;
 use crate::llm_config::LlmSettings;
 use crate::research_config::ResearchSettings;
+use crate::retention_config::RetentionSettings;
 use crate::retrieval_config::RetrievalSettings;
 use crate::secret;
 
@@ -104,6 +105,10 @@ pub struct Config {
     /// so an unconfigured embedding adapter means search runs keyword-only and says so,
     /// not that knowledge stops being published.
     pub retrieval: RetrievalSettings,
+    /// Phase 1F: how long the event log and the finished queue are kept. The default is
+    /// to keep everything; published versions and originals are never pruned whatever
+    /// this says.
+    pub retention: RetentionSettings,
 }
 
 impl fmt::Debug for Config {
@@ -138,6 +143,8 @@ impl fmt::Debug for Config {
             // ResearchSettings redacts its own key for the same reason.
             .field("research", &self.research)
             .field("retrieval", &self.retrieval)
+            // No secret here: horizons and an interval.
+            .field("retention", &self.retention)
             .finish()
     }
 }
@@ -306,6 +313,7 @@ impl Config {
         let llm = LlmSettings::load(source)?;
         let research = ResearchSettings::load(source)?;
         let retrieval = RetrievalSettings::load(source)?;
+        let retention = RetentionSettings::load(source)?;
 
         Ok(Self {
             env,
@@ -328,6 +336,7 @@ impl Config {
             llm,
             research,
             retrieval,
+            retention,
         })
     }
 
@@ -566,6 +575,19 @@ mod tests {
             "with no search endpoint configured the researcher must report what is \
              missing instead of reaching for some default service"
         );
+    }
+
+    #[test]
+    fn retention_defaults_to_keeping_everything() {
+        use crate::updates::RetentionState;
+
+        let config = Config::load(&base_env()).unwrap();
+        assert_eq!(
+            config.retention.state(),
+            RetentionState::KeepEverything,
+            "a pilot must not start deleting its own history because a default said so"
+        );
+        assert!(config.retention.horizons().is_none());
     }
 
     #[test]

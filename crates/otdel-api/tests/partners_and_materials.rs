@@ -138,10 +138,13 @@ async fn upload_stores_the_original_and_queues_extraction() {
         "error",
         // Phase 1B: the page roll-up, `null` until the worker has read anything.
         "extraction",
+        // Phase 1F: how many times this original has been *read*. `0` for a fresh
+        // upload — a changed file is a new material, so this only counts re-readings.
+        "content_revision",
     ] {
         assert!(material.get(field).is_some(), "missing {field}");
     }
-    assert_eq!(material.as_object().unwrap().len(), 11);
+    assert_eq!(material.as_object().unwrap().len(), 12);
     assert_eq!(material["partner_id"], partner.to_string());
     assert_eq!(material["media_type"], "application/pdf");
     assert_eq!(material["filename"], "каталог 2026.pdf");
@@ -153,6 +156,7 @@ async fn upload_stores_the_original_and_queues_extraction() {
     assert!(material["page_count"].is_null());
     assert!(material["error"].is_null());
     assert!(material["extraction"].is_null());
+    assert_eq!(material["content_revision"], 0);
 
     // The queue really holds a job for it.
     let jobs = app

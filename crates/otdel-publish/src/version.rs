@@ -18,7 +18,7 @@ use otdel_core::publication::{ReadinessEntry, ReadinessState};
 use sha2::{Digest, Sha256};
 
 use crate::chunk::normalise;
-use crate::claim::CheckedClaim;
+use crate::claim::{CandidateClaim, CheckedClaim};
 
 /// Fingerprint of the candidate set a version was built from.
 ///
@@ -37,6 +37,58 @@ pub fn fingerprint(claims: &[CheckedClaim]) -> String {
             hasher.update(claim.origin_id.as_bytes());
             hasher.update([0]);
             hasher.update(claim.status.as_str().as_bytes());
+            hasher.update([0]);
+            hasher.update(normalise(claim.product_name.as_deref().unwrap_or_default()).as_bytes());
+            hasher.update([0]);
+            hasher.update(normalise(&claim.attribute).as_bytes());
+            hasher.update([0]);
+            hasher.update(normalise(&claim.value_text).as_bytes());
+            hasher.update([0]);
+            hasher.update(normalise(claim.unit.as_deref().unwrap_or_default()).as_bytes());
+            hasher.update([0]);
+            hasher.update(normalise(claim.conditions.as_deref().unwrap_or_default()).as_bytes());
+            for evidence in &claim.evidence {
+                hasher.update([0]);
+                hasher.update(normalise(&evidence.quote).as_bytes());
+            }
+            hasher.finalize().into()
+        })
+        .collect();
+    digests.sort_unstable();
+
+    let mut outer = Sha256::new();
+    for digest in digests {
+        outer.update(digest);
+    }
+    hex::encode(outer.finalize())
+}
+
+/// Fingerprint of the **candidates alone**, without the verdicts the checker gave them.
+///
+/// [`fingerprint`] is verdict-sensitive on purpose: a source that changed underneath a
+/// claim produces a different published version even though no candidate row moved. That
+/// is exactly right for deciding what to publish, and useless for the question phase 1F
+/// has to answer on a plain GET — *is what we published still built from what the
+/// partner's documents currently say?* Answering that with [`fingerprint`] would mean
+/// running the whole check, which is the thing the owner is deciding whether to start.
+///
+/// So this covers what 1C and 1D actually stored: origin, product, property, value, unit,
+/// conditions and the quotations. Order-independent, folded the same way, and computed
+/// from the same rows the checker would read. Two consequences, both intended:
+///
+/// * a new document, a re-draft or a withdrawn fact changes it, and the refresh status
+///   says a new check would produce something different;
+/// * a source that changed *under* an unchanged candidate does **not** change it. That
+///   case is caught by the source-revision comparison instead, which is why the refresh
+///   status carries both and does not pretend one subsumes the other.
+pub fn candidate_fingerprint(claims: &[CandidateClaim]) -> String {
+    let mut digests: Vec<[u8; 32]> = claims
+        .iter()
+        .map(|claim| {
+            let mut hasher = Sha256::new();
+            hasher.update(claim.origin.as_str().as_bytes());
+            hasher.update([0]);
+            hasher.update(claim.origin_id.as_bytes());
             hasher.update([0]);
             hasher.update(normalise(claim.product_name.as_deref().unwrap_or_default()).as_bytes());
             hasher.update([0]);
@@ -211,6 +263,68 @@ mod tests {
         assert!(value
             .chars()
             .all(|ch| ch.is_ascii_hexdigit() && !ch.is_uppercase()));
+    }
+
+    fn candidate(id: u128, value: &str) -> CandidateClaim {
+        CandidateClaim {
+            origin: ClaimOrigin::PartnerMaterial,
+            origin_id: Uuid::from_u128(id),
+            product_name: Some("BP21".to_owned()),
+            kind: FactKind::Characteristic,
+            attribute: "нагрузка".to_owned(),
+            value_text: value.to_owned(),
+            unit: None,
+            conditions: None,
+            model_context: None,
+            evidence: vec![crate::claim::CandidateEvidence {
+                source_kind: EvidenceSourceKind::Material,
+                material_id: Some(Uuid::from_u128(1)),
+                material_filename: Some("catalogue.pdf".to_owned()),
+                page_number: Some(3),
+                region_id: None,
+                url: None,
+                host: None,
+                retrieved_at: None,
+                content_hash: None,
+                quote: "BP21 3.5 kN".to_owned(),
+                char_start: 0,
+                char_end: 10,
+                source_text: Some("BP21 3.5 kN".to_owned()),
+            }],
+        }
+    }
+
+    #[test]
+    fn the_candidate_fingerprint_ignores_order_and_notices_a_new_candidate() {
+        let a = candidate(1, "3.5");
+        let b = candidate(2, "1200");
+        assert_eq!(
+            candidate_fingerprint(&[a.clone(), b.clone()]),
+            candidate_fingerprint(&[b.clone(), a.clone()])
+        );
+        assert_ne!(
+            candidate_fingerprint(std::slice::from_ref(&a)),
+            candidate_fingerprint(&[a, b])
+        );
+    }
+
+    #[test]
+    fn the_candidate_fingerprint_is_not_the_published_one() {
+        // They answer different questions and must not be compared with each other: one
+        // includes verdicts, the other cannot, because computing a verdict is the check.
+        let checked = fingerprint(&[claim(1, "3.5", ClaimStatus::SourceSupported)]);
+        let candidates = candidate_fingerprint(&[candidate(1, "3.5")]);
+        assert_ne!(checked, candidates);
+        assert_eq!(candidates.len(), 64);
+        assert!(candidates.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn a_changed_value_changes_the_candidate_fingerprint() {
+        assert_ne!(
+            candidate_fingerprint(&[candidate(1, "3.5")]),
+            candidate_fingerprint(&[candidate(1, "9.9")])
+        );
     }
 
     #[test]

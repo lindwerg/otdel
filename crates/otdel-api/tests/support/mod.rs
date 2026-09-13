@@ -700,6 +700,25 @@ impl TestApp {
         }
     }
 
+    /// Phase 1F: an app whose retention policy is switched on.
+    ///
+    /// Retention is off by default — a pilot that pruned its own history because a
+    /// default said so would lose the evidence of its first month — so the tests that
+    /// assert what a sweep removes have to turn it on explicitly, and they go through the
+    /// real `Config::load` in order to do it. A test cannot construct a policy the server
+    /// would refuse.
+    pub async fn start_with_retention(event_days: u32, job_days: Option<u32>) -> Self {
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert(
+            "OTDEL_RETENTION_EVENT_DAYS".to_owned(),
+            event_days.to_string(),
+        );
+        if let Some(days) = job_days {
+            overrides.insert("OTDEL_RETENTION_JOB_DAYS".to_owned(), days.to_string());
+        }
+        Self::start_with_env(overrides).await
+    }
+
     /// The phase 1E worker, with the supplied optional adapters.
     pub fn validation_worker(
         &self,
@@ -753,7 +772,23 @@ impl TestApp {
     }
 
     /// Start with research configuration applied on top of the standard test settings.
+    /// Start with arbitrary extra environment applied on top of the test defaults.
+    ///
+    /// Everything still goes through the real `Config::load`, so an override that the
+    /// server would reject fails the test at startup rather than producing an app in a
+    /// state the product cannot be in.
+    pub async fn start_with_env(extra: std::collections::BTreeMap<String, String>) -> Self {
+        Self::start_with(ResearchOverrides::default(), extra).await
+    }
+
     async fn start_with_settings(settings: ResearchOverrides) -> Self {
+        Self::start_with(settings, std::collections::BTreeMap::new()).await
+    }
+
+    async fn start_with(
+        settings: ResearchOverrides,
+        extra: std::collections::BTreeMap<String, String>,
+    ) -> Self {
         let runtime_url = require_env("OTDEL_TEST_DATABASE_URL");
         let admin_url = require_env("OTDEL_TEST_ADMIN_DATABASE_URL");
 
@@ -767,6 +802,7 @@ impl TestApp {
         let storage_root = std::env::temp_dir().join(format!("otdel-api-test-{}", Uuid::new_v4()));
         let mut source = test_config_source(&runtime_url, &slug, &storage_root);
         settings.apply(&mut source);
+        source.extend(extra);
         let config = Config::load(&source).expect("test configuration");
 
         let db = Database::connect(&config.database_url, 5)

@@ -727,6 +727,11 @@ export interface KnowledgeVersion {
   /** Which candidates, at which revisions, went in. A late run with an older
    *  fingerprint than the published one is not published. */
   input_fingerprint: string
+  /** Phase 1F: the same candidates without their verdicts, so "is this still
+   *  built from what the documents say" is answerable without a new check.
+   *  `null` for a version published before it was recorded — reported as a
+   *  comparison that cannot be made, never as "nothing changed". */
+  candidate_fingerprint: string | null
   claims_total: number
   claims_source_supported: number
   claims_hypothesis: number
@@ -996,4 +1001,265 @@ export interface ApiErrorBody {
 
 export interface ListResponse<T> {
   items: T[]
+}
+
+// --- phase 1F: the update cycle ------------------------------------------------------
+
+/**
+ * Where the published knowledge stands relative to the partner's documents.
+ *
+ * Computed on every request from rows that exist — there is no stored "stale"
+ * flag, so the interface cannot show one that somebody forgot to update.
+ */
+export type RefreshState =
+  | 'never_published'
+  | 'current'
+  | 'revalidation_required'
+  | 'checking'
+  | 'retracted'
+
+export type RefreshReasonCode =
+  | 'material_not_read'
+  | 'material_not_drafted'
+  | 'source_reread'
+  | 'candidates_changed'
+  | 'comparison_unavailable'
+  | 'last_check_blocked'
+  | 'last_check_failed'
+  | 'version_retracted'
+  | 'nothing_published'
+
+export interface RefreshReason {
+  code: RefreshReasonCode
+  /** Shown verbatim. */
+  message: string
+  material_id: string | null
+  material_filename: string | null
+  version_id: string | null
+  version_number: number | null
+  content_revision: number | null
+  drafted_revision: number | null
+}
+
+export type SourceState =
+  | 'reading'
+  | 'unreadable'
+  | 'not_drafted'
+  | 'drafted'
+  | 'reread_after_draft'
+
+export interface SourceRefresh {
+  material_id: string
+  filename: string
+  material_status: MaterialStatus
+  state: SourceState
+  /** How many times this stored original has been *read*. */
+  content_revision: number
+  /** Which reading the current draft used; `null` = unknown, never "current". */
+  drafted_revision: number | null
+  /**
+   * The 1C run's own status, or `null` when the product role never ran over this
+   * document. Needed because `drafted_revision` is recorded when a run *starts*:
+   * a run that then failed leaves a number that looks exactly like success.
+   */
+  draft_status:
+    | 'queued'
+    | 'running'
+    | 'completed'
+    | 'partial'
+    | 'failed'
+    | 'needs_provider'
+    | null
+  facts_drafted: number
+  claims_in_published: number
+  message: string
+}
+
+export interface VersionRef1F {
+  id: string
+  number: number
+  status: string
+  published_at: string | null
+}
+
+export interface RefreshStatus {
+  state: RefreshState
+  published: VersionRef1F | null
+  latest: VersionRef1F | null
+  reasons: RefreshReason[]
+  sources: SourceRefresh[]
+  candidate_fingerprint: string
+  published_candidate_fingerprint: string | null
+  checking: boolean
+  message: string
+  computed_at: string
+}
+
+export type RefreshStepKind = 'extraction' | 'understanding' | 'validation'
+
+/** `queued` is the only outcome that means work will happen. */
+export type RefreshStepOutcome =
+  | 'queued'
+  | 'already_running'
+  | 'up_to_date'
+  | 'needs_provider'
+  | 'waiting'
+
+export interface RefreshStep {
+  kind: RefreshStepKind
+  outcome: RefreshStepOutcome
+  material_id: string | null
+  material_filename: string | null
+  job_id: string | null
+  message: string
+}
+
+export interface RefreshPlan {
+  steps: RefreshStep[]
+  /** How many steps were really queued. Counts, never a percentage. */
+  queued: number
+  message: string
+  requested_at: string
+}
+
+export type EventKind =
+  | 'material_uploaded'
+  | 'material_duplicate'
+  | 'material_reprocess_requested'
+  | 'material_extraction_finished'
+  | 'understanding_queued'
+  | 'understanding_finished'
+  | 'validation_queued'
+  | 'validation_finished'
+  | 'version_published'
+  | 'version_blocked'
+  | 'version_superseded'
+  | 'version_retracted'
+  | 'refresh_requested'
+  | 'export_read'
+  | 'job_failed'
+  | 'retention_applied'
+
+export type EventActor = 'owner' | 'worker' | 'system'
+
+export interface HistoryEvent {
+  id: string
+  partner_id: string | null
+  kind: EventKind
+  actor: EventActor
+  material_id: string | null
+  version_id: string | null
+  job_id: string | null
+  run_id: string | null
+  /** The server's sentence, shown as it is. */
+  summary: string
+  detail: Record<string, unknown>
+  occurred_at: string
+}
+
+export type ChangeKind = 'added' | 'removed' | 'changed'
+
+export interface ClaimSide {
+  claim_id: string
+  status: ClaimStatus
+  value_text: string
+  unit: string | null
+  conditions: string | null
+  /** `filename#page` or a host, as the version recorded it. */
+  sources: string[]
+}
+
+export interface ClaimChange {
+  kind: ChangeKind
+  scope: ClaimScope
+  product_name: string | null
+  attribute: string
+  before: ClaimSide | null
+  after: ClaimSide | null
+  fields: string[]
+  message: string
+}
+
+export interface ReadinessChange {
+  topic: ReadinessTopic
+  before: ReadinessState | null
+  after: ReadinessState | null
+  reason: string
+}
+
+export interface GapChange {
+  kind: ChangeKind
+  topic: string
+  missing: string
+  product_name: string | null
+}
+
+export interface ChangeCounts {
+  added: number
+  removed: number
+  changed: number
+  unchanged: number
+}
+
+export interface VersionChanges {
+  /** `null` for a partner's first version: there is nothing to compare with. */
+  from: VersionRef1F | null
+  to: VersionRef1F
+  counts: ChangeCounts
+  claims: ClaimChange[]
+  readiness: ReadinessChange[]
+  gaps: GapChange[]
+  /** What the comparison cannot see. Shown next to the result. */
+  limitations: string[]
+  message: string
+}
+
+export type RetentionState = 'keep_everything' | 'enabled'
+
+export interface RetentionPreview {
+  events_prunable: number
+  jobs_prunable: number
+  events_total: number
+  jobs_total: number
+  oldest_event: string | null
+}
+
+export interface RetentionPolicy {
+  state: RetentionState
+  event_days: number | null
+  job_days: number | null
+  keep_per_kind: number
+  sweep_interval_seconds: number
+  preview: RetentionPreview
+  /** What retention never removes, in words. */
+  protected: string[]
+  last_sweep: HistoryEvent | null
+  message: string
+}
+
+export interface ExportManifest {
+  schema: string
+  generated_at: string
+  bureau_slug: string
+  partner_id: string
+  partner_name: string
+  version_id: string
+  version_number: number
+  version_status: string
+  published_at: string | null
+  superseded_at: string | null
+  input_fingerprint: string
+  candidate_fingerprint: string | null
+  claims_total: number
+  claims_source_supported: number
+  gaps_total: number
+  /** The caveats that travel with the file. */
+  disclosure: string[]
+}
+
+export interface ExportDocument {
+  manifest: ExportManifest
+  version: KnowledgeVersion
+  claims: VersionClaim[]
+  gaps: VersionGap[]
 }

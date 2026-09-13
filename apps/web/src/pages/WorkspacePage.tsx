@@ -10,15 +10,17 @@ import { PartnerSidebar } from '../components/PartnerSidebar'
 import { PublicationPanel } from '../components/publication/PublicationPanel'
 import { ResearchPanel } from '../components/research/ResearchPanel'
 import { StatusMessage } from '../components/StatusMessage'
+import { UpdatesPanel } from '../components/updates/UpdatesPanel'
 
 /** Sections of the partner card that exist today. Knowledge is phase 1C,
- *  research 1D and published versions 1E; updates and acceptance arrive with 1F
- *  and are deliberately absent rather than stubbed. */
+ *  research 1D, published versions 1E, and the cycle around them — what is out
+ *  of date, what changed, what happened and what is kept — is 1F. */
 const TABS = [
   { id: 'materials', label: 'Материалы' },
   { id: 'knowledge', label: 'Знания' },
   { id: 'research', label: 'Исследование' },
   { id: 'published', label: 'Версии и поиск' },
+  { id: 'updates', label: 'Обновления' },
 ] as const
 
 type TabId = (typeof TABS)[number]['id']
@@ -238,8 +240,10 @@ export function WorkspacePage() {
                 <KnowledgePanel key={selectedPartner.id} partnerId={selectedPartner.id} />
               ) : activeTab === 'research' ? (
                 <ResearchPanel key={selectedPartner.id} partnerId={selectedPartner.id} />
-              ) : (
+              ) : activeTab === 'published' ? (
                 <PublicationPanel key={selectedPartner.id} partnerId={selectedPartner.id} />
+              ) : (
+                <UpdatesPanel key={selectedPartner.id} partnerId={selectedPartner.id} />
               )}
             </>
           ) : null}

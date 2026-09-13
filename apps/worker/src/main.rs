@@ -239,7 +239,8 @@ async fn run(mode: Mode) -> Result<()> {
              sessions_purged={} leases_reclaimed={} stalled_runs_settled={} \
              stalled_plans_settled={} stalled_checks_settled={} reservations_released={} \
              staging_files_removed={} \
-             objects_scanned={} orphan_objects={} scan_truncated={}",
+             objects_scanned={} orphan_objects={} scan_truncated={} \
+             retention_ran={} events_pruned={} jobs_pruned={}",
             extraction.jobs_claimed,
             extraction.jobs_completed,
             extraction.jobs_failed,
@@ -280,7 +281,10 @@ async fn run(mode: Mode) -> Result<()> {
             recovery.staging_files_removed,
             recovery.objects_scanned,
             recovery.orphan_objects,
-            recovery.scan_truncated
+            recovery.scan_truncated,
+            recovery.retention_ran,
+            recovery.events_pruned,
+            recovery.jobs_pruned
         );
         return Ok(());
     }
@@ -406,6 +410,9 @@ async fn serve(
                             objects_scanned = report.objects_scanned,
                             orphan_objects = report.orphan_objects,
                             scan_truncated = report.scan_truncated,
+                            retention_ran = report.retention_ran,
+                            events_pruned = report.events_pruned,
+                            jobs_pruned = report.jobs_pruned,
                             "maintenance pass finished"
                         ),
                         Err(error) => warn!(error = %error, "maintenance pass failed"),

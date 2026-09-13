@@ -6,6 +6,7 @@
 //! feature that works.
 
 pub mod health;
+pub mod history;
 pub mod jobs;
 pub mod knowledge;
 pub mod materials;
@@ -16,6 +17,7 @@ pub mod research;
 pub mod retrieval;
 pub mod retrieval_state;
 pub mod session;
+pub mod updates;
 
 use axum::extract::DefaultBodyLimit;
 use axum::http::{header, HeaderName, HeaderValue, Method};
@@ -165,6 +167,27 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/partners/{partner_id}/retrieval/answer",
             post(retrieval::ask),
+        )
+        // Phase 1F: the cycle around a published version. What is out of date and why,
+        // what starts a new cycle, what happened, what changed, and the read-only copy a
+        // downstream agent takes.
+        .route("/retention", get(history::retention))
+        .route(
+            "/partners/{partner_id}/refresh",
+            get(updates::status).post(updates::refresh),
+        )
+        .route("/partners/{partner_id}/events", get(history::events))
+        .route(
+            "/partners/{partner_id}/materials/{material_id}/reprocess",
+            post(updates::reprocess),
+        )
+        .route(
+            "/partners/{partner_id}/versions/{version_id}/changes",
+            get(publication::changes),
+        )
+        .route(
+            "/partners/{partner_id}/versions/{version_id}/export",
+            get(publication::export),
         )
         .route("/partners/{partner_id}/jobs", get(jobs::list))
         .layer(DefaultBodyLimit::max(upload_limit));

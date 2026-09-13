@@ -17,6 +17,8 @@ otdel-publish.workspace = true
 
 chrono.workspace = true
 log = "0.4"
+# Phase 1F: an event carries a small structured payload, stored as `jsonb`.
+serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

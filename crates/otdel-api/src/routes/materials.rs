@@ -13,9 +13,10 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{body::Body, Json};
 use otdel_core::model::{media_type_string, Material};
+use otdel_core::updates::{EventActor, EventKind};
 use otdel_core::{validate, AppError};
 use otdel_db::materials::{self, InsertOutcome, NewMaterial};
-use otdel_db::{jobs, partners};
+use otdel_db::{events, jobs, partners};
 use otdel_storage::{ObjectKey, ObjectNamespace};
 use tracing::{error, info};
 use uuid::Uuid;
@@ -103,7 +104,42 @@ pub async fn upload(
         let material = match &outcome {
             InsertOutcome::Created(material) | InsertOutcome::Duplicate(material) => material,
         };
-        jobs::enqueue_extraction(&mut tx, partner_id, material.id).await?;
+        let job = jobs::enqueue_extraction(&mut tx, partner_id, material.id).await?;
+
+        // Phase 1F: the history line, in the same transaction as the row it describes.
+        // A duplicate is recorded too, and as its own kind: "я загрузил файл и ничего не
+        // произошло" has an answer, and the answer is that these bytes were already here.
+        let (kind, summary) = match &outcome {
+            InsertOutcome::Created(material) => (
+                EventKind::MaterialUploaded,
+                format!(
+                    "загружен материал «{}» ({} байт); поставлен в очередь на чтение",
+                    material.filename, material.size_bytes
+                ),
+            ),
+            InsertOutcome::Duplicate(material) => (
+                EventKind::MaterialDuplicate,
+                format!(
+                    "повторная загрузка «{}»: файл с тем же содержимым уже есть у этого \
+                     партнёра, новая копия не создана",
+                    material.filename
+                ),
+            ),
+        };
+        events::record(
+            &mut tx,
+            &events::NewEvent::new(kind, EventActor::Owner, summary)
+                .for_partner(partner_id)
+                .about_material(material.id)
+                .about_job(job.id)
+                .with_detail(serde_json::json!({
+                    "media_type": material.media_type,
+                    "size_bytes": material.size_bytes,
+                    "sha256": material.sha256,
+                })),
+        )
+        .await?;
+
         tx.commit().await?;
         Ok::<_, otdel_db::DbError>(outcome)
     }

@@ -61,6 +61,7 @@ fn version_from_row(row: &PgRow, readiness: Vec<ReadinessEntry>) -> DbResult<Kno
             .ok_or_else(|| DbError::Decode(format!("unknown version status `{status}`")))?,
         validation_run_id: row.try_get("validation_run_id")?,
         input_fingerprint: row.try_get("input_fingerprint")?,
+        candidate_fingerprint: row.try_get("candidate_fingerprint")?,
         claims_total: count(row, "claims_total")?,
         claims_source_supported: count(row, "claims_source_supported")?,
         claims_hypothesis: count(row, "claims_hypothesis")?,
@@ -173,6 +174,30 @@ pub async fn published_fingerprint(
     .fetch_optional(tx.conn())
     .await?;
     row.map(|row| row.try_get::<String, _>("input_fingerprint"))
+        .transpose()
+        .map_err(DbError::from)
+}
+
+/// Phase 1F: the candidate fingerprint of what is published now, when it has one.
+///
+/// Two levels of `Option` and both mean something. The outer one is "nothing is
+/// published". The inner one is "this version predates the column", which happens for
+/// anything phase 1E published: the refresh status reports that as a comparison it cannot
+/// make, never as "ничего не изменилось".
+pub async fn published_candidate_fingerprint(
+    tx: &mut ScopedTx,
+    partner_id: Uuid,
+) -> DbResult<Option<Option<String>>> {
+    let bureau_id = tx.bureau_id();
+    let row = sqlx::query(
+        "SELECT candidate_fingerprint FROM otdel.knowledge_versions \
+          WHERE bureau_id = $1 AND partner_id = $2 AND status = 'published'",
+    )
+    .bind(bureau_id)
+    .bind(partner_id)
+    .fetch_optional(tx.conn())
+    .await?;
+    row.map(|row| row.try_get::<Option<String>, _>("candidate_fingerprint"))
         .transpose()
         .map_err(DbError::from)
 }

@@ -223,6 +223,14 @@ pub struct MaintenanceReport {
     pub orphan_objects: usize,
     /// `true` when the object scan hit its limit and did not see everything.
     pub scan_truncated: bool,
+    /// Phase 1F retention. Both stay `0` with no policy configured, which is the default
+    /// and is reported rather than assumed.
+    pub events_pruned: i64,
+    pub jobs_pruned: i64,
+    /// Whether a retention pass ran at all in this maintenance tick. A sweep is paced
+    /// separately from maintenance, so "0 removed" and "did not run" are different
+    /// answers and the report keeps them apart.
+    pub retention_ran: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -237,13 +245,18 @@ pub enum MaintenanceError {
 
 /// Maintenance describes itself as phase 1A recovery; the extraction half lives in
 /// [`extraction`] and is driven by the binary in `apps/worker`.
-pub const MAINTENANCE_SCOPE: &str = "sessions, job leases, upload staging, orphan objects";
+pub const MAINTENANCE_SCOPE: &str =
+    "sessions, job leases, upload staging, orphan objects, history retention";
 
 pub struct Maintenance {
     config: Arc<Config>,
     db: Database,
     store: Arc<dyn ObjectStore>,
     settings: MaintenanceSettings,
+    /// When the retention sweep last ran, so it can be paced independently of the rest
+    /// of maintenance. A `Mutex` rather than an atomic because the value is an `Instant`
+    /// and the contention is one worker thread every five minutes.
+    last_retention: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl Maintenance {
@@ -258,6 +271,7 @@ impl Maintenance {
             db,
             store,
             settings,
+            last_retention: std::sync::Mutex::new(None),
         }
     }
 
@@ -307,7 +321,86 @@ impl Maintenance {
         report.objects_scanned = scanned;
         report.scan_truncated = truncated;
 
+        if let Some(outcome) = self.sweep_retention(bureau_id).await? {
+            report.retention_ran = true;
+            report.events_pruned = outcome.events_removed;
+            report.jobs_pruned = outcome.jobs_removed;
+        }
+
         Ok(report)
+    }
+
+    /// Phase 1F — prune operational history, if a policy says to and enough time has
+    /// passed since the last time.
+    ///
+    /// Returns `None` when nothing ran, which is the normal state: retention is off by
+    /// default. The distinction between "did not run" and "ran and removed nothing" is
+    /// kept all the way out to the worker's report, because the second one means the
+    /// policy is working and the first one means it is not configured.
+    ///
+    /// The sweep's own record is written **outside** the deleting transaction
+    /// ([`otdel_db::events::record_standalone`]). The trigger that permits a retention
+    /// delete is transaction-local, so writing the record inside would put exactly one
+    /// event under a flag whose whole purpose is to allow removal.
+    async fn sweep_retention(
+        &self,
+        bureau_id: Uuid,
+    ) -> Result<Option<otdel_db::updates::RetentionOutcome>, MaintenanceError> {
+        let Some(horizons) = self.config.retention.horizons() else {
+            return Ok(None);
+        };
+
+        {
+            // A poisoned lock here means another thread panicked while holding it; the
+            // value is a timestamp and losing it costs one extra sweep, so the pass
+            // continues rather than propagating a panic into maintenance.
+            let mut last = self
+                .last_retention
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(previous) = *last {
+                if previous.elapsed() < self.config.retention.sweep_interval {
+                    return Ok(None);
+                }
+            }
+            *last = Some(std::time::Instant::now());
+        }
+
+        let mut tx = self.db.begin_scoped(bureau_id).await?;
+        let outcome = otdel_db::updates::apply_retention(&mut tx, horizons).await?;
+        tx.commit().await?;
+
+        if !outcome.is_empty() {
+            otdel_db::events::record_standalone(
+                &self.db,
+                bureau_id,
+                &otdel_db::events::NewEvent::new(
+                    otdel_core::updates::EventKind::RetentionApplied,
+                    otdel_core::updates::EventActor::System,
+                    format!(
+                        "очистка истории: удалено событий {}, завершённых заданий {}. \
+                         Опубликованные версии, их снимки и оригиналы не затрагиваются",
+                        outcome.events_removed, outcome.jobs_removed
+                    ),
+                )
+                .with_detail(serde_json::json!({
+                    "events_removed": outcome.events_removed,
+                    "jobs_removed": outcome.jobs_removed,
+                    "event_days": horizons.event_days,
+                    "job_days": horizons.job_days,
+                    "keep_per_kind": horizons.keep_per_kind,
+                })),
+            )
+            .await?;
+
+            info!(
+                events_removed = outcome.events_removed,
+                jobs_removed = outcome.jobs_removed,
+                "retention pass removed operational history"
+            );
+        }
+
+        Ok(Some(outcome))
     }
 
     /// Compare stored objects with material rows of this bureau.

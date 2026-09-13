@@ -42,6 +42,13 @@ pub struct Material {
     pub created_at: DateTime<Utc>,
     pub error: Option<String>,
     pub extraction: Option<ExtractionSummary>,
+    /// Phase 1F: how many times this stored original has been **read**.
+    ///
+    /// Not how many times it was uploaded — a changed file is a different material,
+    /// because deduplication is by content. `0` means "never read"; anything above `1`
+    /// means the text behind this id has been produced again, which is what makes a
+    /// draft taken from an earlier reading identifiable as such.
+    pub content_revision: i32,
 }
 
 /// `{id,partner_id,material_id,page_number,kind,status,stage,attempts,created_at,
@@ -121,6 +128,35 @@ impl MaterialStatus {
     /// * `quarantined` — the content itself was rejected, repeating cannot change that.
     pub const fn can_retry(self) -> bool {
         matches!(self, Self::Failed | Self::Partial)
+    }
+
+    /// Whether a **reprocess** may be started — phase 1F's "read this document again".
+    ///
+    /// Wider than [`Self::can_retry`] on purpose, and the difference is the whole point
+    /// of having two. A retry is for work that did not finish. A reprocess is for work
+    /// that finished and should be done again: a better OCR engine, a fixed parser, or
+    /// simply doubt about what was read. `block-01-spec.md` §6.1 allows exactly that —
+    /// «явный запуск новой версии обработчика допускается» — while re-running the same
+    /// profile over an unchanged file is expected to reuse what is stored.
+    ///
+    /// `Queued` and `Processing` are refused because the reading they would repeat has
+    /// not happened yet; `Quarantined` is refused because the file never passed intake,
+    /// and re-reading it would be re-reading something this system declined to open.
+    pub const fn can_reprocess(self) -> bool {
+        matches!(self, Self::Completed | Self::Partial | Self::Failed)
+    }
+
+    /// Explains why a reprocess was refused, in the owner's terms.
+    pub fn reprocess_refusal(self) -> AppError {
+        let message = match self {
+            Self::Queued => "материал уже стоит в очереди на чтение",
+            Self::Processing => "материал читается прямо сейчас: дождитесь окончания",
+            Self::Quarantined => {
+                "файл не прошёл приём и не читался; повторное чтение нечего повторять"
+            }
+            Self::Completed | Self::Partial | Self::Failed => "материал можно перечитать",
+        };
+        AppError::new(ErrorCode::Conflict, message)
     }
 
     /// Explains, without leaking internals, why a retry was refused.
@@ -311,6 +347,26 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_material_can_be_reread_even_though_it_cannot_be_retried() {
+        // The 1F distinction: a retry resumes work that did not finish, a reprocess
+        // repeats work that did.
+        assert!(MaterialStatus::Completed.can_reprocess());
+        assert!(!MaterialStatus::Completed.can_retry());
+        assert!(MaterialStatus::Partial.can_reprocess());
+        assert!(MaterialStatus::Failed.can_reprocess());
+
+        for status in [
+            MaterialStatus::Queued,
+            MaterialStatus::Processing,
+            MaterialStatus::Quarantined,
+        ] {
+            assert!(!status.can_reprocess(), "{}", status.as_str());
+            assert_eq!(status.reprocess_refusal().code, ErrorCode::Conflict);
+            assert!(!status.reprocess_refusal().message.is_empty());
+        }
+    }
+
+    #[test]
     fn idempotency_key_is_stable_per_material() {
         let material = Uuid::from_u128(7);
         assert_eq!(
@@ -453,13 +509,16 @@ mod tests {
             created_at: now,
             error: None,
             extraction: None,
+            content_revision: 0,
         };
         let value = serde_json::to_value(&material).unwrap();
         let object = value.as_object().unwrap();
-        assert_eq!(object.len(), 11);
-        // A queued material must not look read: no pages, no summary, no page count.
+        assert_eq!(object.len(), 12);
+        // A queued material must not look read: no pages, no summary, no page count, and
+        // a reading count of zero rather than a default of one.
         assert!(object["extraction"].is_null());
         assert!(object["page_count"].is_null());
         assert_eq!(object["status"], "queued");
+        assert_eq!(object["content_revision"], 0);
     }
 }

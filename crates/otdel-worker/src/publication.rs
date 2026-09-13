@@ -26,10 +26,11 @@ use std::time::Duration;
 use otdel_core::config::Config;
 use otdel_core::model::{Job, JobKind};
 use otdel_core::publication::{ClaimStatus, ValidationRunStatus};
+use otdel_core::updates::{EventActor, EventKind};
 use otdel_db::publication::{
     self, NewClaim, NewEvidence, NewGap, NewVersion, PublishOutcome, RunOutcome,
 };
-use otdel_db::{jobs, partners, publication_read, Database};
+use otdel_db::{events, jobs, partners, publication_read, Database};
 use otdel_embed::{EmbedRequest, EmbeddingProvider};
 use otdel_llm::LlmProvider;
 use otdel_publish::{check_claims, chunk, readiness, version, CheckedClaim, PublicationDecision};
@@ -53,6 +54,8 @@ pub struct ValidationReport {
     pub claims_checked: u32,
     pub claims_rejected: u32,
     pub chunks_embedded: u32,
+    /// Phase 1F: checks queued again because candidates appeared while one was running.
+    pub checks_requeued: u32,
 }
 
 pub struct ValidationWorker {
@@ -113,6 +116,12 @@ impl ValidationWorker {
                     }
                     self.settle(bureau_id, &job, None).await?;
                     report.jobs_completed += 1;
+                    if self
+                        .follow_up(bureau_id, &job, outcome.inputs.as_deref())
+                        .await?
+                    {
+                        report.checks_requeued += 1;
+                    }
                 }
                 Err(error) => {
                     warn!(
@@ -130,6 +139,69 @@ impl ValidationWorker {
         }
 
         Ok(report)
+    }
+
+    /// Queue another check when candidates appeared **while this one was running**.
+    ///
+    /// The check reads its candidates once, in its first transaction. A draft that commits
+    /// after that moment is not in the version this run produced — and `queue_check` in the
+    /// understanding worker could not help, because it sees a check already `running` and
+    /// returns rather than arming a second one it has no way to arm (the job row is leased).
+    ///
+    /// Uploading three documents at once is enough to hit it: the first draft starts a
+    /// check, the other two commit while it works, and their facts would never be checked
+    /// and never published — with nothing queued to ever fix it.
+    ///
+    /// So the run that just finished compares what it read with what exists now and, if
+    /// they differ, queues one more. This cannot loop: publishing does not change the
+    /// candidate set, so a repeat requires a real new candidate each time.
+    ///
+    /// Runs after `settle`, deliberately — the job row has to be `completed` before
+    /// `enqueue_validation` can re-arm it.
+    async fn follow_up(
+        &self,
+        bureau_id: Uuid,
+        job: &Job,
+        checked: Option<&str>,
+    ) -> Result<bool, WorkerError> {
+        let Some(checked) = checked else {
+            return Ok(false);
+        };
+
+        let mut tx = self.db.begin_scoped(bureau_id).await?;
+        let candidates = otdel_db::updates::load_candidate_digest(&mut tx, job.partner_id).await?;
+        let now = otdel_publish::candidate_fingerprint(&candidates);
+        if now == checked || jobs::validation_pending(&mut tx, job.partner_id).await? {
+            tx.commit().await?;
+            return Ok(false);
+        }
+
+        let run = publication::enqueue_run(&mut tx, job.partner_id, otdel_publish::PROMPT_PROFILE)
+            .await?;
+        let queued = jobs::enqueue_validation(&mut tx, job.partner_id, run.id).await?;
+        events::record(
+            &mut tx,
+            &events::NewEvent::new(
+                EventKind::ValidationQueued,
+                EventActor::Worker,
+                "проверка поставлена в очередь ещё раз: пока шла предыдущая, появились новые \
+                 кандидаты, и в её версию они не вошли"
+                    .to_owned(),
+            )
+            .for_partner(job.partner_id)
+            .about_job(queued.id)
+            .about_run(run.id)
+            .with_detail(serde_json::json!({ "trigger": "candidates_changed_during_check" })),
+        )
+        .await?;
+        tx.commit().await?;
+
+        info!(
+            partner_id = %job.partner_id,
+            job_id = %queued.id,
+            "candidates changed while the check was running; another check is queued"
+        );
+        Ok(true)
     }
 
     async fn claim(&self, bureau_id: Uuid) -> Result<Option<Job>, WorkerError> {
@@ -200,6 +272,28 @@ impl ValidationWorker {
             },
         )
         .await?;
+        // Phase 1F: a failed check is history, and it is the history that answers "почему
+        // версия прежняя". The run row keeps the current state and is overwritten by the
+        // next attempt; this line is not.
+        events::record(
+            &mut tx,
+            &events::NewEvent::new(
+                EventKind::JobFailed,
+                EventActor::Worker,
+                format!(
+                    "проверка не выполнена: {}. Опубликованная версия не менялась",
+                    error.diagnostic()
+                ),
+            )
+            .for_partner(job.partner_id)
+            .about_job(job.id)
+            .with_detail(serde_json::json!({
+                "kind": "validate_partner",
+                "permanent": error.is_permanent(),
+                "attempts": job.attempts,
+            })),
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -256,9 +350,30 @@ impl ValidationWorker {
                 },
             )
             .await?;
+            events::record(
+                &mut tx,
+                &events::NewEvent::new(
+                    EventKind::ValidationFinished,
+                    EventActor::Worker,
+                    "проверка завершена без результата: у партнёра нет ни одного кандидата"
+                        .to_owned(),
+                )
+                .for_partner(job.partner_id)
+                .about_run(run.id)
+                .with_detail(serde_json::json!({ "outcome": "no_candidates" })),
+            )
+            .await?;
             tx.commit().await?;
-            return Ok(JobOutcome::default());
+            return Ok(JobOutcome {
+                inputs: Some(otdel_publish::candidate_fingerprint(&candidates)),
+                ..JobOutcome::default()
+            });
         }
+
+        // What this run is about to check. Compared after it finishes with what exists
+        // then, because a draft committed while the check was running is not in it (see
+        // `settle_and_follow_up`).
+        let inputs = otdel_publish::candidate_fingerprint(&candidates);
 
         // --- 2. the deterministic check -------------------------------------------
         self.heartbeat(bureau_id, job, "checking claims").await?;
@@ -339,6 +454,34 @@ impl ValidationWorker {
                 },
             )
             .await?;
+            // The one outcome with no version to point at. Without this line the history
+            // of a check that found nothing new would be silence, which is exactly what
+            // the owner reads as "кажется, ничего не запустилось".
+            events::record(
+                &mut tx,
+                &events::NewEvent::new(
+                    EventKind::ValidationFinished,
+                    EventActor::Worker,
+                    if embedded > 0 {
+                        format!(
+                            "проверка завершена: кандидаты не изменились, новая версия не \
+                             создавалась. Опубликованной версии добавлено векторов: {embedded}"
+                        )
+                    } else {
+                        "проверка завершена: кандидаты не изменились с прошлой публикации, \
+                         новая версия не создавалась"
+                            .to_owned()
+                    },
+                )
+                .for_partner(job.partner_id)
+                .about_run(run.id)
+                .with_detail(serde_json::json!({
+                    "outcome": "unchanged",
+                    "chunks_embedded": embedded,
+                    "published_number": published.as_ref().map(|version| version.number),
+                })),
+            )
+            .await?;
             tx.commit().await?;
             info!(
                 partner_id = %job.partner_id,
@@ -347,6 +490,7 @@ impl ValidationWorker {
             );
             return Ok(JobOutcome {
                 chunks_embedded: u32::try_from(embedded).unwrap_or(0),
+                inputs: Some(inputs),
                 ..JobOutcome::default()
             });
         }
@@ -356,6 +500,9 @@ impl ValidationWorker {
             .await?;
         let new_version = NewVersion {
             input_fingerprint: fingerprint,
+            // Phase 1F: the same input without its verdicts, so `GET .../refresh` can say
+            // whether a new check would produce something different without running one.
+            candidate_fingerprint: inputs.clone(),
             validation_run_id: run.id,
             claims: outcome
                 .claims
@@ -395,6 +542,12 @@ impl ValidationWorker {
             return Err(WorkerError::LeaseLost);
         }
 
+        // Which version is current *before* this one publishes. Read inside the writing
+        // transaction, because it is the one this run is about to supersede, and the
+        // event log has to name it — "версия 2 заменила версию 1" is the line that makes
+        // the history readable, and afterwards there is no way to tell which it was.
+        let superseded = publication_read::find_published(&mut tx, job.partner_id).await?;
+
         let (version_id, counts) =
             publication::write_version(&mut tx, job.partner_id, &new_version).await?;
 
@@ -424,6 +577,90 @@ impl ValidationWorker {
             }
             PublicationDecision::Unchanged => unreachable!("handled above"),
         };
+
+        // The history of the switch, written in the transaction that performs it. A log
+        // that could survive a rolled-back publication would describe a version nobody
+        // can open.
+        let version_number = publication_read::find_version(&mut tx, job.partner_id, version_id)
+            .await?
+            .map(|version| version.number);
+        if published {
+            if let Some(previous) = &superseded {
+                events::record(
+                    &mut tx,
+                    &events::NewEvent::new(
+                        EventKind::VersionSuperseded,
+                        EventActor::Worker,
+                        format!(
+                            "версия {} заменена: опубликована версия {}. Замещённая версия \
+                             остаётся неизменной и открывается по закреплённой ссылке",
+                            previous.number,
+                            version_number.unwrap_or_default()
+                        ),
+                    )
+                    .for_partner(job.partner_id)
+                    .about_version(previous.id)
+                    .with_detail(serde_json::json!({
+                        "superseded_number": previous.number,
+                        "replaced_by_number": version_number,
+                    })),
+                )
+                .await?;
+            }
+            events::record(
+                &mut tx,
+                &events::NewEvent::new(
+                    EventKind::VersionPublished,
+                    EventActor::Worker,
+                    format!(
+                        "опубликована версия {}: утверждений {}, из них подтверждено \
+                         источником {}",
+                        version_number.unwrap_or_default(),
+                        counts.claims,
+                        outcome.count(ClaimStatus::SourceSupported)
+                    ),
+                )
+                .for_partner(job.partner_id)
+                .about_version(version_id)
+                .about_run(run.id)
+                .with_detail(serde_json::json!({
+                    "number": version_number,
+                    "claims": counts.claims,
+                    "supported": outcome.count(ClaimStatus::SourceSupported),
+                    "conflicted": outcome.count(ClaimStatus::Conflicted),
+                    "gaps": counts.gaps,
+                })),
+            )
+            .await?;
+        } else {
+            events::record(
+                &mut tx,
+                &events::NewEvent::new(
+                    EventKind::VersionBlocked,
+                    EventActor::Worker,
+                    format!(
+                        "версия {} не опубликована: {}",
+                        version_number.unwrap_or_default(),
+                        blocked_reasons
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "правила публикации не выполнены".to_owned())
+                    ),
+                )
+                .for_partner(job.partner_id)
+                .about_version(version_id)
+                .about_run(run.id)
+                .with_detail(serde_json::json!({
+                    "number": version_number,
+                    "blocked_reasons": blocked_reasons,
+                    // The version that stays live. A blocked check does not take away
+                    // what is published (`block-01-spec.md` §7), and the log says which
+                    // version that is rather than leaving the reader to assume.
+                    "still_published_number": superseded.as_ref().map(|version| version.number),
+                })),
+            )
+            .await?;
+        }
         tx.commit().await?;
 
         // --- 6. vectors, if there is a provider ------------------------------------
@@ -478,6 +715,7 @@ impl ValidationWorker {
             chunks_embedded: u32::try_from(chunks_embedded).unwrap_or(0),
             published,
             blocked: !blocked_reasons.is_empty(),
+            inputs: Some(inputs),
         })
     }
 
@@ -645,13 +883,17 @@ impl ValidationWorker {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct JobOutcome {
     claims_checked: u32,
     claims_rejected: u32,
     chunks_embedded: u32,
     published: bool,
     blocked: bool,
+    /// Phase 1F: the candidate fingerprint this run actually read, so the pass can tell
+    /// whether anything appeared while it was working. `None` only when the run never got
+    /// as far as reading candidates.
+    inputs: Option<String>,
 }
 
 /// A plain translation. Every rule has already been applied by `otdel-publish`, and a

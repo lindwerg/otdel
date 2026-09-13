@@ -24,10 +24,15 @@ afterEach(() => {
 interface Scenario {
   /** Answers POST /api/partners; default is a plain success. */
   createPartner?: (callCount: number) => Response
+  /** Answers GET /api/partners; default is an empty list. */
+  listPartners?: (callCount: number) => Response
+  /** Answers DELETE /api/session; default is 204. */
+  deleteSession?: () => Response
 }
 
 function renderApp(scenario: Scenario = {}) {
   let createCalls = 0
+  let listCalls = 0
   const { calls } = installMockFetch((req: RecordedRequest) => {
     if (req.url === '/api/session' && req.method === 'GET') {
       return jsonResponse(200, { authenticated: true, csrf_token: 'csrf-1' })
@@ -36,9 +41,11 @@ function renderApp(scenario: Scenario = {}) {
       return jsonResponse(200, { authenticated: true, csrf_token: 'csrf-2' })
     }
     if (req.url === '/api/session' && req.method === 'DELETE') {
-      return new Response(null, { status: 204 })
+      return scenario.deleteSession?.() ?? new Response(null, { status: 204 })
     }
     if (req.url === '/api/partners' && req.method === 'GET') {
+      listCalls += 1
+      if (scenario.listPartners) return scenario.listPartners(listCalls)
       return jsonResponse(200, { items: [] })
     }
     if (req.url === '/api/partners' && req.method === 'POST') {
@@ -152,6 +159,33 @@ describe('session expiry while a modal dialog is open', () => {
     expect(creates[0]?.headers['x-csrf-token']).toBe('csrf-1')
     expect(creates[1]?.headers['x-csrf-token']).toBe('csrf-2')
   })
+
+  it('also prompts when a plain read — not a mutation — is the request that gets the 401', async () => {
+    const user = userEvent.setup()
+    renderApp({
+      // The session dies between the session check and the very first list
+      // read; no mutating request is involved anywhere.
+      listPartners: (n) =>
+        n === 1
+          ? apiError(401, 'unauthorized', 'Сессия недействительна')
+          : jsonResponse(200, { items: [] }),
+    })
+
+    // Must be the re-login prompt, not an endless "не удалось загрузить" banner.
+    const prompt = await screen.findByRole('alertdialog')
+    expect(prompt.tagName).toBe('DIALOG')
+
+    await user.type(within(prompt).getByLabelText('Пароль'), 'pilot-secret')
+    await user.click(within(prompt).getByRole('button', { name: 'Войти' }))
+
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument())
+
+    // The read that failed is not replayed behind the user's back; its
+    // banner keeps an explicit Retry, which now succeeds on the restored
+    // session and brings the workspace back.
+    await user.click(screen.getByRole('button', { name: 'Повторить' }))
+    expect(await screen.findByRole('button', { name: '+ Добавить партнёра' })).toBeInTheDocument()
+  })
 })
 
 describe('explicit logout', () => {
@@ -186,5 +220,38 @@ describe('explicit logout', () => {
     await user.click(screen.getByRole('button', { name: '+ Добавить партнёра' }))
     expect(screen.getByLabelText(/Название/)).toHaveValue('')
     expect(screen.getByLabelText(/Пояснение/)).toHaveValue('')
+  })
+
+  it('still logs out cleanly when DELETE /api/session returns 401 (session already gone)', async () => {
+    const user = userEvent.setup()
+    renderApp({ deleteSession: () => apiError(401, 'unauthorized', 'Сессия недействительна') })
+
+    await openPartnerDraft(user)
+    await user.click(screen.getByRole('button', { name: 'Выйти' }))
+
+    // The user asked to leave and the session is gone: that is exactly the
+    // requested end state, so it must read as a normal logout.
+    await waitFor(() => expect(screen.getByLabelText('Пароль')).toBeInTheDocument())
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Сессия истекла/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Не удалось выйти/)).not.toBeInTheDocument()
+    // No draft left visible on what may well be a shared machine.
+    expect(screen.queryByLabelText(/Название/)).not.toBeInTheDocument()
+    expect(screen.queryByText('черновик, который нельзя потерять')).not.toBeInTheDocument()
+  })
+
+  it('keeps the workspace and shows an error when logout fails for any other reason', async () => {
+    const user = userEvent.setup()
+    renderApp({ deleteSession: () => apiError(500, 'internal', 'Сервер недоступен') })
+
+    await openPartnerDraft(user)
+    await user.click(screen.getByRole('button', { name: 'Выйти' }))
+
+    // The cookie is still live server-side, so the UI must not claim the
+    // user is logged out — the workspace and their draft stay put.
+    expect(await screen.findByText('Сервер недоступен')).toBeInTheDocument()
+    expect(screen.getByLabelText(/Название/)).toHaveValue('BASIS')
+    expect(screen.getByRole('button', { name: 'Выйти' })).toBeInTheDocument()
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
   })
 })

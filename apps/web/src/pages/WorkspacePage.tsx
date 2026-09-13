@@ -9,7 +9,7 @@ import { PartnerSidebar } from '../components/PartnerSidebar'
 import { StatusMessage } from '../components/StatusMessage'
 
 export function WorkspacePage() {
-  const { logout, runMutation } = useAuth()
+  const { logout, runMutation, runRead } = useAuth()
   const [searchParams, setSearchParams] = useSearchParams()
   const partnerId = searchParams.get('partner_id')
 
@@ -32,11 +32,13 @@ export function WorkspacePage() {
 
   const loadPartners = useCallback(() => {
     setPartnersError(null)
-    return listPartners().then(
+    // runRead, not a bare listPartners(): a 401 here means the session is
+    // gone, and must raise the re-login prompt rather than a retry banner.
+    return runRead(() => listPartners()).then(
       (items) => setPartners(items),
       (err: unknown) => setPartnersError(err instanceof Error ? err.message : 'Не удалось загрузить партнёров.'),
     )
-  }, [])
+  }, [runRead])
 
   useEffect(() => {
     void loadPartners()
@@ -52,13 +54,15 @@ export function WorkspacePage() {
       return
     }
     let cancelled = false
-    getPartner(partnerId).then(
+    runRead(() => getPartner(partnerId)).then(
       (partner) => {
         if (cancelled) return
         setPartners((prev) => (prev ? [...prev, partner] : [partner]))
       },
       (err: unknown) => {
         if (cancelled) return
+        // A 404 is still handled here; runRead only intercepts 401 and
+        // rethrows everything else untouched.
         if (err instanceof ApiError && err.status === 404) {
           setMissingPartnerNotice('Партнёр не найден. Возможно, ссылка устарела.')
           const next = new URLSearchParams(searchParams)

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { listMaterials } from '../api/client'
 import type { Material, MaterialStatus } from '../api/types'
+import { useAuth } from '../auth/AuthContext'
 
 const POLL_MS = 3000
 const PENDING_STATUSES: MaterialStatus[] = ['queued', 'processing']
@@ -26,6 +27,12 @@ function hasPending(items: Material[]): boolean {
  * it can be invoked directly (upload/retry) independently of this effect.
  */
 export function useMaterials(partnerId: string) {
+  // Both the initial load and every poll tick go through `runRead`, so a
+  // session that dies while this panel is merely open — typically noticed
+  // first by a background poll, with no user action involved at all — raises
+  // the re-login prompt instead of a generic "не удалось обновить" banner
+  // whose Retry button could only ever produce another 401.
+  const { runRead } = useAuth()
   const [materials, setMaterials] = useState<Material[] | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const materialsRef = useRef<Material[]>([])
@@ -52,7 +59,7 @@ export function useMaterials(partnerId: string) {
       timerRef.current = window.setTimeout(async () => {
         timerRef.current = null
         try {
-          const items = await listMaterials(partnerId)
+          const items = await runRead(() => listMaterials(partnerId))
           if (epochRef.current !== epoch) return // stale: partner switched or unmounted meanwhile
           materialsRef.current = items
           setMaterials(items)
@@ -66,13 +73,13 @@ export function useMaterials(partnerId: string) {
         }
       }, POLL_MS)
     },
-    [partnerId, clearTimer],
+    [partnerId, clearTimer, runRead],
   )
 
   const load = useCallback(
     (epoch: number) => {
       setLoadError(null)
-      return listMaterials(partnerId).then(
+      return runRead(() => listMaterials(partnerId)).then(
         (items) => {
           if (epochRef.current !== epoch) return
           materialsRef.current = items
@@ -85,7 +92,7 @@ export function useMaterials(partnerId: string) {
         },
       )
     },
-    [partnerId, armPoll],
+    [partnerId, armPoll, runRead],
   )
 
   useEffect(() => {

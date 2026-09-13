@@ -89,6 +89,24 @@ interface AuthContextValue {
    *    replayed.
    */
   runMutation: <T>(fn: (csrfToken: string) => Promise<T>) => Promise<T>
+  /**
+   * Runs one authenticated *read* (GET) and applies the same 401 handling as
+   * `runMutation`: the state flips to `anonymous`/`expired` and a
+   * `SessionExpiredError` is thrown.
+   *
+   * Reads need this just as much as mutations do. A session can expire while
+   * the user is only looking at the page — a materials poll ticking in the
+   * background is often the very first request to notice. Left unwrapped, a
+   * 401 there is indistinguishable from "the server had a hiccup": the panel
+   * shows a generic error with a Retry button that can only ever produce
+   * another 401, and the user is never told to log in again.
+   *
+   * Reads carry no CSRF token, so there is deliberately no refresh/replay
+   * branch here — only the expiry transition. Every other error (404,
+   * network, ...) is rethrown untouched so callers keep their own specific
+   * handling (e.g. "партнёр не найден").
+   */
+  runRead: <T>(fn: () => Promise<T>) => Promise<T>
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null)
@@ -132,11 +150,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setState({ status: 'anonymous', reason: 'logged-out' })
       return
     }
-    // Only mark the session as ended once the server actually confirms it:
-    // the HttpOnly cookie is still live if DELETE fails (network error, a
-    // rejected CSRF token, ...), so forcing "anonymous" regardless would
-    // just be a UI lie — the caller is expected to catch and surface this.
-    await apiLogout(current.csrfToken)
+    try {
+      await apiLogout(current.csrfToken)
+    } catch (err) {
+      // A 401 here is not a failed logout: it means the session the user
+      // asked to end is already gone server-side. The desired end state has
+      // been reached, so this completes normally as a deliberate logout —
+      // it must NOT become 'expired', which would keep the workspace (and
+      // the user's drafts) on screen behind a re-login prompt on what may
+      // well be a shared machine.
+      if (!isSessionExpiredError(err)) {
+        // Any other failure (network error, rejected CSRF token, 5xx) leaves
+        // the HttpOnly cookie live: claiming the user is logged out would
+        // just be a UI lie, so the workspace stays authenticated and the
+        // caller is expected to catch and surface this.
+        throw err
+      }
+    }
     setState({ status: 'anonymous', reason: 'logged-out' })
   }, [])
 
@@ -187,6 +217,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [toExpiry],
   )
 
+  const runRead = useCallback(
+    async <T,>(fn: () => Promise<T>): Promise<T> => {
+      try {
+        return await fn()
+      } catch (err) {
+        throw toExpiry(err)
+      }
+    },
+    [toExpiry],
+  )
+
   const value = useMemo<AuthContextValue>(
     () => ({
       state,
@@ -195,8 +236,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       logout,
       recheck: checkSession,
       runMutation,
+      runRead,
     }),
-    [state, login, logout, checkSession, runMutation],
+    [state, login, logout, checkSession, runMutation, runRead],
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>

@@ -207,6 +207,55 @@ describe('runMutation', () => {
   })
 })
 
+describe('runRead', () => {
+  it('turns a 401 from a plain GET into the expiry state, so the re-login prompt appears', async () => {
+    const { result } = await renderAuthenticated(() => jsonResponse(200, { authenticated: true, csrf_token: 'token' }))
+
+    let caught: unknown
+    await act(async () => {
+      try {
+        await result.current.runRead(async () => {
+          throw new ApiError(401, { code: 'unauthorized', message: 'expired', retryable: false })
+        })
+      } catch (err) {
+        caught = err
+      }
+    })
+
+    // Without this, a background poll's 401 would only ever surface as a
+    // generic "не удалось обновить" banner with a Retry that can never work.
+    expect(caught).toBeInstanceOf(SessionExpiredError)
+    expect(result.current.state).toEqual({ status: 'anonymous', reason: 'expired' })
+  })
+
+  it('passes other read failures (e.g. 404) through untouched and keeps the session', async () => {
+    const { result } = await renderAuthenticated(() => jsonResponse(200, { authenticated: true, csrf_token: 'token' }))
+
+    let caught: unknown
+    await act(async () => {
+      try {
+        await result.current.runRead(async () => {
+          throw new ApiError(404, { code: 'not_found', message: 'Партнёр не найден', retryable: false })
+        })
+      } catch (err) {
+        caught = err
+      }
+    })
+
+    // Callers keep their own specific handling for these.
+    expect(caught).toBeInstanceOf(ApiError)
+    expect((caught as ApiError).status).toBe(404)
+    expect(result.current.state.status).toBe('authenticated')
+  })
+
+  it('returns the value unchanged on success', async () => {
+    const { result } = await renderAuthenticated(() => jsonResponse(200, { authenticated: true, csrf_token: 'token' }))
+    const value = await act(async () => result.current.runRead(async () => ['a', 'b']))
+    expect(value).toEqual(['a', 'b'])
+    expect(result.current.state.status).toBe('authenticated')
+  })
+})
+
 describe('logout', () => {
   it('ends as anonymous/logged-out — never as "expired" — when the server confirms it', async () => {
     installMockFetch((req) => {
@@ -227,6 +276,29 @@ describe('logout', () => {
     // 'logged-out' is what lets App.tsx unmount the workspace (discarding
     // retained drafts) and show the ordinary login screen instead of a
     // "session expired" prompt over preserved work.
+    expect(result.current.state).toEqual({ status: 'anonymous', reason: 'logged-out' })
+  })
+
+  it('completes as a deliberate logout (not "expired") when DELETE /api/session returns 401', async () => {
+    installMockFetch((req) => {
+      if (req.url === '/api/session' && req.method === 'GET') {
+        return jsonResponse(200, { authenticated: true, csrf_token: 'token' })
+      }
+      if (req.url === '/api/session' && req.method === 'DELETE') {
+        // The session had already expired server-side by the time the user
+        // pressed "Выйти".
+        return apiError(401, 'unauthorized', 'Сессия недействительна')
+      }
+      throw new Error(`unhandled request: ${req.method} ${req.url}`)
+    })
+    const { result } = renderHook(() => useAuth(), { wrapper })
+    await waitFor(() => expect(result.current.state.status).toBe('authenticated'))
+
+    // Must not reject: the end state the user asked for has been reached.
+    await act(async () => result.current.logout())
+
+    // Crucially 'logged-out', not 'expired' — otherwise the workspace and
+    // the user's drafts would stay on screen behind a re-login prompt.
     expect(result.current.state).toEqual({ status: 'anonymous', reason: 'logged-out' })
   })
 

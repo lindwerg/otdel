@@ -1,4 +1,4 @@
-.PHONY: help check preview dev-init db-up db-down db-logs migrate bootstrap server worker worker-once fmt lint test test-unit test-db build
+.PHONY: help check preview dev-init db-up db-down db-logs db-extensions migrate bootstrap server worker worker-once worker-probe fmt lint test test-unit test-db build
 
 # rustup installs into ~/.cargo/bin, which is not on PATH for a non-login `make` shell.
 # Adding it here (relative to $HOME, never an absolute personal path) means these targets
@@ -21,14 +21,16 @@ COMPOSE ?= docker compose
 help:
 	@echo "OTDEL — available targets:"
 	@echo ""
-	@echo "  Local pilot (phase 1A backend):"
+	@echo "  Local pilot (backend, phases 1A-1D):"
 	@echo "    make dev-init     - generate .local credentials/env (password is written to a file, not printed)"
 	@echo "    make db-up        - start PostgreSQL (compose project otdel-block1, 127.0.0.1:58432)"
+	@echo "    make db-extensions- install pgvector as superuser (optional; semantic search)"
 	@echo "    make migrate      - apply migrations with the migration role"
 	@echo "    make bootstrap    - provision the configured bureau"
 	@echo "    make server       - run the API on 127.0.0.1:18480"
-	@echo "    make worker       - run the maintenance worker (no document extraction in 1A)"
-	@echo "    make worker-once  - one maintenance pass, then exit"
+	@echo "    make worker       - run the worker: extraction + understanding + research + verification + maintenance"
+	@echo "    make worker-once  - one pass of each, then exit"
+	@echo "    make worker-probe - report OCR, model, research and embedding adapter availability"
 	@echo "    make db-down      - stop the database container (other projects are untouched)"
 	@echo ""
 	@echo "  Checks:"
@@ -55,6 +57,13 @@ db-down:
 db-logs:
 	$(COMPOSE) logs --tail 50 postgres
 
+# pgvector is not a `trusted` extension, so the restricted migration role cannot create
+# it and migration 0006 carries on without the vector column. This target does the part
+# that needs a superuser, and adds the column when the extension arrives after 0006 has
+# already run. Everything except semantic search works without it.
+db-extensions:
+	./scripts/dev-extensions.sh
+
 migrate:
 	./scripts/dev-api.sh migrate
 
@@ -69,6 +78,9 @@ worker:
 
 worker-once:
 	./scripts/dev-worker.sh once
+
+worker-probe:
+	./scripts/dev-worker.sh probe
 
 # --- checks --------------------------------------------------------------------
 

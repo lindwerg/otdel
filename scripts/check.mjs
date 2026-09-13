@@ -42,7 +42,11 @@
  *      and trailing commas stripped first, so they are really validated
  *      rather than skipped. A tsconfig additionally requires a workflow that
  *      runs a real TypeScript check (see check 10) — this script does not
- *      type-check anything itself.
+ *      type-check anything itself. The type-check requirement is satisfied
+ *      by a `run:` step invoking tsc/vue-tsc/svelte-check directly or via a
+ *      package script whose *contents* run one of them (`npm run check` with
+ *      `"check": "tsc -b"`); a script is never accepted for its name alone,
+ *      and the detector has a small self-test that runs with the check.
  *   7. JavaScript syntax for every tracked *.js/*.mjs/*.cjs file that passed
  *      the same validation, via `node --check` (rejected files are never
  *      subprocessed here).
@@ -498,19 +502,150 @@ for (const manifest of ['package.json', 'apps/web/package.json']) {
 // well-formed. The actual TypeScript validation is `tsc` (or vue-tsc/svelte-check), and
 // it belongs in a workflow — otherwise relaxing the JSON parse for tsconfig would have
 // traded a false failure for a genuinely unchecked frontend.
+//
+// A workflow rarely calls the compiler directly: the normal shape is a step that runs a
+// package script, e.g. `run: npm run check` with `"check": "tsc -b"` in
+// apps/web/package.json. That is a real type check and must be recognised — but via the
+// script's *contents*, never its name. `"check": "echo ok"` is not a type check no
+// matter what the step is called, so the script is looked up and inspected.
+
+/** `scripts` of a manifest, or `{}` when it is absent/unreadable (check 5 reports that). */
+function packageScripts(manifestPath) {
+  if (!fileExists(manifestPath)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    const scripts = parsed && typeof parsed === 'object' ? parsed.scripts : null;
+    return scripts && typeof scripts === 'object' ? scripts : {};
+  } catch {
+    return {};
+  }
+}
+
+// A command that really invokes the TypeScript compiler: `tsc` in any of its forms
+// (`tsc -b`, `tsc --build`, `tsc --noEmit`, `npx tsc -p ...`) or a framework wrapper
+// around it. Anchored on shell token boundaries so it does not match inside a longer
+// word such as `tscheck` or a path like `./notsc`.
+const TS_CHECKER_RE = /(?:^|[\s;&|(])(?:npx\s+|pnpm\s+exec\s+|yarn\s+)?(?:vue-tsc|svelte-check|tsc)(?:$|[\s;&|)])/;
+
+/** Script names invoked from a command line, e.g. `npm run check` -> `check`. */
+function referencedScriptNames(command) {
+  return [...command.matchAll(/\b(?:npm|pnpm|yarn)\s+run\s+([A-Za-z0-9_:.-]+)/g)].map((m) => m[1]);
+}
+
+/**
+ * The `run:` commands of a workflow — inline (`run: npm ci`) and block scalars
+ * (`run: |` followed by deeper-indented lines).
+ *
+ * Only these are considered. Step *names* and YAML comments are deliberately excluded:
+ * a step called "Type-check (tsc)" proves nothing about what the step executes.
+ */
+function workflowRunCommands(text) {
+  const commands = [];
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i += 1) {
+    const match = /^(\s*)(?:-\s+)?run:\s*(.*)$/.exec(lines[i]);
+    if (!match) continue;
+    const indent = match[1].length;
+    const inline = match[2].trim();
+    if (inline && !/^[|>][-+]?\d*$/.test(inline)) {
+      commands.push(inline);
+      continue;
+    }
+    for (let j = i + 1; j < lines.length; j += 1) {
+      if (lines[j].trim() === '') continue;
+      if (lines[j].length - lines[j].trimStart().length <= indent) break;
+      commands.push(lines[j].trim());
+    }
+  }
+  return commands;
+}
+
+/**
+ * Find a real TypeScript check among a workflow's `run:` commands.
+ *
+ * Returns a short description of what was found, or `null`. A package script is followed
+ * into the manifests (and one script may call another, with cycle protection); the tool
+ * it ends up running is what decides.
+ */
+function findTypeScriptCheck(workflowText, manifests) {
+  const resolve = (name, seen) => {
+    if (seen.has(name)) return null;
+    seen.add(name);
+    for (const [manifestPath, scripts] of manifests) {
+      const body = scripts[name];
+      if (typeof body !== 'string') continue;
+      if (TS_CHECKER_RE.test(body)) return `${manifestPath} script "${name}": ${body}`;
+      for (const nested of referencedScriptNames(body)) {
+        const found = resolve(nested, seen);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+
+  for (const command of workflowRunCommands(workflowText)) {
+    if (TS_CHECKER_RE.test(command)) return `workflow step \`${command}\``;
+    for (const name of referencedScriptNames(command)) {
+      const found = resolve(name, new Set());
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+// Tiny self-test of the detector above. It runs on every invocation because the rules it
+// encodes are exactly the ones that are easy to break: accepting a script because of its
+// name, or accepting a step title that merely mentions tsc.
+function selfTestTypeScriptCheckDetector() {
+  const scripts = (obj) => [['test-fixture/package.json', obj]];
+  const cases = [
+    // The real frontend shape: a named script that does run the compiler.
+    ['    - name: Type-check\n      run: npm run check\n', scripts({ check: 'tsc -b' }), true],
+    ['    - run: pnpm run typecheck\n', scripts({ typecheck: 'vue-tsc --noEmit' }), true],
+    // One script delegating to another still resolves to the real tool.
+    ['    - run: npm run check\n', scripts({ check: 'npm run tc', tc: 'tsc -b' }), true],
+    ['    - run: npm run build\n', scripts({ build: 'tsc -b && vite build' }), true],
+    // Direct invocations, with and without a block scalar.
+    ['    - run: npx tsc --noEmit\n', scripts({}), true],
+    ['    - run: |\n        npm ci\n        svelte-check\n', scripts({}), true],
+    // A script is judged by what it runs, never by its name.
+    ['    - run: npm run check\n', scripts({ check: 'echo ok' }), false],
+    ['    - run: npm run check\n', scripts({}), false],
+    // A step title that mentions the compiler is not a type check.
+    ['    - name: Type-check (tsc)\n      run: npm run lint\n', scripts({ lint: 'oxlint' }), false],
+    // Cycles must not hang or pass.
+    ['    - run: npm run a\n', scripts({ a: 'npm run b', b: 'npm run a' }), false],
+  ];
+  for (const [workflow, manifests, expected] of cases) {
+    if (Boolean(findTypeScriptCheck(workflow, manifests)) !== expected) {
+      fail(
+        `scripts/check.mjs self-test failed: the TypeScript-check detector ${expected ? 'missed' : 'wrongly accepted'} ` +
+        `${JSON.stringify(workflow)}. Fix the detector before relying on this check.`
+      );
+      return null;
+    }
+  }
+  return cases.length;
+}
+
 const tsconfigs = trackedFiles.filter((f) => /(^|\/)tsconfig[^/]*\.json$/i.test(f));
 if (tsconfigs.length > 0) {
-  const hasTypeCheck =
-    /(npx\s+tsc|\btsc\b\s+(--noEmit|-p|--project|--build)|run\s+(type-?check|typecheck)|vue-tsc|svelte-check)/.test(allWorkflows);
-  if (!hasTypeCheck) {
+  const selfTested = selfTestTypeScriptCheckDetector();
+  if (selfTested) note(`TypeScript-check detector self-test passed (${selfTested} cases).`);
+  const manifests = ['apps/web/package.json', 'package.json'].map((m) => [m, packageScripts(m)]);
+  const found =
+    findTypeScriptCheck(ciWorkflow, manifests) || findTypeScriptCheck(webWorkflow, manifests);
+  if (!found) {
     fail(
       `${tsconfigs[0]} is present, but no workflow (.github/workflows/ci.yml or web.yml) runs a ` +
-      `TypeScript check (tsc --noEmit / a typecheck script / vue-tsc / svelte-check). This ` +
+      `TypeScript check. A \`run:\` step must invoke tsc/vue-tsc/svelte-check, either directly ` +
+      `(\`npx tsc --noEmit\`) or through a package script (\`npm run check\` with ` +
+      `\`"check": "tsc -b"\`). A script is accepted for what it runs, not for its name. This ` +
       `script only validates tsconfig syntax as JSONC; it does not type-check. See ` +
       `docs/development.md.`
     );
   } else {
-    note(`${tsconfigs.length} tsconfig file(s) present: found a TypeScript check command in the workflows.`);
+    note(`${tsconfigs.length} tsconfig file(s) present: TypeScript check found via ${found}.`);
   }
 }
 

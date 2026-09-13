@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::AppError;
+use crate::extraction_config::ExtractionSettings;
 use crate::secret;
 
 /// Lower bound shared by the session TTL and the idle timeout.
@@ -84,6 +85,8 @@ pub struct Config {
     pub max_upload_bytes: u64,
     pub login_throttle: LoginThrottle,
     pub log_filter: String,
+    /// Phase 1B: how the worker reads documents, and whether OCR is available at all.
+    pub extraction: ExtractionSettings,
 }
 
 impl fmt::Debug for Config {
@@ -111,6 +114,7 @@ impl fmt::Debug for Config {
             .field("max_upload_bytes", &self.max_upload_bytes)
             .field("login_throttle", &self.login_throttle)
             .field("log_filter", &self.log_filter)
+            .field("extraction", &self.extraction)
             .finish()
     }
 }
@@ -275,6 +279,8 @@ impl Config {
 
         let log_filter = string_or(source, "OTDEL_LOG", "info,otdel_api=info,sqlx=warn");
 
+        let extraction = ExtractionSettings::load(source)?;
+
         Ok(Self {
             env,
             bind_addr,
@@ -292,6 +298,7 @@ impl Config {
             max_upload_bytes,
             login_throttle,
             log_filter,
+            extraction,
         })
     }
 
@@ -306,7 +313,7 @@ impl Config {
     }
 }
 
-fn string_or(source: &dyn ConfigSource, key: &str, default: &str) -> String {
+pub(crate) fn string_or(source: &dyn ConfigSource, key: &str, default: &str) -> String {
     match source.get(key) {
         Some(value) if !value.trim().is_empty() => value.trim().to_owned(),
         _ => default.to_owned(),
@@ -330,7 +337,7 @@ fn placeholder_error(key: &str) -> AppError {
     ))
 }
 
-fn parse_bool(value: &str, key: &str) -> Result<bool, AppError> {
+pub(crate) fn parse_bool(value: &str, key: &str) -> Result<bool, AppError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),
@@ -338,7 +345,11 @@ fn parse_bool(value: &str, key: &str) -> Result<bool, AppError> {
     }
 }
 
-fn parse_u64_or(source: &dyn ConfigSource, key: &str, default: u64) -> Result<u64, AppError> {
+pub(crate) fn parse_u64_or(
+    source: &dyn ConfigSource,
+    key: &str,
+    default: u64,
+) -> Result<u64, AppError> {
     match source.get(key) {
         Some(value) if !value.trim().is_empty() => value
             .trim()
@@ -348,7 +359,7 @@ fn parse_u64_or(source: &dyn ConfigSource, key: &str, default: u64) -> Result<u6
     }
 }
 
-fn duration_secs_or(
+pub(crate) fn duration_secs_or(
     source: &dyn ConfigSource,
     key: &str,
     default: u64,

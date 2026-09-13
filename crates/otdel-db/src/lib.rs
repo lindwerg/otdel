@@ -14,6 +14,7 @@
 pub mod error;
 pub mod jobs;
 pub mod materials;
+pub mod pages;
 pub mod partners;
 pub mod sessions;
 pub mod tenancy;
@@ -102,6 +103,9 @@ impl Database {
                     row_security_active('otdel.partners') AS rls_partners, \
                     row_security_active('otdel.materials') AS rls_materials, \
                     row_security_active('otdel.jobs') AS rls_jobs, \
+                    row_security_active('otdel.material_pages') AS rls_material_pages, \
+                    row_security_active('otdel.page_regions') AS rls_page_regions, \
+                    row_security_active('otdel.table_cells') AS rls_table_cells, \
                     has_table_privilege(current_user, 'otdel.sessions', 'SELECT') AS reads_sessions \
                FROM pg_roles r WHERE r.rolname = current_user",
         )
@@ -128,17 +132,36 @@ impl Database {
         if row.try_get::<bool, _>("reads_sessions")? {
             problems.push("the role can read otdel.sessions directly");
         }
-        for (column, table) in [
-            ("rls_partners", "otdel.partners"),
-            ("rls_materials", "otdel.materials"),
-            ("rls_jobs", "otdel.jobs"),
+        // Every tenant table, including the phase 1B evidence tables: page text is
+        // partner data exactly as much as the original file is.
+        for (column, problem) in [
+            (
+                "rls_partners",
+                "row-level security is not applied on otdel.partners",
+            ),
+            (
+                "rls_materials",
+                "row-level security is not applied on otdel.materials",
+            ),
+            (
+                "rls_jobs",
+                "row-level security is not applied on otdel.jobs",
+            ),
+            (
+                "rls_material_pages",
+                "row-level security is not applied on otdel.material_pages",
+            ),
+            (
+                "rls_page_regions",
+                "row-level security is not applied on otdel.page_regions",
+            ),
+            (
+                "rls_table_cells",
+                "row-level security is not applied on otdel.table_cells",
+            ),
         ] {
             if !row.try_get::<bool, _>(column)? {
-                problems.push(match table {
-                    "otdel.partners" => "row-level security is not applied on otdel.partners",
-                    "otdel.materials" => "row-level security is not applied on otdel.materials",
-                    _ => "row-level security is not applied on otdel.jobs",
-                });
+                problems.push(problem);
             }
         }
 

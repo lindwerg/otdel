@@ -1,14 +1,19 @@
 //! Durable job queue.
 //!
-//! Phase 1A only *records* work: uploading a material enqueues one `extract_document`
-//! job and the retry endpoint puts an existing job back into `queued`. Nothing in this
-//! repository claims to read documents — the 1B worker will lease these rows.
+//! Phase 1A recorded work; phase 1B runs it. The row carries everything a worker needs
+//! to be restart-safe: an idempotency key (unique per bureau), the attempt counter with a
+//! bound, a lease owner/expiry and the earliest time it may run again.
 //!
-//! The queue row carries everything a worker needs to be restart-safe: an idempotency
-//! key (unique per bureau), the attempt counter with a bound, a lease owner/expiry and
-//! the earliest time it may run again.
+//! Claiming uses `FOR UPDATE SKIP LOCKED` inside a **short** transaction that only marks
+//! the row; the actual reading happens afterwards, outside any transaction, with the
+//! lease renewed by heartbeats. That is what keeps a long document from holding a
+//! database transaction open for minutes, and what lets a second worker pick up the job
+//! if this one dies — the maintenance pass returns expired leases to the queue.
+
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use otdel_core::extraction::page_extraction_idempotency_key;
 use otdel_core::model::{extraction_idempotency_key, Job, JobKind, JobStatus};
 use sqlx::postgres::PgRow;
 use sqlx::Row;
@@ -17,8 +22,8 @@ use uuid::Uuid;
 use crate::error::{DbError, DbResult};
 use crate::tenancy::ScopedTx;
 
-const COLUMNS: &str =
-    "id, partner_id, material_id, kind, status, stage, attempts, created_at, updated_at, error";
+const COLUMNS: &str = "id, partner_id, material_id, page_number, kind, status, stage, \
+     attempts, created_at, updated_at, error";
 
 fn job_from_row(row: &PgRow) -> DbResult<Job> {
     let kind: String = row.try_get("kind")?;
@@ -32,6 +37,7 @@ fn job_from_row(row: &PgRow) -> DbResult<Job> {
         id: row.try_get("id")?,
         partner_id: row.try_get("partner_id")?,
         material_id: row.try_get("material_id")?,
+        page_number: row.try_get("page_number")?,
         kind,
         status,
         stage: row.try_get("stage")?,
@@ -120,6 +126,7 @@ pub async fn requeue_extraction(
             SET status = 'queued', \
                 stage = NULL, \
                 error = NULL, \
+                error_kind = NULL, \
                 run_after = now(), \
                 lease_owner = NULL, \
                 lease_expires_at = NULL, \
@@ -166,6 +173,183 @@ pub async fn reclaim_expired_leases(tx: &mut ScopedTx) -> DbResult<u64> {
     .await?;
 
     Ok(result.rows_affected())
+}
+
+// --- phase 1B: single-page jobs ------------------------------------------------------
+
+/// Enqueue (or return) the job that re-reads one page of a material.
+///
+/// The idempotency key contains the page number, so retrying page 7 twice reuses one row
+/// and retrying page 8 is a different job.
+pub async fn enqueue_page_extraction(
+    tx: &mut ScopedTx,
+    partner_id: Uuid,
+    material_id: Uuid,
+    page_number: i32,
+) -> DbResult<Job> {
+    let bureau_id = tx.bureau_id();
+    let key = page_extraction_idempotency_key(material_id, page_number);
+
+    // An existing row is *reset* rather than left as it was: a page job that already ran
+    // and failed must become runnable again, which is exactly what the user asked for.
+    let row = sqlx::query(&format!(
+        "INSERT INTO otdel.jobs \
+             (bureau_id, partner_id, material_id, page_number, kind, status, idempotency_key) \
+         VALUES ($1, $2, $3, $4, 'extract_page', 'queued', $5) \
+         ON CONFLICT (bureau_id, idempotency_key) DO UPDATE \
+            SET status = 'queued', \
+                stage = NULL, \
+                error = NULL, \
+                error_kind = NULL, \
+                run_after = now(), \
+                lease_owner = NULL, \
+                lease_expires_at = NULL, \
+                max_attempts = GREATEST(otdel.jobs.max_attempts, otdel.jobs.attempts + 1), \
+                updated_at = now() \
+         RETURNING {COLUMNS}"
+    ))
+    .bind(bureau_id)
+    .bind(partner_id)
+    .bind(material_id)
+    .bind(page_number)
+    .bind(&key)
+    .fetch_one(tx.conn())
+    .await?;
+
+    job_from_row(&row)
+}
+
+// --- phase 1B: leasing ---------------------------------------------------------------
+
+/// Take the next runnable job for this bureau, or `None` when the queue is empty.
+///
+/// `SKIP LOCKED` means two workers never fight over the same row and never block each
+/// other. The attempt counter is incremented *here*, at claim time, so a worker that
+/// dies mid-run still burns an attempt and a permanently poisonous document cannot be
+/// retried forever.
+pub async fn claim_next(tx: &mut ScopedTx, owner: &str, lease: Duration) -> DbResult<Option<Job>> {
+    let bureau_id = tx.bureau_id();
+    let lease_seconds = i32::try_from(lease.as_secs()).unwrap_or(i32::MAX);
+
+    let row = sqlx::query(&format!(
+        "UPDATE otdel.jobs SET \
+                status = 'running', \
+                attempts = attempts + 1, \
+                stage = 'claimed', \
+                lease_owner = $2, \
+                lease_expires_at = now() + make_interval(secs => $3), \
+                updated_at = now() \
+          WHERE id = ( \
+              SELECT j.id FROM otdel.jobs j \
+               WHERE j.bureau_id = $1 AND j.status = 'queued' AND j.run_after <= now() \
+               ORDER BY j.run_after, j.created_at, j.id \
+               FOR UPDATE SKIP LOCKED \
+               LIMIT 1 \
+          ) \
+      RETURNING {COLUMNS}"
+    ))
+    .bind(bureau_id)
+    .bind(owner)
+    .bind(f64::from(lease_seconds))
+    .fetch_optional(tx.conn())
+    .await?;
+
+    row.as_ref().map(job_from_row).transpose()
+}
+
+/// Extend the lease of a job this worker still holds, and record what it is doing.
+///
+/// Returns `false` when the job is no longer ours — the lease expired and somebody else
+/// took it. The caller must then stop writing results for it rather than racing.
+pub async fn heartbeat(
+    tx: &mut ScopedTx,
+    job_id: Uuid,
+    owner: &str,
+    lease: Duration,
+    stage: Option<&str>,
+) -> DbResult<bool> {
+    let bureau_id = tx.bureau_id();
+    let lease_seconds = i32::try_from(lease.as_secs()).unwrap_or(i32::MAX);
+
+    let result = sqlx::query(
+        "UPDATE otdel.jobs SET \
+                lease_expires_at = now() + make_interval(secs => $4), \
+                stage = coalesce($5, stage), \
+                updated_at = now() \
+          WHERE bureau_id = $1 AND id = $2 AND status = 'running' AND lease_owner = $3",
+    )
+    .bind(bureau_id)
+    .bind(job_id)
+    .bind(owner)
+    .bind(f64::from(lease_seconds))
+    .bind(stage)
+    .execute(tx.conn())
+    .await?;
+
+    Ok(result.rows_affected() == 1)
+}
+
+/// Settle a job as done.
+pub async fn complete(tx: &mut ScopedTx, job_id: Uuid, owner: &str) -> DbResult<bool> {
+    let bureau_id = tx.bureau_id();
+    let result = sqlx::query(
+        "UPDATE otdel.jobs SET \
+                status = 'completed', \
+                stage = NULL, \
+                error = NULL, \
+                error_kind = NULL, \
+                lease_owner = NULL, \
+                lease_expires_at = NULL, \
+                updated_at = now() \
+          WHERE bureau_id = $1 AND id = $2 AND status = 'running' AND lease_owner = $3",
+    )
+    .bind(bureau_id)
+    .bind(job_id)
+    .bind(owner)
+    .execute(tx.conn())
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Settle a job as failed.
+///
+/// A *transient* failure below the attempt limit goes back to `queued` with a delay; a
+/// permanent one (the file is not a PDF) stops immediately, because repeating it would
+/// only burn attempts and hide the real reason behind "still retrying".
+pub async fn fail(
+    tx: &mut ScopedTx,
+    job_id: Uuid,
+    owner: &str,
+    message: &str,
+    permanent: bool,
+    backoff: Duration,
+) -> DbResult<bool> {
+    let bureau_id = tx.bureau_id();
+    let backoff_seconds = i32::try_from(backoff.as_secs()).unwrap_or(i32::MAX);
+    let message: String = message.chars().take(2000).collect();
+
+    let result = sqlx::query(
+        "UPDATE otdel.jobs SET \
+                status = CASE WHEN $4 OR attempts >= max_attempts THEN 'failed' ELSE 'queued' END, \
+                error = $5, \
+                error_kind = CASE WHEN $4 THEN 'permanent' ELSE 'transient' END, \
+                stage = NULL, \
+                run_after = now() + make_interval(secs => $6), \
+                lease_owner = NULL, \
+                lease_expires_at = NULL, \
+                updated_at = now() \
+          WHERE bureau_id = $1 AND id = $2 AND status = 'running' AND lease_owner = $3",
+    )
+    .bind(bureau_id)
+    .bind(job_id)
+    .bind(owner)
+    .bind(permanent)
+    .bind(&message)
+    .bind(f64::from(backoff_seconds))
+    .execute(tx.conn())
+    .await?;
+
+    Ok(result.rows_affected() == 1)
 }
 
 /// Queue depth by status, for the maintenance log and future dashboards.

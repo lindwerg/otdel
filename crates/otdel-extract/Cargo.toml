@@ -1,0 +1,25 @@
+[package]
+name = "otdel-extract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+# In-memory synthetic PDFs, used by the tests of this crate and of the worker/API.
+# Off by default so nothing test-shaped ends up in a production build.
+fixtures = []
+
+[dependencies]
+otdel-core.workspace = true
+
+async-trait.workspace = true
+pdf-extract.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+otdel-extract = { workspace = true, features = ["fixtures"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

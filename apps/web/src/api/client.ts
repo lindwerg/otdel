@@ -3,6 +3,8 @@ import type {
   Job,
   ListResponse,
   Material,
+  MaterialPage,
+  PageDetail,
   Partner,
   SessionResponse,
 } from './types'
@@ -173,8 +175,62 @@ export function retryMaterial(
   )
 }
 
-export function originalMaterialUrl(partnerId: string, materialId: string): string {
-  return `/api/partners/${encodeURIComponent(partnerId)}/materials/${encodeURIComponent(materialId)}/original`
+export function getMaterial(partnerId: string, materialId: string): Promise<Material> {
+  return apiRequest<Material>(
+    `/partners/${encodeURIComponent(partnerId)}/materials/${encodeURIComponent(materialId)}`,
+  )
+}
+
+/**
+ * Authorised download of the stored original.
+ *
+ * `page` appends the standard PDF open parameter (`#page=N`), which browser and
+ * desktop viewers honour. It is a real link into the source document — phase 1B
+ * stores no page images, so nothing here pretends a rendered page exists.
+ */
+export function originalMaterialUrl(
+  partnerId: string,
+  materialId: string,
+  page?: number,
+): string {
+  const base = `/api/partners/${encodeURIComponent(partnerId)}/materials/${encodeURIComponent(materialId)}/original`
+  return page && page > 0 ? `${base}#page=${page}` : base
+}
+
+// --- Pages (phase 1B) ------------------------------------------------------
+
+function pagesPath(partnerId: string, materialId: string): string {
+  return `/partners/${encodeURIComponent(partnerId)}/materials/${encodeURIComponent(materialId)}/pages`
+}
+
+export async function listPages(
+  partnerId: string,
+  materialId: string,
+): Promise<MaterialPage[]> {
+  const res = await apiRequest<ListResponse<MaterialPage>>(pagesPath(partnerId, materialId))
+  return res.items
+}
+
+export function getPage(
+  partnerId: string,
+  materialId: string,
+  pageNumber: number,
+): Promise<PageDetail> {
+  return apiRequest<PageDetail>(
+    `${pagesPath(partnerId, materialId)}/${encodeURIComponent(String(pageNumber))}`,
+  )
+}
+
+export function retryPage(
+  partnerId: string,
+  materialId: string,
+  pageNumber: number,
+  csrfToken: string,
+): Promise<MaterialPage> {
+  return apiRequest<MaterialPage>(
+    `${pagesPath(partnerId, materialId)}/${encodeURIComponent(String(pageNumber))}/retry`,
+    { method: 'POST', csrfToken },
+  )
 }
 
 // --- Jobs --------------------------------------------------------------

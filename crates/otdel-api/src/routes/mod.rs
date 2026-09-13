@@ -8,6 +8,7 @@
 pub mod health;
 pub mod jobs;
 pub mod materials;
+pub mod pages;
 pub mod partners;
 pub mod session;
 
@@ -52,12 +53,29 @@ pub fn router(state: AppState) -> Router {
             get(materials::list).post(materials::upload),
         )
         .route(
+            "/partners/{partner_id}/materials/{material_id}",
+            get(materials::show),
+        )
+        .route(
             "/partners/{partner_id}/materials/{material_id}/original",
             get(materials::download),
         )
         .route(
             "/partners/{partner_id}/materials/{material_id}/retry",
             post(materials::retry),
+        )
+        // Phase 1B: the per-page evidence of a material.
+        .route(
+            "/partners/{partner_id}/materials/{material_id}/pages",
+            get(pages::list),
+        )
+        .route(
+            "/partners/{partner_id}/materials/{material_id}/pages/{page_number}",
+            get(pages::show),
+        )
+        .route(
+            "/partners/{partner_id}/materials/{material_id}/pages/{page_number}/retry",
+            post(pages::retry),
         )
         .route("/partners/{partner_id}/jobs", get(jobs::list))
         .layer(DefaultBodyLimit::max(upload_limit));

@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# Run the maintenance worker with the local environment from .local/otdel.env.
+# Run the background worker with the local environment from .local/otdel.env.
 #
-# Usage: scripts/dev-worker.sh [run|once]
+# Usage: scripts/dev-worker.sh [run|once|probe]
 #
-# Phase 1A maintenance only (expired sessions, job lease recovery, staging sweep,
-# orphan reporting). It does not extract documents — that is phase 1B.
+#   run   — extraction + maintenance until stopped
+#   once  — one extraction pass and one maintenance pass, then exit
+#   probe — report whether the OCR engine and the page rasteriser are installed
+#
+# Since phase 1B the worker reads documents: queued materials become per-page records.
+# Maintenance (expired sessions, job lease recovery, staging sweep, orphan reporting)
+# continues to run alongside it.
 
 set -euo pipefail
 

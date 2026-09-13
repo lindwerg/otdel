@@ -11,14 +11,44 @@ Everything here is a candidate, and everything here is about the **industry**. V
 and publication are 1E. Nothing in this phase becomes a characteristic of the partner's
 product, and nothing answers a customer.
 
-## What is real, and what is waiting
+## The provider, and what it is not allowed to be
 
-**No search provider has been chosen for OTDEL.** That is the expected state, and it is a
-state, not a failure — `block-01-spec.md` §3 lists Perplexity and OpenRouter as *possible*
-adapters, not as decisions anybody made:
+**OpenRouter's `openrouter:web_search` is the search provider.** The owner chose it, so it
+is implemented rather than described: the adapter calls the official server tool through
+the same `/chat/completions` the product roles already use, and the same OpenRouter account
+pays for both.
 
-* the adapters built from a configuration without an endpoint, a key **or** a host
-  allowlist have **no HTTP client inside them** (`otdel_search::build_search_provider`,
+```json
+{ "model": "openai/gpt-4o-mini",
+  "messages": [ … ],
+  "tools": [ { "type": "openrouter:web_search",
+               "parameters": { "engine": "exa", "max_results": 5,
+                               "max_total_results": 20,
+                               "search_context_size": "low" } } ] }
+```
+
+What comes back is a chat answer with `url_citation` annotations. **Only the annotations
+are used.** The model's prose is discarded — including any URL it writes into it, which
+could be one it invented — and every cited link then goes through the pipeline this phase
+already had: `NormalisedUrl`, the host allowlist, the guarded resolver, `robots.txt`, the
+byte and character bounds, the SHA-256 snapshot, the literal-quote check. A search provider
+finds leads. It never becomes a source, and nothing it returns is quotable.
+
+That separation is the point. OpenRouter can cite anything on the web; what may be *read*
+is still only what the owner declared, and what may be *quoted* is still only a page this
+system downloaded itself and can show a hash for. The annotation's own excerpt is stored
+exactly like a search snippet — a lead the owner may read, never evidence, never an
+instruction.
+
+The generic `http_json` adapter stays, unchanged: any endpoint that accepts
+`POST {"query": …, "max_results": …}` and answers
+`{"results": [{"url": …, "title": …, "snippet": …}]}`. A self-hosted SearxNG, a different
+vendor, a proxy. Choosing OpenRouter did not close the socket for anything else.
+
+**Nothing configured is still a state, not a failure.**
+
+* the adapters built from a configuration without a key, a model **or** a host allowlist
+  have **no HTTP client inside them** (`otdel_search::build_search_provider`,
   `build_fetcher`), so there is no code path from the worker to a network;
 * `GET /api/research/provider` reports `needs_configuration` and names the missing
   variables; the interface repeats that and disables the button;
@@ -29,16 +59,27 @@ adapters, not as decisions anybody made:
 
 Reading materials, page evidence and the product draft keep working exactly as before.
 
-**Readiness needs all three halves.** A search endpoint, an allowlist and a model. A
+**Readiness needs all three halves.** A search adapter, an allowlist and a model. A
 researcher that could search but not read would spend money to produce a list of links
 nobody may open; one that could read but not interpret would produce pages and no answer.
 The provider endpoint reports the three separately, so "why is the button disabled" has a
 specific answer.
 
-**The tests never need any of it.** They install scripted adapters
-(`otdel_search::fake`, `otdel_llm::fake`) and drive the real query builder, the real URL
-guard, the real allowlist, the real budget ledger, the real quotation checker, the real
-queue and the real database.
+**The key is inherited, not copied.** With the OpenRouter adapter and no
+`OTDEL_RESEARCH_API_KEY` of its own, the researcher uses `OTDEL_LLM_API_KEY` — the same
+account, the same endpoint, one secret to protect instead of two. It is resolved once at
+load into a redacting `ApiKey`, is never serialised, never logged and never written to the
+database, and the only trace of where it came from is a boolean the interface shows as
+«Ключ взят из OTDEL_LLM_API_KEY». The *generic* adapter never inherits it: a search
+endpoint the owner configured is a different service, and sending a model key to it would
+be a leak.
+
+**The tests never need any of it.** Two layers of them. Most of the suite installs scripted
+adapters (`otdel_search::fake`, `otdel_llm::fake`) and drives the real query builder, URL
+guard, allowlist, budget ledger, quotation checker, queue and database. The OpenRouter
+tests go one level deeper and replace only the *socket* (`FakeChatTransport`), so the tool
+arguments, the citation parser, the cost arithmetic and every refusal under test are the
+production ones.
 
 ## Quick start
 
@@ -54,24 +95,38 @@ make worker                                    # extraction + understanding + re
 # WARN research adapters not configured: nothing leaves this machine and no budget is
 #      reserved. An approved question is recorded as `needs_provider` — reading and
 #      understanding materials keep working as usual
-#      search_state="needs_configuration" missing=["OTDEL_RESEARCH_SEARCH_URL",
-#      "OTDEL_RESEARCH_API_KEY", "OTDEL_RESEARCH_ALLOWED_HOSTS"]
+#      search_state="needs_configuration" missing=["OTDEL_LLM_API_KEY",
+#      "OTDEL_LLM_MODEL", "OTDEL_RESEARCH_ALLOWED_HOSTS"]
 ```
 
-With a provider (kept in the git-ignored `.local/otdel.env`, never in the repository):
+To switch it on, in the git-ignored `.local/openrouter.env` and `.local/otdel.env` — never
+in the repository:
 
 ```bash
-OTDEL_RESEARCH_SEARCH_URL=https://search.example.com/v1/search
-OTDEL_RESEARCH_API_KEY=...
+OTDEL_LLM_API_KEY=...              # also pays for the search
+OTDEL_LLM_MODEL=openai/gpt-4o-mini
+OTDEL_LLM_BASE_URL=https://openrouter.ai/api/v1
+
+OTDEL_RESEARCH_PROVIDER=openrouter
 OTDEL_RESEARCH_ALLOWED_HOSTS=docs.cntd.ru,.gost.ru
 ```
 
-There is deliberately no vendor name in that list. The endpoint is a **shape**: it accepts
-`POST {"query": "...", "max_results": 8}` and answers
-`{"results": [{"url": …, "title": …, "snippet": …}]}` (`items` and `web.results` are also
-accepted). A vendor API, a self-hosted SearxNG, or a few lines of proxy in front of either.
-Choosing the provider is a decision for the owner, and this phase implements the socket for
-it rather than pretending the decision was made.
+That is the whole of it: the engine defaults to `auto`, the result count to 5, the plan
+allowance to 20, and the tariff to Exa's published price. Everything else in
+[`.env.example`](../.env.example) is there to be tuned, not to be filled in.
+
+There is one real call in the repository to prove the wire format is right —
+`crates/otdel-search/tests/openrouter_smoke.rs`, `#[ignore]`d so neither CI nor a local
+`cargo test` can run it:
+
+```bash
+set -a; . ./.local/openrouter.env; set +a
+export OTDEL_RESEARCH_ALLOWED_HOSTS=docs.cntd.ru
+cargo test -p otdel-search --test openrouter_smoke -- --ignored --nocapture
+```
+
+It asks one neutral question about a published standard, takes three results, fetches
+nothing, stores nothing and prints only public URLs.
 
 ## The pipeline
 
@@ -112,6 +167,8 @@ of a payment.
 | queries are built **deterministically**, never by a model | a model deciding to look for something else | same |
 | the partner's name is never put in a prompt — `ResearchContext` has no such field | a conclusion attributed to the partner | `otdel-research/src/prompt.rs` |
 | the model sees labels (`E1`…), never URLs or identifiers | a model asking for a page, or naming another tenant's row | same |
+| the search model gets the vetted query and nothing else — no partner, no material, no context | the search half leaking what the interpretation half is careful about | `otdel-search/src/openrouter.rs` |
+| the search model's prose is discarded; only `url_citation` links survive | a model inventing a URL that looks like a source | same |
 
 A partner called `BASIS` makes «какая нагрузка у профилей BASIS?» unsearchable — with a
 message saying so and asking for an industry phrasing. A multi-word name only blocks on the
@@ -237,6 +294,49 @@ part of a pass. The interpretation phase is reserved as one amount — the numbe
 requests that catalogue will really produce, computed by the same batching the
 interpretation runs — and settled at what was actually used; the difference goes back.
 
+### A forecast is not an invoice
+
+With OpenRouter the price of a search is not a flat number somebody typed into a variable.
+It is built from the engine's published tariff and the result count:
+
+| Engine | Declared tariff |
+|---|---|
+| `exa` (and `auto`, for a model without built-in search) | 7 000 micros per request, 10 results included, 1 000 per further result |
+| `parallel` | 5 000 micros per request, results not metered |
+| `native` | nothing of its own — the model provider bills it in tokens |
+
+plus a **token allowance**: the model that runs the tool reads its own results, and those
+tokens are part of the bill. That sum is what the ledger *reserves* before the call.
+
+What it *settles* is different, and deliberately so. OpenRouter returns `usage.cost` — the
+actual amount charged for the whole request, tool and tokens together — and when it is
+present it wins. A reported cost is an invoice; a declared tariff is a guess, and preferring
+the guess to the fact would make the balance a number that merely looks precise. When
+nothing is reported the tariff stands, computed from the results that really came back
+rather than from the count that was asked for.
+
+On this pilot the two are close and the difference is visible: three results through
+`openai/gpt-4o-mini` reserved 10 000 micros and settled at **7 474** — Exa's 7 000 plus
+about 474 of tokens. The journal shows the charge, the budget panel shows the forecast, and
+each says which it is.
+
+Because of that, `settle_amount` records an amount **above** its reservation rather than
+trimming it. A call that turned out to cost more has already cost more; clamping the number
+would make the ledger disagree with the account it exists to track. The ceiling still does
+its work — the next reservation sees the larger balance and refuses.
+
+`auto` is resolved rather than repeated. OpenRouter picks the model's own search when the
+model has one and Exa when it does not, so for `openai/gpt-4o-mini` the honest label is Exa
+and the honest price is Exa's. The interface writes «auto → exa» and says why. Reporting
+"auto" and leaving it there would hide a real 0,007 USD per request behind a word.
+
+**Results are bounded per plan, not just per query.** With a per-result tariff, a plan whose
+every query keeps finding new links is a plan that keeps spending — including on links the
+allowlist will refuse and nobody will ever read.
+`OTDEL_RESEARCH_OPENROUTER_MAX_TOTAL_RESULTS` stops the searching when the plan has
+accumulated its allowance, which `max_sources_per_plan` alone does not do: that one bounds
+what is *read*.
+
 `FOR UPDATE` is what makes "конкурентные задачи не обходят общий лимит"
 (`block-01-spec.md` §10) true: a second worker reserving at the same moment blocks on the
 lock until the first has committed, and then sees the new balance.
@@ -301,8 +401,11 @@ cd apps/web && npm test    # the interface
 |---|---|
 | `otdel-core` unit tests | configuration states (nothing set → what is missing), the allowlist's matching rules, redaction, the 1D vocabulary |
 | `otdel-search` unit tests | URL refusals (scheme, port, IP literal, credentials, CRLF), every internal IP range including IPv4-mapped IPv6, the guarded resolver, robots parsing, HTML→text, response shapes, the unconfigured adapters reaching no network |
+| `otdel-search::openrouter` unit tests | the `openrouter:web_search` request body, `auto` left unsaid and a chosen engine sent, the result clamp, citations nested and flat, an answer with no citations refused rather than reported empty, `usage.cost` read in micros under both spellings of the server-tool field, the key absent from the body |
+| `otdel-search/tests/openrouter_smoke.rs` | one **real** call, `#[ignore]`d: run by hand to confirm the wire format against the live service |
 | `otdel-research` unit tests | query building and the partner-name refusal, prompt bounds and injection containment, every validation rule, budget arithmetic, the exact model-request count a catalogue will produce |
 | `otdel-worker` unit tests | permanent vs transient classification, pass bookkeeping |
+| `otdel-api/tests/research_1d.rs` (OpenRouter) | the real adapter over a scripted socket: the official tool in the body with no key and no partner name, a citation becoming a source through the allowlist, the reported 8 100 charged instead of the 10 000 forecast, the engine named per query in the journal, an answer without citations failing rather than reporting nothing, a cited host outside the allowlist refused, the plan-wide result ceiling stopping the second search, a cost above its reservation recorded at what it cost rather than trimmed |
 | `otdel-api/tests/research_1d.rs` | the whole path with scripted adapters: nothing configured; a question naming the partner; a host outside the allowlist; a site forbidding crawling; a hostile page; a spoofed source; an exhausted budget; an unknown outcome; a transport failure; the page and pass limits; stop; idempotency; a repeated pass replacing its journal but not its ledger; the same document found twice; another bureau; a crashed worker's money; the model call being reserved and settled like any other; CSRF and session; the database refusing an unsourced conclusion |
 | `apps/web` vitest | an industry candidate vs a partner fact, the external citation with its date, the budget with its three tariffs and its "unknown" bucket, the "нужна настройка" state, the source journal including unread rows |
 
@@ -313,14 +416,34 @@ pilot database, with `migrate` applied twice to confirm idempotency.
 
 * migration 0005 applies cleanly; row-level security is active on all seven new tables for
   the restricted runtime role;
-* 485 Rust tests and 97 web tests pass; `cargo fmt --check`, `cargo clippy --workspace
+* 512 Rust tests and 102 web tests pass; `cargo fmt --check`, `cargo clippy --workspace
   --all-targets -- -D warnings`, `node scripts/check.mjs`, `tsc -b` and `vite build` are
   clean, and `oxlint` reports no new finding (its six warnings are all in 1A/1B files this
   phase did not touch);
-* **no test opened a socket to a remote host**, and no research key exists on this machine.
-  The suites use the scripted adapters; the unconfigured ones have no HTTP client to use.
-  (Two resolver tests do call `lookup_host` — for `localhost`, in order to assert that a
-  name resolving to loopback is *refused*.)
+* **no test in the suite opened a socket to a remote host.** The suites use the scripted
+  adapters and the scripted transport; the unconfigured adapters have no HTTP client to
+  use. (Two resolver tests do call `lookup_host` — for `localhost`, in order to assert that
+  a name resolving to loopback is *refused*.)
+
+**One deliberate exception, run by hand.** `crates/otdel-search/tests/openrouter_smoke.rs`
+is `#[ignore]`d and was executed once against the live service with the pilot's key:
+
+```
+engine=exa (configured auto, exa fallback: true), model=openai/gpt-4o-mini,
+max_results=3, forecast=10000 micros
+hits=3 duration_ms=11237 reported_micros=Some(7474) prompt_tokens=Some(2282)
+completion_tokens=Some(228) web_search_requests=Some(1)
+  https://normadocs.ru/gost_9.307-2021 — Some("ГОСТ 9.307-2021 …")
+  https://allgosts.ru/25/220/gost_9.307-2021 — Some("ГОСТ 9.307-2021 …")
+  https://standartgost.ru/g/ГОСТ_9.307-2021 — Some("ГОСТ 9.307-2021 …")
+```
+
+Three real links to the standard that was asked about, one search request, and a cost the
+provider stated itself. It confirms four things at once: the request shape is right, `auto`
+really does resolve to Exa for this model, `usage.cost` really is returned without being
+asked for, and the Exa tariff is what the documentation says — 7 000 of the 7 474 is the
+request, the rest is tokens. Nothing was fetched, nothing was stored, and the key appears
+in no line of that output.
 
 Ten defects were found and fixed — two by the suite, one by the database, and seven by an
 adversarial review of the finished code:
@@ -373,10 +496,20 @@ see it — the adapter's stated invariant is true again rather than nearly true.
 1. **Nothing here is verified.** "Подтверждено цитатой" means the fragment exists on the
    page that was downloaded — not that the page is right, not that the publisher is
    authoritative, and not that the standard is current. The checker is 1E.
-2. **No provider is integrated.** What exists is the socket, the shape of the request and
-   the shape of the response. Until an endpoint is configured and a bounded run is made
-   against it, "работает с настоящим поиском" is not a claim this phase makes
-   (`block-01-plan.md`, 1D acceptance).
+2. **One real call is not a pilot.** The wire format is confirmed against the live service
+   (see the smoke test's output in the report), and the cost model is confirmed against a
+   real `usage.cost`. What has *not* happened is a real plan run end to end on real money
+   with real publishers in the allowlist — the smoke test fetches nothing and stores
+   nothing. Treat the tariff defaults as provisional until a few real plans have been
+   reconciled against an OpenRouter invoice.
+   Two specifics worth knowing before that first run. The server tool is marked **beta** by
+   OpenRouter, and the `annotations` field this adapter parses is documented in prose but
+   absent from their OpenAPI schema — hence the defensive parser and the explicit "модель не
+   выполнила веб-поиск" refusal rather than a silent empty result. And the hosts a search
+   returns are usually *not* the hosts an allowlist contains: the smoke test's three results
+   were `normadocs.ru`, `allgosts.ru` and `standartgost.ru`, none of which is
+   `docs.cntd.ru`. A plan with a narrow allowlist will pay for results it then refuses to
+   read, which is the correct behaviour and an expensive surprise if nobody said it first.
 3. **The raw bytes are not archived.** The snapshot is the extracted text, identified by
    the SHA-256 of the bytes it came from and dated by `retrieved_at`. That is enough to
    check a citation and to notice a changed source; it is not a copy of the page. Storing

@@ -517,13 +517,20 @@ pub async fn settle(
     settle_amount(tx, reservation, reservation.amount_micros, state, note).await
 }
 
-/// Close a reservation for *less* than it held.
+/// Close a reservation at what the call really cost.
 ///
 /// One reservation can cover several calls whose number is not known in advance — the
 /// model requests of one interpretation phase are reserved at their worst case, because a
 /// reservation that guessed low would be a ceiling that does not hold. `actual_micros` is
 /// what was really used; the difference goes back to the budget, and the ledger row is
 /// rewritten to the real amount so it explains the balance rather than the intention.
+///
+/// **An amount above the reservation is recorded, not trimmed.** A provider that reports
+/// its own cost is stating an invoice, and a search that turned out to cost more than the
+/// forecast has already cost it — clamping the number would make the ledger disagree with
+/// the account it is supposed to track, and would hide exactly the case the owner needs to
+/// see. The ceiling still does its job: the next [`reserve`] sees the larger balance and
+/// refuses.
 pub async fn settle_amount(
     tx: &mut ScopedTx,
     reservation: &Reservation,
@@ -532,7 +539,7 @@ pub async fn settle_amount(
     note: Option<&str>,
 ) -> DbResult<()> {
     let bureau_id = tx.bureau_id();
-    let actual = actual_micros.clamp(0, reservation.amount_micros);
+    let actual = actual_micros.max(0);
 
     // Only a reservation that is still open can be closed: a second settlement of the
     // same row would move the money twice.

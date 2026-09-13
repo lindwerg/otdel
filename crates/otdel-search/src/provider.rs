@@ -38,11 +38,35 @@ pub struct SearchHit {
     pub snippet: Option<String>,
 }
 
+/// What one search call really cost, and on whose authority.
+///
+/// A declared tariff is a forecast; a number the provider puts in its own response is an
+/// invoice. Keeping the two apart is the difference between a ledger that explains the
+/// balance and one that merely asserts it, so the adapter reports what it was told and
+/// the caller decides what to charge.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchBilling {
+    /// Engine that served this request (`exa`, `native`, …), when the adapter knows.
+    pub engine: Option<String>,
+    /// `true` when `auto` resolved to Exa because the model has no search of its own.
+    pub exa_fallback: bool,
+    /// What the provider says this call cost, in micros. `None` means it said nothing,
+    /// and the declared tariff stands.
+    pub reported_micros: Option<u64>,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    /// Searches the provider says it actually ran. A model asked to search may search
+    /// twice, or not at all, and the bill follows what happened rather than what was
+    /// requested.
+    pub search_requests: Option<u32>,
+}
+
 /// What one search call produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchAnswer {
     pub hits: Vec<SearchHit>,
     pub duration: Duration,
+    pub billing: SearchBilling,
 }
 
 /// Why a search call did not produce results.

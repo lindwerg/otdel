@@ -660,6 +660,42 @@ impl TestApp {
         }
     }
 
+    /// An application whose researcher is the **real** OpenRouter adapter, with only its
+    /// socket replaced.
+    ///
+    /// The difference from [`Self::start_with_research`] matters: there the whole search
+    /// adapter is a fake and nothing about the OpenRouter one is exercised, while here the
+    /// tool arguments, the citation parsing, the cost arithmetic and every refusal are the
+    /// production code, and only the `POST` is scripted. The settings come from the loaded
+    /// configuration, so the engine, the tariff and the result counts are the ones the
+    /// application really has.
+    pub async fn start_with_openrouter(
+        transport: Arc<dyn otdel_search::ChatTransport>,
+        fetcher: Arc<dyn DocumentFetcher>,
+        llm: Arc<dyn LlmProvider>,
+        settings: ResearchOverrides,
+    ) -> (Self, Arc<otdel_search::OpenRouterSearch>) {
+        let app = Self::start_with_settings(settings).await;
+        let search = Arc::new(otdel_search::OpenRouterSearch::with_transport(
+            &app.state.config.research,
+            transport,
+        ));
+        let state = app
+            .state
+            .clone()
+            .with_provider(llm)
+            .with_research_adapters(Arc::clone(&search) as Arc<dyn SearchProvider>, fetcher);
+        let router = otdel_api::app(state.clone());
+        (
+            Self {
+                router,
+                state,
+                ..app
+            },
+            search,
+        )
+    }
+
     /// The phase 1D worker, with the supplied adapters.
     pub fn research_worker(
         &self,
@@ -848,6 +884,12 @@ pub struct ResearchOverrides {
     pub max_sources_per_plan: Option<u32>,
     pub max_queries_per_plan: Option<u32>,
     pub max_passes_per_plan: Option<u32>,
+    /// Configure the researcher as OpenRouter's `openrouter:web_search` rather than the
+    /// generic endpoint, with this engine.
+    pub openrouter_engine: Option<String>,
+    pub openrouter_max_results: Option<u32>,
+    pub openrouter_max_total_results: Option<u32>,
+    pub openrouter_model: Option<String>,
 }
 
 impl ResearchOverrides {
@@ -905,19 +947,75 @@ impl ResearchOverrides {
         self
     }
 
+    /// Run this application as an OpenRouter researcher. The key and the model are the
+    /// test ones; nothing reaches a network, because the transport is scripted.
+    pub fn with_openrouter(mut self, engine: &str) -> Self {
+        self.openrouter_engine = Some(engine.to_owned());
+        self
+    }
+
+    pub fn with_openrouter_results(mut self, per_query: u32, per_plan: u32) -> Self {
+        self.openrouter_max_results = Some(per_query);
+        self.openrouter_max_total_results = Some(per_plan);
+        self
+    }
+
+    pub fn with_openrouter_model(mut self, model: &str) -> Self {
+        self.openrouter_model = Some(model.to_owned());
+        self
+    }
+
     fn apply(&self, source: &mut std::collections::BTreeMap<String, String>) {
         // The search endpoint and key are set whenever a test declares an allowlist:
         // the adapters injected afterwards are scripted, but the *configuration* has to
         // read as ready or the routes would refuse before the fakes are ever consulted.
         if let Some(hosts) = &self.allowed_hosts {
-            source.insert(
-                "OTDEL_RESEARCH_SEARCH_URL".to_owned(),
-                "https://search.invalid.test/v1/search".to_owned(),
-            );
-            source.insert(
-                "OTDEL_RESEARCH_API_KEY".to_owned(),
-                "srch-test-only-never-used".to_owned(),
-            );
+            if let Some(engine) = &self.openrouter_engine {
+                // The OpenRouter adapter has no endpoint of its own; it needs a model, a
+                // key and an engine. The key is a test string that never leaves the
+                // process: the transport under the adapter is scripted.
+                source.insert(
+                    "OTDEL_RESEARCH_PROVIDER".to_owned(),
+                    "openrouter".to_owned(),
+                );
+                source.insert(
+                    "OTDEL_LLM_API_KEY".to_owned(),
+                    "sk-or-v1-test-only-never-used".to_owned(),
+                );
+                source.insert(
+                    "OTDEL_LLM_MODEL".to_owned(),
+                    self.openrouter_model
+                        .clone()
+                        .unwrap_or_else(|| "openai/gpt-4o-mini".to_owned()),
+                );
+                source.insert(
+                    "OTDEL_RESEARCH_OPENROUTER_ENGINE".to_owned(),
+                    engine.clone(),
+                );
+                for (key, value) in [
+                    (
+                        "OTDEL_RESEARCH_OPENROUTER_MAX_RESULTS",
+                        self.openrouter_max_results,
+                    ),
+                    (
+                        "OTDEL_RESEARCH_OPENROUTER_MAX_TOTAL_RESULTS",
+                        self.openrouter_max_total_results,
+                    ),
+                ] {
+                    if let Some(value) = value {
+                        source.insert(key.to_owned(), value.to_string());
+                    }
+                }
+            } else {
+                source.insert(
+                    "OTDEL_RESEARCH_SEARCH_URL".to_owned(),
+                    "https://search.invalid.test/v1/search".to_owned(),
+                );
+                source.insert(
+                    "OTDEL_RESEARCH_API_KEY".to_owned(),
+                    "srch-test-only-never-used".to_owned(),
+                );
+            }
             source.insert("OTDEL_RESEARCH_ALLOWED_HOSTS".to_owned(), hosts.clone());
         }
         for (key, value) in [
@@ -925,7 +1023,11 @@ impl ResearchOverrides {
             ("OTDEL_RESEARCH_PLAN_BUDGET_MICROS", self.plan_budget_micros),
             (
                 "OTDEL_RESEARCH_COST_PER_SEARCH_MICROS",
-                self.cost_per_search_micros,
+                // With OpenRouter the per-search price is computed from the engine
+                // tariff, and setting a flat one is a configuration error rather than an
+                // override.
+                self.cost_per_search_micros
+                    .filter(|_| self.openrouter_engine.is_none()),
             ),
             (
                 "OTDEL_RESEARCH_COST_PER_FETCH_MICROS",

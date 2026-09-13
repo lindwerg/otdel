@@ -395,6 +395,40 @@ export interface ResearchLimits {
   request_timeout_seconds: number
   plan_time_budget_seconds: number
   max_passes_per_plan: number
+  /**
+   * Results one plan may accumulate in total. Only a provider that meters results
+   * sets this; `null` means the page limit is the only bound that matters.
+   */
+  max_total_results_per_plan: number | null
+}
+
+/**
+ * Which engine runs the search, and what one call is expected to cost.
+ *
+ * Present only for the OpenRouter adapter — it is the one whose price depends on a
+ * choice. `configured` is what the owner wrote; `effective` is what will really
+ * run, because `auto` is not a mystery: for a model with no built-in search it
+ * means Exa, and the tariff follows.
+ *
+ * Every amount here is the **declared** tariff. What the ledger finally records is
+ * whatever the provider reported having charged.
+ */
+export interface ResearchEngineState {
+  configured: string
+  effective: string
+  /** `auto` fell back to Exa because the model cannot search by itself. */
+  exa_fallback: boolean
+  model: string
+  max_results: number
+  max_total_results_per_plan: number
+  /** One search call: the engine tariff plus the model tokens it spends. */
+  forecast_micros: number
+  search_base_micros: number
+  included_results: number
+  extra_result_micros: number
+  token_allowance_micros: number
+  /** The key came from `OTDEL_LLM_API_KEY` rather than the researcher's own. */
+  api_key_inherited: boolean
 }
 
 /**
@@ -415,6 +449,8 @@ export interface ResearchProviderState {
   /** Hosts the researcher may read, exactly as declared. */
   allowed_hosts: string[]
   limits: ResearchLimits
+  /** Present when the configured adapter is OpenRouter's `openrouter:web_search`. */
+  engine: ResearchEngineState | null
   message: string
 }
 

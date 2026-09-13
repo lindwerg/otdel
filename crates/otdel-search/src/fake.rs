@@ -23,9 +23,10 @@ use otdel_core::research_config::HostAllowlist;
 use sha2::{Digest, Sha256};
 
 use crate::html;
+use crate::openrouter::ChatTransport;
 use crate::provider::{
-    AdapterDescription, DocumentFetcher, FetchRefusal, FetchedDocument, SearchAnswer, SearchError,
-    SearchHit, SearchProvider, SearchRequest,
+    AdapterDescription, DocumentFetcher, FetchRefusal, FetchedDocument, SearchAnswer,
+    SearchBilling, SearchError, SearchHit, SearchProvider, SearchRequest,
 };
 use crate::url::NormalisedUrl;
 
@@ -33,6 +34,8 @@ use crate::url::NormalisedUrl;
 #[derive(Debug)]
 pub enum FakeSearchReply {
     Hits(Vec<SearchHit>),
+    /// Results *and* a bill, for the providers that report one.
+    Billed(Vec<SearchHit>, SearchBilling),
     Fail(SearchError),
 }
 
@@ -47,6 +50,21 @@ impl FakeSearchReply {
                     snippet: None,
                 })
                 .collect(),
+        )
+    }
+
+    /// The same, with a cost the provider claims to have charged.
+    pub fn billed(urls: &[&str], reported_micros: u64) -> Self {
+        let Self::Hits(hits) = Self::urls(urls) else {
+            unreachable!("urls always builds Hits")
+        };
+        Self::Billed(
+            hits,
+            SearchBilling {
+                engine: Some("exa".to_owned()),
+                reported_micros: Some(reported_micros),
+                ..SearchBilling::default()
+            },
         )
     }
 }
@@ -120,16 +138,115 @@ impl SearchProvider for FakeSearchProvider {
                 SearchError::InvalidResponse("тестовый поиск: ответы закончились".to_owned())
             })?;
 
-        match reply {
-            FakeSearchReply::Hits(hits) => Ok(SearchAnswer {
-                hits: hits
-                    .into_iter()
-                    .take(request.max_results as usize)
-                    .collect(),
-                duration: Duration::from_millis(1),
-            }),
-            FakeSearchReply::Fail(error) => Err(error),
+        let (hits, billing) = match reply {
+            FakeSearchReply::Hits(hits) => (hits, SearchBilling::default()),
+            FakeSearchReply::Billed(hits, billing) => (hits, billing),
+            FakeSearchReply::Fail(error) => return Err(error),
+        };
+
+        Ok(SearchAnswer {
+            hits: hits
+                .into_iter()
+                .take(request.max_results as usize)
+                .collect(),
+            duration: Duration::from_millis(1),
+            billing,
+        })
+    }
+}
+
+/// A scripted `/chat/completions`, so the *real* OpenRouter adapter can be tested.
+///
+/// This is the more honest half of the fakes. [`FakeSearchProvider`] replaces the adapter
+/// altogether and therefore proves nothing about it; this one replaces only the socket, so
+/// the tool arguments, the citation parsing, the cost arithmetic and every refusal are the
+/// production ones. It also records the request bodies, which is how a test can assert
+/// that the partner's name never left the machine and that the key is not in the body.
+pub struct FakeChatTransport {
+    answers: Mutex<Vec<Result<serde_json::Value, SearchError>>>,
+    requests: Mutex<Vec<serde_json::Value>>,
+}
+
+impl std::fmt::Debug for FakeChatTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeChatTransport").finish_non_exhaustive()
+    }
+}
+
+impl FakeChatTransport {
+    pub fn new(answers: Vec<Result<serde_json::Value, SearchError>>) -> Self {
+        Self {
+            answers: Mutex::new(answers.into_iter().rev().collect()),
+            requests: Mutex::new(Vec::new()),
         }
+    }
+
+    /// One answer citing these URLs, billed at `cost` US dollars — the shape OpenRouter
+    /// really returns, written out in full so the parser is exercised, not bypassed.
+    pub fn citing(urls: &[&str], cost: f64) -> Self {
+        Self::new(vec![Ok(serde_json::json!({
+            "id": "gen-fake",
+            "model": "openai/gpt-4o-mini",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "Нашёл источники.",
+                    "annotations": urls
+                        .iter()
+                        .map(|url| serde_json::json!({
+                            "type": "url_citation",
+                            "url_citation": {
+                                "url": url,
+                                "title": "Страница",
+                                "content": "фрагмент",
+                                "start_index": 0,
+                                "end_index": 10,
+                            },
+                        }))
+                        .collect::<Vec<_>>(),
+                },
+            }],
+            "usage": {
+                "prompt_tokens": 1_100,
+                "completion_tokens": 60,
+                "total_tokens": 1_160,
+                "cost": cost,
+                "server_tool_use_details": {"web_search_requests": 1},
+            },
+        }))])
+    }
+
+    /// Every request body this transport was given, in order.
+    pub fn requests(&self) -> Vec<serde_json::Value> {
+        self.requests.lock().expect("fake transport lock").clone()
+    }
+
+    pub fn call_count(&self) -> usize {
+        self.requests.lock().expect("fake transport lock").len()
+    }
+}
+
+#[async_trait]
+impl ChatTransport for FakeChatTransport {
+    fn endpoint_host(&self) -> Option<String> {
+        Some("openrouter.test".to_owned())
+    }
+
+    async fn post(&self, body: &serde_json::Value) -> Result<serde_json::Value, SearchError> {
+        self.requests
+            .lock()
+            .expect("fake transport lock")
+            .push(body.clone());
+        self.answers
+            .lock()
+            .expect("fake transport lock")
+            .pop()
+            .unwrap_or_else(|| {
+                Err(SearchError::InvalidResponse(
+                    "тестовый транспорт: ответы закончились".to_owned(),
+                ))
+            })
     }
 }
 

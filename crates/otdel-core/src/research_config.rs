@@ -50,6 +50,9 @@ const REQUEST_TIMEOUT_RANGE: (u64, u64) = (5, 120);
 const PLAN_TIME_BUDGET_RANGE: (u64, u64) = (30, 1_800);
 const MIN_REQUEST_INTERVAL_RANGE: (u64, u64) = (0, 60_000);
 const MAX_PASSES_RANGE: (u64, u64) = (1, 10);
+/// OpenRouter clamps the tool's own `max_results` at 25.
+const OPENROUTER_MAX_RESULTS_RANGE: (u64, u64) = (1, 25);
+const OPENROUTER_MAX_TOTAL_RESULTS_RANGE: (u64, u64) = (1, 200);
 /// Ten currency units per single call is already absurd; beyond it a typo is likelier
 /// than an intention.
 const COST_RANGE: (u64, u64) = (0, 10_000_000);
@@ -58,17 +61,24 @@ const BUDGET_RANGE: (u64, u64) = (0, 1_000_000_000);
 
 /// Which search adapter the researcher speaks to.
 ///
-/// There is deliberately no vendor in this enumeration. No provider has been selected
-/// for OTDEL, and hard-coding one would be this phase claiming a decision nobody made.
-/// [`SearchProviderKind::HttpJson`] is a *shape*: any endpoint — a vendor API, a
-/// self-hosted SearxNG, a three-line proxy in front of either — that accepts the
-/// documented JSON request and answers with the documented JSON response.
+/// [`SearchProviderKind::HttpJson`] is a *shape* rather than a vendor: any endpoint — a
+/// vendor API, a self-hosted SearxNG, a three-line proxy in front of either — that
+/// accepts the documented JSON request and answers with the documented JSON response.
+///
+/// [`SearchProviderKind::OpenRouterWebSearch`] is the first *named* provider, chosen by
+/// the owner: OpenRouter's official server tool `openrouter:web_search`, called through
+/// the same `/chat/completions` endpoint the product roles already use. It finds links;
+/// it is never allowed to become the thing that reads them. Every URL it returns goes
+/// through the same allowlist, the same SSRF guard, the same `robots.txt` check and the
+/// same snapshot-and-quote pipeline as any other lead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchProviderKind {
     /// External research is switched off on purpose. Nothing is queued, nothing called.
     Disabled,
     /// A configured HTTPS endpoint speaking the documented JSON shape.
     HttpJson,
+    /// OpenRouter's `openrouter:web_search` server tool.
+    OpenRouterWebSearch,
 }
 
 impl SearchProviderKind {
@@ -76,6 +86,7 @@ impl SearchProviderKind {
         match self {
             Self::Disabled => "disabled",
             Self::HttpJson => "http_json",
+            Self::OpenRouterWebSearch => "openrouter_web_search",
         }
     }
 
@@ -83,9 +94,73 @@ impl SearchProviderKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "disabled" | "off" | "none" => Ok(Self::Disabled),
             "http_json" | "http" | "json" => Ok(Self::HttpJson),
+            "openrouter" | "openrouter_web_search" | "web_search" => Ok(Self::OpenRouterWebSearch),
             other => Err(AppError::validation(format!(
-                "OTDEL_RESEARCH_PROVIDER must be `http_json` or `disabled`, got `{other}`"
+                "OTDEL_RESEARCH_PROVIDER must be `openrouter`, `http_json` or `disabled`, \
+                 got `{other}`"
             ))),
+        }
+    }
+}
+
+/// Which engine OpenRouter is asked to run the search on.
+///
+/// An allowlist, not a free string. OpenRouter also exposes `perplexity` and
+/// `firecrawl`; they are deliberately not here, because an engine this system has never
+/// priced and never tested is not something an environment variable should be able to
+/// switch on silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchEngine {
+    /// Let OpenRouter choose. For a model without built-in search this means Exa, and
+    /// the interface says so rather than leaving the tariff a mystery.
+    Auto,
+    Exa,
+    Parallel,
+    /// The model provider's own built-in search. Priced by that provider, so its cost is
+    /// only ever known from what the response reports.
+    Native,
+}
+
+impl SearchEngine {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Exa => "exa",
+            Self::Parallel => "parallel",
+            Self::Native => "native",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, AppError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "exa" => Ok(Self::Exa),
+            "parallel" => Ok(Self::Parallel),
+            "native" => Ok(Self::Native),
+            other => Err(AppError::validation(format!(
+                "OTDEL_RESEARCH_OPENROUTER_ENGINE must be one of `auto`, `exa`, `parallel`, \
+                 `native`, got `{other}`"
+            ))),
+        }
+    }
+
+    /// The declared tariff of this engine: `(base_micros, included_results,
+    /// extra_result_micros)`.
+    ///
+    /// From OpenRouter's published prices for its server tool. They are defaults the
+    /// owner can override, not a promise about an invoice — the same rule as everywhere
+    /// else in this phase.
+    const fn default_tariff(self) -> (u64, u32, u64) {
+        match self {
+            // $0.007 per request including ten results, then $0.001 each. `auto` is
+            // priced as Exa because that is what it resolves to for every model this
+            // system is likely to use, and because over-reserving is the safe direction.
+            Self::Auto | Self::Exa => (7_000, 10, 1_000),
+            // $0.005 per request in Parallel's default mode; results are not metered.
+            Self::Parallel => (5_000, u32::MAX, 0),
+            // Passed through to the model provider, which prices it in its own tokens.
+            // There is no separate per-request tariff to declare.
+            Self::Native => (0, u32::MAX, 0),
         }
     }
 }
@@ -302,6 +377,129 @@ impl Default for ResearchCosts {
     }
 }
 
+/// Everything specific to the `openrouter:web_search` adapter.
+///
+/// Contains no secret. The key is resolved once, at load, into
+/// [`ResearchSettings::api_key`] — either the researcher's own
+/// `OTDEL_RESEARCH_API_KEY` or, when that is absent, the model key the owner already
+/// configured. Inheriting it is a convenience, not a second copy: the value lives in one
+/// redacting [`ApiKey`], is never serialised, never logged and never written to the
+/// database, and [`Self::api_key_inherited`] is the only trace of where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenRouterSearchSettings {
+    /// Base URL of the OpenRouter-compatible API, without `/chat/completions`.
+    pub base_url: String,
+    /// Model that runs the tool. Its own tokens are part of the bill.
+    pub model: String,
+    pub engine: SearchEngine,
+    /// Results asked of the tool per search call.
+    pub max_results: u32,
+    /// Ceiling on results one plan may accumulate across all of its searches. Bounds the
+    /// spend of a plan whose every query keeps finding new links.
+    pub max_total_results_per_plan: u32,
+    /// Declared price of one search request, covering `included_results` results.
+    pub base_micros: u64,
+    pub included_results: u32,
+    /// Declared price of each result beyond `included_results`.
+    pub extra_result_micros: u64,
+    /// Declared allowance for the model tokens one search call spends reading its own
+    /// results. A *forecast*: when the response reports what it really cost, the reported
+    /// number replaces this one in the ledger.
+    pub token_allowance_micros: u64,
+    /// `true` when the key came from `OTDEL_LLM_API_KEY`. Shown to the owner so that
+    /// "which key is this spending" has a visible answer.
+    pub api_key_inherited: bool,
+}
+
+impl Default for OpenRouterSearchSettings {
+    fn default() -> Self {
+        let (base_micros, included_results, extra_result_micros) =
+            SearchEngine::Auto.default_tariff();
+        Self {
+            base_url: crate::llm_config::OPENROUTER_BASE_URL.to_owned(),
+            model: String::new(),
+            engine: SearchEngine::Auto,
+            max_results: 5,
+            max_total_results_per_plan: 20,
+            base_micros,
+            included_results,
+            extra_result_micros,
+            // Around five results of bounded context plus a short answer, at the price of
+            // a small model. Deliberately not zero: a forecast of nothing would make the
+            // reservation smaller than the call and the ledger would learn about it late.
+            token_allowance_micros: 3_000,
+            api_key_inherited: false,
+        }
+    }
+}
+
+impl OpenRouterSearchSettings {
+    /// Which engine will really serve the request.
+    ///
+    /// `auto` is not a mystery to be reported as one: OpenRouter resolves it to the
+    /// model's built-in search when the model has one, and to Exa when it does not. A
+    /// model like `openai/gpt-4o-mini` has none, so `auto` means Exa, and both the
+    /// interface and the tariff say Exa rather than "auto, we will see".
+    pub fn effective_engine(&self) -> SearchEngine {
+        match self.engine {
+            SearchEngine::Auto if native_search_capable(&self.model) => SearchEngine::Native,
+            SearchEngine::Auto => SearchEngine::Exa,
+            other => other,
+        }
+    }
+
+    /// `true` when `auto` had to fall back to Exa because the model cannot search itself.
+    pub fn is_exa_fallback(&self) -> bool {
+        self.engine == SearchEngine::Auto && !native_search_capable(&self.model)
+    }
+
+    /// The declared price of one search returning `results` results.
+    pub fn search_cost_micros(&self, results: u32) -> u64 {
+        let extra = u64::from(results.saturating_sub(self.included_results));
+        self.base_micros
+            .saturating_add(extra.saturating_mul(self.extra_result_micros))
+    }
+
+    /// What one search call is expected to cost in total, tokens included.
+    ///
+    /// This is the number reserved before the call. The number *settled* after it is what
+    /// the provider reported, when it reports anything.
+    pub fn forecast_micros(&self) -> u64 {
+        self.search_cost_micros(self.max_results)
+            .saturating_add(self.token_allowance_micros)
+    }
+
+    /// Full URL of the chat-completions endpoint that carries the tool.
+    pub fn chat_completions_url(&self) -> String {
+        format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
+    }
+
+    /// Host of that endpoint, for the interface and the log. Never the key.
+    pub fn endpoint_host(&self) -> Option<String> {
+        let (_, rest) = self.base_url.split_once("://")?;
+        let authority = rest.split('/').next()?;
+        (!authority.is_empty()).then(|| authority.to_owned())
+    }
+}
+
+/// Does this model carry its own web search?
+///
+/// Conservative and deliberately small: a model is assumed to have no built-in search
+/// unless its identifier says otherwise. Guessing the other way would forecast a tariff
+/// of zero for a call that is really billed as an Exa search.
+fn native_search_capable(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    if model.is_empty() {
+        return false;
+    }
+    // `:online` is OpenRouter's own "this variant searches" suffix; Perplexity's models
+    // and the `…-search…` variants of the big providers are the documented cases.
+    model.ends_with(":online")
+        || model.starts_with("perplexity/")
+        || model.contains("-search")
+        || model.contains("_search")
+}
+
 /// Everything the researcher needs, with the secret kept out of `Debug`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ResearchSettings {
@@ -314,6 +512,8 @@ pub struct ResearchSettings {
     pub allowed_hosts: HostAllowlist,
     pub limits: ResearchLimits,
     pub costs: ResearchCosts,
+    /// Only meaningful when `provider` is [`SearchProviderKind::OpenRouterWebSearch`].
+    pub openrouter: OpenRouterSearchSettings,
 }
 
 impl Default for ResearchSettings {
@@ -326,6 +526,7 @@ impl Default for ResearchSettings {
             allowed_hosts: HostAllowlist::default(),
             limits: ResearchLimits::default(),
             costs: ResearchCosts::default(),
+            openrouter: OpenRouterSearchSettings::default(),
         }
     }
 }
@@ -341,6 +542,7 @@ impl fmt::Debug for ResearchSettings {
             .field("availability", &self.availability().as_str())
             .field("limits", &self.limits)
             .field("costs", &self.costs)
+            .field("openrouter", &self.openrouter)
             .finish()
     }
 }
@@ -356,17 +558,17 @@ impl ResearchSettings {
 
         // An empty or placeholder key counts as "not supplied": the owner is told what
         // to set, and no request is attempted with it.
-        let api_key = match source.get("OTDEL_RESEARCH_API_KEY") {
-            Some(value) if !value.trim().is_empty() && !secret::looks_like_placeholder(&value) => {
-                let value = value.trim().to_owned();
-                if value.chars().any(char::is_control) {
-                    return Err(AppError::validation(
-                        "OTDEL_RESEARCH_API_KEY must not contain control characters",
-                    ));
-                }
-                Some(ApiKey::new(value))
+        let api_key = read_key(source, "OTDEL_RESEARCH_API_KEY")?;
+
+        // The model key is inherited *only* for the OpenRouter adapter, and only when the
+        // researcher has no key of its own. It is the same account and the same endpoint
+        // the product roles already call, so asking the owner to paste the value a second
+        // time would add a copy to protect without adding a boundary.
+        let (api_key, api_key_inherited) = match (api_key, provider) {
+            (None, SearchProviderKind::OpenRouterWebSearch) => {
+                (read_key(source, "OTDEL_LLM_API_KEY")?, true)
             }
-            _ => None,
+            (key, _) => (key, false),
         };
 
         let api_key_header = match source.get("OTDEL_RESEARCH_API_KEY_HEADER") {
@@ -394,8 +596,10 @@ impl ResearchSettings {
         let allowed_hosts =
             HostAllowlist::parse(&string_or(source, "OTDEL_RESEARCH_ALLOWED_HOSTS", ""))?;
 
+        let openrouter = load_openrouter(source, api_key_inherited)?;
+
         let defaults = ResearchLimits::default();
-        let limits = ResearchLimits {
+        let mut limits = ResearchLimits {
             max_queries_per_plan: bounded_u32(
                 source,
                 "OTDEL_RESEARCH_MAX_QUERIES_PER_PLAN",
@@ -452,6 +656,25 @@ impl ResearchSettings {
             )?,
         };
 
+        // One number, not two. The OpenRouter tool is asked for exactly as many results
+        // as the plan is allowed to see, and that count is what the tariff is computed
+        // from; two knobs disagreeing would make the forecast wrong in a way nobody would
+        // notice until the invoice.
+        if provider == SearchProviderKind::OpenRouterWebSearch {
+            let generic = source
+                .get("OTDEL_RESEARCH_MAX_RESULTS_PER_QUERY")
+                .filter(|value| !value.trim().is_empty());
+            if generic.is_some() && limits.max_results_per_query != openrouter.max_results {
+                return Err(AppError::validation(
+                    "OTDEL_RESEARCH_MAX_RESULTS_PER_QUERY and \
+                     OTDEL_RESEARCH_OPENROUTER_MAX_RESULTS disagree; with the OpenRouter \
+                     provider set only OTDEL_RESEARCH_OPENROUTER_MAX_RESULTS, because the \
+                     search tariff is computed from it",
+                ));
+            }
+            limits.max_results_per_query = openrouter.max_results;
+        }
+
         let cost_defaults = ResearchCosts::default();
         let currency = string_or(source, "OTDEL_RESEARCH_CURRENCY", &cost_defaults.currency)
             .to_ascii_uppercase();
@@ -461,14 +684,36 @@ impl ResearchSettings {
             ));
         }
 
+        // With OpenRouter the per-search price is *derived* — engine tariff for the
+        // configured result count, plus the token allowance — so a flat
+        // `COST_PER_SEARCH_MICROS` would be a second, silently ignored answer to the same
+        // question. Saying so is better than quietly preferring one of them.
+        if provider == SearchProviderKind::OpenRouterWebSearch
+            && source
+                .get("OTDEL_RESEARCH_COST_PER_SEARCH_MICROS")
+                .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(AppError::validation(
+                "OTDEL_RESEARCH_COST_PER_SEARCH_MICROS does not apply to the OpenRouter \
+                 provider: the price of a search is computed from \
+                 OTDEL_RESEARCH_OPENROUTER_SEARCH_BASE_MICROS, \
+                 OTDEL_RESEARCH_OPENROUTER_SEARCH_EXTRA_RESULT_MICROS and \
+                 OTDEL_RESEARCH_OPENROUTER_TOKEN_ALLOWANCE_MICROS",
+            ));
+        }
+
         let costs = ResearchCosts {
             currency,
-            search_micros: bounded_u64(
-                source,
-                "OTDEL_RESEARCH_COST_PER_SEARCH_MICROS",
-                cost_defaults.search_micros,
-                COST_RANGE,
-            )?,
+            search_micros: if provider == SearchProviderKind::OpenRouterWebSearch {
+                openrouter.forecast_micros()
+            } else {
+                bounded_u64(
+                    source,
+                    "OTDEL_RESEARCH_COST_PER_SEARCH_MICROS",
+                    cost_defaults.search_micros,
+                    COST_RANGE,
+                )?
+            },
             fetch_micros: bounded_u64(
                 source,
                 "OTDEL_RESEARCH_COST_PER_FETCH_MICROS",
@@ -510,6 +755,7 @@ impl ResearchSettings {
             allowed_hosts,
             limits,
             costs,
+            openrouter,
         })
     }
 
@@ -524,11 +770,30 @@ impl ResearchSettings {
         }
 
         let mut missing: Vec<&'static str> = Vec::new();
-        if self.search_url.is_empty() {
-            missing.push("OTDEL_RESEARCH_SEARCH_URL");
-        }
-        if self.api_key.is_none() {
-            missing.push("OTDEL_RESEARCH_API_KEY");
+        match self.provider {
+            SearchProviderKind::Disabled => {}
+            SearchProviderKind::HttpJson => {
+                if self.search_url.is_empty() {
+                    missing.push("OTDEL_RESEARCH_SEARCH_URL");
+                }
+                if self.api_key.is_none() {
+                    missing.push("OTDEL_RESEARCH_API_KEY");
+                }
+            }
+            // The OpenRouter adapter needs no endpoint of its own: it calls the
+            // `/chat/completions` the product roles already use. What it does need is a
+            // model to run the tool on, and a key — its own or the model's.
+            SearchProviderKind::OpenRouterWebSearch => {
+                if self.api_key.is_none() {
+                    missing.push("OTDEL_LLM_API_KEY");
+                }
+                if self.openrouter.model.is_empty() {
+                    missing.push("OTDEL_LLM_MODEL");
+                }
+                if self.openrouter.base_url.is_empty() {
+                    missing.push("OTDEL_LLM_BASE_URL");
+                }
+            }
         }
         if self.allowed_hosts.is_empty() {
             missing.push("OTDEL_RESEARCH_ALLOWED_HOSTS");
@@ -543,6 +808,9 @@ impl ResearchSettings {
 
     /// Host of the search endpoint, for the interface and the log. Never the key.
     pub fn search_host(&self) -> Option<String> {
+        if self.provider == SearchProviderKind::OpenRouterWebSearch {
+            return self.openrouter.endpoint_host();
+        }
         let (_, rest) = self.search_url.split_once("://")?;
         let authority = rest.split('/').next()?;
         if authority.is_empty() {
@@ -640,6 +908,182 @@ pub fn authority_host(authority: &str) -> &str {
     host.trim_start_matches('[').trim_end_matches(']')
 }
 
+/// Read the `openrouter:web_search` settings.
+///
+/// The model, the endpoint and the key all default to the ones the owner already
+/// configured for the product roles, because it is the same account and the same service.
+/// Everything that costs money — the engine, the result counts, the tariff — has its own
+/// variable with a stated default, so a spend can be predicted before it happens.
+fn load_openrouter(
+    source: &dyn ConfigSource,
+    api_key_inherited: bool,
+) -> Result<OpenRouterSearchSettings, AppError> {
+    let defaults = OpenRouterSearchSettings::default();
+
+    let inherited_base = string_or(
+        source,
+        "OTDEL_LLM_BASE_URL",
+        crate::llm_config::OPENROUTER_BASE_URL,
+    );
+    let base_url = normalise_openrouter_base(&string_or(
+        source,
+        "OTDEL_RESEARCH_OPENROUTER_BASE_URL",
+        &inherited_base,
+    ))?;
+
+    let model = string_or(
+        source,
+        "OTDEL_RESEARCH_OPENROUTER_MODEL",
+        &string_or(source, "OTDEL_LLM_MODEL", ""),
+    );
+    if !model.is_empty()
+        && (model
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+            || model.len() > 200)
+    {
+        return Err(AppError::validation(
+            "OTDEL_RESEARCH_OPENROUTER_MODEL must be a model identifier without spaces or \
+             control characters, e.g. `openai/gpt-4o-mini`",
+        ));
+    }
+
+    let engine = match source.get("OTDEL_RESEARCH_OPENROUTER_ENGINE") {
+        Some(value) if !value.trim().is_empty() => SearchEngine::parse(&value)?,
+        _ => defaults.engine,
+    };
+
+    let max_results = bounded_u32(
+        source,
+        "OTDEL_RESEARCH_OPENROUTER_MAX_RESULTS",
+        u64::from(defaults.max_results),
+        OPENROUTER_MAX_RESULTS_RANGE,
+    )?;
+    let max_total_results_per_plan = bounded_u32(
+        source,
+        "OTDEL_RESEARCH_OPENROUTER_MAX_TOTAL_RESULTS",
+        u64::from(defaults.max_total_results_per_plan),
+        OPENROUTER_MAX_TOTAL_RESULTS_RANGE,
+    )?;
+    if max_total_results_per_plan < max_results {
+        return Err(AppError::validation(
+            "OTDEL_RESEARCH_OPENROUTER_MAX_TOTAL_RESULTS must not be smaller than \
+             OTDEL_RESEARCH_OPENROUTER_MAX_RESULTS: one search would already exceed the \
+             whole plan's allowance",
+        ));
+    }
+
+    // The tariff defaults follow the engine the owner actually selected, so switching
+    // from Exa to Parallel does not leave the forecast quoting Exa's price.
+    let (base_default, included_default, extra_default) = {
+        let resolved = OpenRouterSearchSettings {
+            engine,
+            model: model.clone(),
+            ..defaults.clone()
+        };
+        resolved.effective_engine().default_tariff()
+    };
+
+    Ok(OpenRouterSearchSettings {
+        base_url,
+        model,
+        engine,
+        max_results,
+        max_total_results_per_plan,
+        base_micros: bounded_u64(
+            source,
+            "OTDEL_RESEARCH_OPENROUTER_SEARCH_BASE_MICROS",
+            base_default,
+            COST_RANGE,
+        )?,
+        included_results: bounded_u32(
+            source,
+            "OTDEL_RESEARCH_OPENROUTER_SEARCH_INCLUDED_RESULTS",
+            u64::from(included_default.min(1_000)),
+            (0, 1_000),
+        )?,
+        extra_result_micros: bounded_u64(
+            source,
+            "OTDEL_RESEARCH_OPENROUTER_SEARCH_EXTRA_RESULT_MICROS",
+            extra_default,
+            COST_RANGE,
+        )?,
+        token_allowance_micros: bounded_u64(
+            source,
+            "OTDEL_RESEARCH_OPENROUTER_TOKEN_ALLOWANCE_MICROS",
+            defaults.token_allowance_micros,
+            COST_RANGE,
+        )?,
+        api_key_inherited,
+    })
+}
+
+/// The OpenRouter base URL, held to the same rule as every other endpoint.
+fn normalise_openrouter_base(raw: &str) -> Result<String, AppError> {
+    let value = raw.trim().trim_end_matches('/');
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    if value.chars().any(char::is_control)
+        || value.contains(char::is_whitespace)
+        || value.contains('?')
+        || value.contains('#')
+    {
+        return Err(AppError::validation(
+            "OTDEL_RESEARCH_OPENROUTER_BASE_URL must be a plain endpoint without whitespace, \
+             a query string or a fragment",
+        ));
+    }
+    let (scheme, rest) = value.split_once("://").ok_or_else(|| {
+        AppError::validation("OTDEL_RESEARCH_OPENROUTER_BASE_URL must start with https://")
+    })?;
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return Err(AppError::validation(
+            "OTDEL_RESEARCH_OPENROUTER_BASE_URL must name a host and must not embed \
+             credentials; the key is sent in a header",
+        ));
+    }
+    // Same reason as the search endpoint: hyper skips DNS for a literal, so the guarded
+    // resolver would never see it.
+    if let Some(address) = literal_address(authority_host(authority)) {
+        if !address.is_loopback() {
+            return Err(AppError::validation(
+                "OTDEL_RESEARCH_OPENROUTER_BASE_URL must name a host, not an IP address \
+                 (only a loopback literal is allowed): an address bypasses the guard that \
+                 refuses internal destinations",
+            ));
+        }
+    }
+    match scheme {
+        "https" => Ok(value.to_owned()),
+        "http" if is_loopback_authority(authority) => Ok(value.to_owned()),
+        other => Err(AppError::validation(format!(
+            "OTDEL_RESEARCH_OPENROUTER_BASE_URL scheme `{other}` is not supported; use https://"
+        ))),
+    }
+}
+
+/// Read one API key from the configuration.
+///
+/// An empty or placeholder value counts as "not supplied" rather than as a key that will
+/// fail on the first call: the owner is told what to set, and nothing is ever sent with
+/// it. The value is wrapped immediately, so no caller ever holds a bare `String`.
+fn read_key(source: &dyn ConfigSource, name: &str) -> Result<Option<ApiKey>, AppError> {
+    match source.get(name) {
+        Some(value) if !value.trim().is_empty() && !secret::looks_like_placeholder(&value) => {
+            let value = value.trim().to_owned();
+            if value.chars().any(char::is_control) {
+                return Err(AppError::validation(format!(
+                    "{name} must not contain control characters"
+                )));
+            }
+            Ok(Some(ApiKey::new(value)))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// The address this host *is*, when it is written as one rather than named.
 fn literal_address(host: &str) -> Option<std::net::IpAddr> {
     host.parse::<std::net::IpAddr>().ok()
@@ -711,6 +1155,277 @@ mod tests {
             ("OTDEL_RESEARCH_API_KEY", "srch-0123456789abcdef"),
             ("OTDEL_RESEARCH_ALLOWED_HOSTS", "docs.cntd.ru, .gost.ru"),
         ]
+    }
+
+    fn openrouter_pairs() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("OTDEL_RESEARCH_PROVIDER", "openrouter"),
+            ("OTDEL_LLM_API_KEY", "sk-or-v1-0123456789abcdef"),
+            ("OTDEL_LLM_MODEL", "openai/gpt-4o-mini"),
+            ("OTDEL_RESEARCH_ALLOWED_HOSTS", "docs.cntd.ru"),
+        ]
+    }
+
+    fn openrouter(extra: &[(&str, &str)]) -> ResearchSettings {
+        let mut pairs = openrouter_pairs();
+        pairs.extend(extra.iter().copied().map(|(key, value)| {
+            (
+                Box::leak(key.to_owned().into_boxed_str()) as &'static str,
+                Box::leak(value.to_owned().into_boxed_str()) as &'static str,
+            )
+        }));
+        ResearchSettings::load(&env(&pairs)).unwrap()
+    }
+
+    #[test]
+    fn the_shipped_example_configuration_actually_loads() {
+        // `.env.example` is the file an owner copies. Two of its variables are now refused
+        // in combination with the shipped provider (a flat search price, a second result
+        // count), so an example that had them set would fail at the first start — and the
+        // only way to find that out would be to try it. This test tries it.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.env.example");
+        let text = std::fs::read_to_string(path).expect("read .env.example");
+
+        let source: BTreeMap<String, String> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, value)| {
+                (
+                    key.trim().to_owned(),
+                    value.trim().trim_matches('"').to_owned(),
+                )
+            })
+            .collect();
+
+        assert!(
+            source.contains_key("OTDEL_RESEARCH_PROVIDER"),
+            "the example must name a provider"
+        );
+        let settings = ResearchSettings::load(&source)
+            .expect("the shipped .env.example must be a configuration the loader accepts");
+
+        // And it must ship as *not ready*: the example carries no key and no allowlist, so
+        // a copied-and-run installation makes no external call until the owner decides to.
+        assert!(
+            !settings.availability().is_ready(),
+            "the example must not describe a researcher that would start calling out"
+        );
+    }
+
+    #[test]
+    fn the_openrouter_adapter_needs_no_endpoint_of_its_own() {
+        // It calls the same `/chat/completions` the product roles already use, so asking
+        // for a separate search URL would be asking for a second copy of one answer.
+        let settings = openrouter(&[]);
+        assert_eq!(settings.provider, SearchProviderKind::OpenRouterWebSearch);
+        assert_eq!(settings.availability(), SearchAvailability::Ready);
+        assert_eq!(settings.search_host().as_deref(), Some("openrouter.ai"));
+        assert!(settings.search_url.is_empty());
+    }
+
+    #[test]
+    fn the_model_key_is_inherited_only_by_the_openrouter_adapter_and_never_printed() {
+        let inherited = openrouter(&[]);
+        assert!(inherited.api_key.is_some());
+        assert!(
+            inherited.openrouter.api_key_inherited,
+            "the owner must be able to see which key is being spent"
+        );
+        let rendered = format!("{inherited:?}");
+        assert!(!rendered.contains("sk-or-v1-"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+
+        // Its own key wins, and then nothing is inherited.
+        let own = openrouter(&[("OTDEL_RESEARCH_API_KEY", "srch-0123456789abcdef")]);
+        assert!(!own.openrouter.api_key_inherited);
+
+        // The generic adapter never inherits: a search endpoint the owner configured is a
+        // different service from the model, and a model key sent to it would be a leak.
+        let generic = ResearchSettings::load(&env(&[
+            ("OTDEL_RESEARCH_SEARCH_URL", "https://search.example.com/v1"),
+            ("OTDEL_LLM_API_KEY", "sk-or-v1-0123456789abcdef"),
+            ("OTDEL_RESEARCH_ALLOWED_HOSTS", "docs.cntd.ru"),
+        ]))
+        .unwrap();
+        assert!(generic.api_key.is_none());
+        assert_eq!(
+            generic.availability(),
+            SearchAvailability::NeedsConfiguration {
+                missing: vec!["OTDEL_RESEARCH_API_KEY"],
+            }
+        );
+    }
+
+    #[test]
+    fn an_openrouter_researcher_without_a_key_or_a_model_says_which_variable_is_missing() {
+        let settings = ResearchSettings::load(&env(&[
+            ("OTDEL_RESEARCH_PROVIDER", "openrouter"),
+            ("OTDEL_RESEARCH_ALLOWED_HOSTS", "docs.cntd.ru"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            settings.availability(),
+            SearchAvailability::NeedsConfiguration {
+                missing: vec!["OTDEL_LLM_API_KEY", "OTDEL_LLM_MODEL"],
+            }
+        );
+    }
+
+    #[test]
+    fn auto_resolves_to_exa_for_a_model_that_cannot_search_itself() {
+        // The case the owner actually runs: `openai/gpt-4o-mini` has no built-in search,
+        // so `auto` is Exa, and both the label and the tariff have to say Exa rather than
+        // leaving the price to be discovered on an invoice.
+        let mini = openrouter(&[]);
+        assert_eq!(mini.openrouter.engine, SearchEngine::Auto);
+        assert_eq!(mini.openrouter.effective_engine(), SearchEngine::Exa);
+        assert!(mini.openrouter.is_exa_fallback());
+        assert_eq!(mini.openrouter.base_micros, 7_000);
+
+        for model in [
+            "perplexity/sonar",
+            "openai/gpt-4o-search-preview",
+            "x/y:online",
+        ] {
+            let native = openrouter(&[("OTDEL_LLM_MODEL", model)]);
+            assert_eq!(
+                native.openrouter.effective_engine(),
+                SearchEngine::Native,
+                "{model} carries its own search"
+            );
+            assert!(!native.openrouter.is_exa_fallback());
+        }
+    }
+
+    #[test]
+    fn the_engine_is_an_allowlist_not_a_free_string() {
+        for engine in ["exa", "parallel", "native", "auto", "EXA"] {
+            assert!(
+                ResearchSettings::load(&env(&{
+                    let mut pairs = openrouter_pairs();
+                    pairs.push(("OTDEL_RESEARCH_OPENROUTER_ENGINE", engine));
+                    pairs
+                }))
+                .is_ok(),
+                "{engine} is supported"
+            );
+        }
+        // Engines this system has never priced and never tested must not be reachable by
+        // typing their name into an environment variable.
+        for engine in ["perplexity", "firecrawl", "google", ""] {
+            let result = ResearchSettings::load(&env(&{
+                let mut pairs = openrouter_pairs();
+                pairs.push(("OTDEL_RESEARCH_OPENROUTER_ENGINE", engine));
+                pairs
+            }));
+            if engine.is_empty() {
+                // Empty means "not set", which is `auto`.
+                assert!(result.is_ok());
+            } else {
+                assert!(result.is_err(), "{engine} must be refused");
+            }
+        }
+    }
+
+    #[test]
+    fn the_exa_tariff_is_per_request_with_ten_results_included() {
+        let settings = openrouter(&[("OTDEL_RESEARCH_OPENROUTER_MAX_RESULTS", "12")]);
+        let openrouter = &settings.openrouter;
+
+        // $0.007 covers up to ten; each further result is $0.001.
+        assert_eq!(openrouter.search_cost_micros(1), 7_000);
+        assert_eq!(openrouter.search_cost_micros(10), 7_000);
+        assert_eq!(openrouter.search_cost_micros(12), 9_000);
+        // The forecast adds the model tokens the call spends reading its own results.
+        assert_eq!(openrouter.forecast_micros(), 9_000 + 3_000);
+        assert_eq!(
+            settings.costs.search_micros,
+            openrouter.forecast_micros(),
+            "the ledger reserves the forecast, not a flat number from elsewhere"
+        );
+    }
+
+    #[test]
+    fn an_engine_without_a_per_result_price_is_not_charged_one() {
+        let parallel = openrouter(&[("OTDEL_RESEARCH_OPENROUTER_ENGINE", "parallel")]);
+        assert_eq!(parallel.openrouter.base_micros, 5_000);
+        assert_eq!(parallel.openrouter.search_cost_micros(25), 5_000);
+
+        // Native search is billed by the model provider in its own tokens; there is no
+        // separate per-request tariff to declare, and inventing one would be fiction.
+        let native = openrouter(&[("OTDEL_RESEARCH_OPENROUTER_ENGINE", "native")]);
+        assert_eq!(native.openrouter.base_micros, 0);
+        assert_eq!(native.openrouter.forecast_micros(), 3_000);
+    }
+
+    #[test]
+    fn two_variables_may_not_answer_the_same_question() {
+        // A flat per-search price alongside a computed one would leave the forecast
+        // depending on which line the reader happened to believe.
+        let mut pairs = openrouter_pairs();
+        pairs.push(("OTDEL_RESEARCH_COST_PER_SEARCH_MICROS", "5000"));
+        let error = ResearchSettings::load(&env(&pairs)).unwrap_err();
+        assert!(error.to_string().contains("OTDEL_RESEARCH_OPENROUTER"));
+
+        let mut pairs = openrouter_pairs();
+        pairs.push(("OTDEL_RESEARCH_MAX_RESULTS_PER_QUERY", "8"));
+        assert!(ResearchSettings::load(&env(&pairs)).is_err());
+
+        // Agreeing is fine — there is nothing to be confused about.
+        let mut pairs = openrouter_pairs();
+        pairs.push(("OTDEL_RESEARCH_MAX_RESULTS_PER_QUERY", "5"));
+        assert!(ResearchSettings::load(&env(&pairs)).is_ok());
+    }
+
+    #[test]
+    fn the_result_count_defaults_to_five_and_is_bounded_per_plan() {
+        let settings = openrouter(&[]);
+        assert_eq!(settings.openrouter.max_results, 5);
+        assert_eq!(settings.limits.max_results_per_query, 5);
+        assert_eq!(settings.openrouter.max_total_results_per_plan, 20);
+
+        // A plan allowance smaller than a single search is not a bound, it is a deadlock.
+        let mut pairs = openrouter_pairs();
+        pairs.push(("OTDEL_RESEARCH_OPENROUTER_MAX_RESULTS", "10"));
+        pairs.push(("OTDEL_RESEARCH_OPENROUTER_MAX_TOTAL_RESULTS", "5"));
+        assert!(ResearchSettings::load(&env(&pairs)).is_err());
+
+        // OpenRouter clamps the tool at 25; asking for more is a typo, not a wish.
+        let mut pairs = openrouter_pairs();
+        pairs.push(("OTDEL_RESEARCH_OPENROUTER_MAX_RESULTS", "40"));
+        assert!(ResearchSettings::load(&env(&pairs)).is_err());
+    }
+
+    #[test]
+    fn the_openrouter_endpoint_obeys_the_same_url_rules_as_every_other() {
+        for base in [
+            "http://openrouter.ai/api/v1",
+            "https://203.0.113.10/api/v1",
+            "https://user:pass@openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1?key=secret",
+        ] {
+            let mut pairs = openrouter_pairs();
+            pairs.push((
+                "OTDEL_RESEARCH_OPENROUTER_BASE_URL",
+                Box::leak(base.to_owned().into_boxed_str()),
+            ));
+            assert!(
+                ResearchSettings::load(&env(&pairs)).is_err(),
+                "{base} must be refused"
+            );
+        }
+
+        // A self-hosted gateway on loopback stays possible, deliberately and visibly.
+        let local = openrouter(&[(
+            "OTDEL_RESEARCH_OPENROUTER_BASE_URL",
+            "http://127.0.0.1:8080/v1",
+        )]);
+        assert_eq!(
+            local.openrouter.chat_completions_url(),
+            "http://127.0.0.1:8080/v1/chat/completions"
+        );
     }
 
     #[test]

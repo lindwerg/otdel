@@ -28,6 +28,7 @@ pub mod fetch;
 pub mod guard;
 pub mod html;
 pub mod http;
+pub mod openrouter;
 pub mod provider;
 pub mod robots;
 pub mod url;
@@ -37,16 +38,17 @@ pub mod fake;
 
 use std::sync::Arc;
 
-use otdel_core::research_config::ResearchSettings;
+use otdel_core::research_config::{ResearchSettings, SearchProviderKind};
 use tracing::{info, warn};
 
 pub use fetch::{HttpsFetcher, UnconfiguredFetcher};
 pub use guard::{GuardedResolver, HostPolicy};
 pub use html::ExtractedPage;
 pub use http::{HttpSearchProvider, UnconfiguredSearch};
+pub use openrouter::{ChatTransport, OpenRouterSearch};
 pub use provider::{
-    AdapterDescription, DocumentFetcher, FetchRefusal, FetchedDocument, SearchAnswer, SearchError,
-    SearchHit, SearchProvider, SearchRequest,
+    AdapterDescription, DocumentFetcher, FetchRefusal, FetchedDocument, SearchAnswer,
+    SearchBilling, SearchError, SearchHit, SearchProvider, SearchRequest,
 };
 pub use url::{NormalisedUrl, UrlRejection};
 
@@ -81,14 +83,25 @@ pub fn build_search_provider(settings: &ResearchSettings) -> Arc<dyn SearchProvi
         return Arc::new(provider);
     }
 
-    match HttpSearchProvider::new(settings) {
+    let built: Result<Arc<dyn SearchProvider>, SearchError> = match settings.provider {
+        SearchProviderKind::OpenRouterWebSearch => {
+            OpenRouterSearch::new(settings).map(|provider| Arc::new(provider) as Arc<_>)
+        }
+        // `Disabled` cannot reach here: it is never `ready`.
+        SearchProviderKind::HttpJson | SearchProviderKind::Disabled => {
+            HttpSearchProvider::new(settings).map(|provider| Arc::new(provider) as Arc<_>)
+        }
+    };
+
+    match built {
         Ok(provider) => {
             info!(
+                provider = provider.describe().provider,
                 endpoint_host = settings.search_host().unwrap_or_default(),
                 allowed_hosts = settings.allowed_hosts.len(),
                 "search adapter ready"
             );
-            Arc::new(provider)
+            provider
         }
         // Only reachable when the HTTP client itself cannot be built (no TLS backend,
         // for instance). Falling back keeps the process alive and honest rather than

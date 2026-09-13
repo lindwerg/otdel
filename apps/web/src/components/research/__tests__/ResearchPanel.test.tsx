@@ -5,6 +5,7 @@ import type {
   ExternalEvidence,
   IndustryQuestion,
   ResearchBudget,
+  ResearchEngineState,
   ResearchFinding,
   ResearchOverview,
   ResearchPlan,
@@ -57,10 +58,46 @@ function providerReady(): ResearchProviderState {
       request_timeout_seconds: 20,
       plan_time_budget_seconds: 300,
       max_passes_per_plan: 2,
+      max_total_results_per_plan: null,
     },
+    engine: null,
     message:
       'Исследователь готов: поиск через search.example.com, чтение только с docs.example.org ' +
       'и модель openai/gpt-4o-mini.',
+  }
+}
+
+/** The researcher as the owner really runs it: OpenRouter's server tool. */
+function providerOpenRouter(
+  engineOverrides: Partial<ResearchEngineState> = {},
+): ResearchProviderState {
+  const ready = providerReady()
+  return {
+    ...ready,
+    search: {
+      ...ready.search,
+      provider: 'openrouter_web_search',
+      endpoint_host: 'openrouter.ai',
+      message:
+        'Исследователь ищет источники через openrouter.ai (openai/gpt-4o-mini, движок exa, ' +
+        'до 5 результатов на запрос). Ключ взят из OTDEL_LLM_API_KEY.',
+    },
+    limits: { ...ready.limits, max_results_per_query: 5, max_total_results_per_plan: 20 },
+    engine: {
+      configured: 'auto',
+      effective: 'exa',
+      exa_fallback: true,
+      model: 'openai/gpt-4o-mini',
+      max_results: 5,
+      max_total_results_per_plan: 20,
+      forecast_micros: 10_000,
+      search_base_micros: 7_000,
+      included_results: 10,
+      extra_result_micros: 1_000,
+      token_allowance_micros: 3_000,
+      api_key_inherited: true,
+      ...engineOverrides,
+    },
   }
 }
 
@@ -616,5 +653,73 @@ describe('ResearchPanel', () => {
 
     renderPanel()
     expect(await screen.findByRole('list', { name: 'Отраслевые выводы' })).toBeInTheDocument()
+  })
+
+  it('states the engine and the forecast before anything is spent', async () => {
+    install({ overviewBody: overview({ provider: providerOpenRouter() }) })
+    renderPanel()
+
+    const engine = await screen.findByRole('region', { name: 'Поиск' })
+    // `auto` is resolved, not repeated: the owner sees which engine will really run.
+    expect(within(engine).getByText('auto → exa')).toBeInTheDocument()
+    expect(within(engine).getByText('openai/gpt-4o-mini')).toBeInTheDocument()
+    // The forecast for one search: 0,007 for the request plus 0,003 for the tokens.
+    expect(within(engine).getByText('0,01 USD')).toBeInTheDocument()
+    expect(within(engine).getByText(/не больше 20 на всё исследование/)).toBeInTheDocument()
+    // And it is labelled a forecast, not an invoice.
+    expect(within(engine).getByText(/Это прогноз по объявленному тарифу/)).toBeInTheDocument()
+    expect(within(engine).getByText(/включая 10 результатов/)).toBeInTheDocument()
+  })
+
+  it('says plainly when auto had to fall back to Exa, and whose key is being spent', async () => {
+    install({ overviewBody: overview({ provider: providerOpenRouter() }) })
+    renderPanel()
+
+    const engine = await screen.findByRole('region', { name: 'Поиск' })
+    expect(within(engine).getByText(/не умеет искать сама/)).toBeInTheDocument()
+    expect(within(engine).getByText(/Ключ взят из OTDEL_LLM_API_KEY/)).toBeInTheDocument()
+  })
+
+  it('does not invent an engine panel for a provider that has no engine to choose', async () => {
+    install()
+    renderPanel()
+
+    await screen.findByRole('list', { name: 'Отраслевые выводы' })
+    expect(screen.queryByRole('region', { name: 'Поиск' })).not.toBeInTheDocument()
+  })
+
+  it('names the engine that really served each query, with what it really cost', async () => {
+    installMockFetch((req) => {
+      if (req.url.endsWith('/api/session')) {
+        return jsonResponse(200, { authenticated: true, csrf_token: 'csrf-1' })
+      }
+      if (req.url.endsWith('/research/findings')) {
+        return jsonResponse(200, { items: [finding()] })
+      }
+      if (req.url.endsWith('/research')) {
+        return jsonResponse(200, overview({ provider: providerOpenRouter() }))
+      }
+      if (req.url.endsWith('/sources')) {
+        return jsonResponse(200, { items: sources() })
+      }
+      if (req.url.endsWith('/queries')) {
+        return jsonResponse(200, {
+          items: [
+            {
+              ...queries()[0],
+              provider: 'openrouter_web_search/exa',
+              // What the provider reported charging, not the 0,01 forecast.
+              cost_micros: 8_100,
+            },
+          ],
+        })
+      }
+      return jsonResponse(404, { error: { code: 'not_found', message: 'нет', retryable: false } })
+    })
+    renderPanel()
+
+    await userEvent.click(await screen.findByRole('button', { name: /Журнал источников/ }))
+    expect(await screen.findByText(/OpenRouter web search · exa/)).toBeInTheDocument()
+    expect(screen.getByText(/0,0081 USD/)).toBeInTheDocument()
   })
 })

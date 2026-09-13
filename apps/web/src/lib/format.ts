@@ -421,6 +421,26 @@ export function queryOutcomeLabel(outcome: QueryOutcome): string {
   return QUERY_OUTCOME_LABEL[outcome] ?? outcome
 }
 
+const SEARCH_ADAPTER_LABEL: Record<string, string> = {
+  openrouter_web_search: 'OpenRouter web search',
+  http_json: 'внешний поиск',
+  fake: 'тестовый поиск',
+}
+
+/**
+ * The provider string of a journalled query, as a person reads it.
+ *
+ * The worker writes `adapter/engine` (`openrouter_web_search/exa`) when it knows
+ * which engine served the call, and the bare adapter when nothing ran. The engine
+ * is kept visible rather than folded into the adapter name, because with `auto`
+ * the two are different answers and the price follows the engine.
+ */
+export function searchProviderLabel(provider: string): string {
+  const [adapter, engine] = provider.split('/', 2)
+  const name = SEARCH_ADAPTER_LABEL[adapter] ?? adapter
+  return engine ? `${name} · ${engine}` : name
+}
+
 /**
  * An amount of research money, as a person reads it: `0,005 USD`.
  *

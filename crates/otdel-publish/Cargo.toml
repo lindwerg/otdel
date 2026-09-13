@@ -1,0 +1,31 @@
+[package]
+name = "otdel-publish"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "The checker, the readiness rules and the bounded answering role of OTDEL phase 1E: every verdict is reached by re-reading the stored source, a model may only lower a verdict, and an answer cites the published version or says it has none."
+
+[dependencies]
+otdel-core.workspace = true
+# The quotation machinery is shared with 1C and 1D on purpose. What the checker has to
+# decide is whether a citation still says what it said, and "дословно" must mean exactly
+# one thing across the phase that wrote the citation and the phase that verifies it —
+# two implementations would eventually disagree about a dash or a non-breaking space, and
+# the disagreement would show up as knowledge quietly going stale.
+otdel-knowledge.workspace = true
+otdel-llm.workspace = true
+
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+otdel-llm = { workspace = true, features = ["fake"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

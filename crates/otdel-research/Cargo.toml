@@ -1,0 +1,29 @@
+[package]
+name = "otdel-research"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Phase 1D as a pure pipeline: deterministic query building that refuses to name the partner, the external source catalogue, the bounded researcher prompt, and validation that keeps a finding tied to an exact fragment of an exact page."
+
+[dependencies]
+otdel-core.workspace = true
+# The quotation machinery is shared with 1C on purpose: a citation into a web page is
+# checked by exactly the code that checks a citation into a partner's PDF, so the two
+# cannot drift into different notions of what "дословно" means.
+otdel-knowledge.workspace = true
+otdel-llm.workspace = true
+otdel-search.workspace = true
+
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+otdel-llm = { workspace = true, features = ["fake"] }
+otdel-search = { workspace = true, features = ["fake"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

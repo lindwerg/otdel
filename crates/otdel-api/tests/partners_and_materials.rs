@@ -136,19 +136,27 @@ async fn upload_stores_the_original_and_queues_extraction() {
         "page_count",
         "created_at",
         "error",
+        // Phase 1B: the page roll-up, `null` until the worker has read anything.
+        "extraction",
+        // Phase 1F: how many times this original has been *read*. `0` for a fresh
+        // upload — a changed file is a new material, so this only counts re-readings.
+        "content_revision",
     ] {
         assert!(material.get(field).is_some(), "missing {field}");
     }
-    assert_eq!(material.as_object().unwrap().len(), 10);
+    assert_eq!(material.as_object().unwrap().len(), 12);
     assert_eq!(material["partner_id"], partner.to_string());
     assert_eq!(material["media_type"], "application/pdf");
     assert_eq!(material["filename"], "каталог 2026.pdf");
     assert_eq!(material["size_bytes"], pdf.len() as i64);
     assert_eq!(material["sha256"].as_str().unwrap().len(), 64);
-    // Phase 1A does not read documents: the file is queued, never “completed”.
+    // A freshly uploaded file is queued, never “completed”: nothing has read it yet, so
+    // there is no page count and no extraction summary either.
     assert_eq!(material["status"], "queued");
     assert!(material["page_count"].is_null());
     assert!(material["error"].is_null());
+    assert!(material["extraction"].is_null());
+    assert_eq!(material["content_revision"], 0);
 
     // The queue really holds a job for it.
     let jobs = app
@@ -162,6 +170,8 @@ async fn upload_stores_the_original_and_queues_extraction() {
     assert_eq!(items[0]["material_id"], material["id"]);
     assert_eq!(items[0]["attempts"], 0);
     assert!(items[0]["stage"].is_null());
+    // A whole-document job names no page; only a single-page retry does.
+    assert!(items[0]["page_number"].is_null());
 
     // And the listing shows it.
     let listed = app

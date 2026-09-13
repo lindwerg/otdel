@@ -27,7 +27,11 @@ use otdel_api::state::AppState;
 use otdel_core::config::Config;
 use otdel_core::secret;
 use otdel_db::Database;
+use otdel_extract::{OcrEngine, PageProcessor, PageRasteriser, ToolAvailability};
+use otdel_llm::LlmProvider;
+use otdel_search::{DocumentFetcher, SearchProvider};
 use otdel_storage::{FilesystemObjectStore, ObjectStore};
+use otdel_worker::{Extractor, KnowledgeWorker, ResearchWorker, ToolReport};
 use serde_json::Value;
 use sqlx::{Executor, PgPool};
 use tower::ServiceExt;
@@ -51,42 +55,9 @@ impl TestApp {
     /// Every test gets its own bureau (and its own storage namespace), so tests can run
     /// concurrently against one database and still make statements about isolation.
     pub async fn start() -> Self {
-        let runtime_url = require_env("OTDEL_TEST_DATABASE_URL");
-        let admin_url = require_env("OTDEL_TEST_ADMIN_DATABASE_URL");
-
-        let admin_pool = PgPool::connect(&admin_url)
-            .await
-            .expect("connect with the migration role");
-
-        let slug = unique_slug();
-        let bureau_id = provision_bureau(&admin_pool, &slug).await;
-
-        let storage_root = std::env::temp_dir().join(format!("otdel-api-test-{}", Uuid::new_v4()));
-        let config = test_config(&runtime_url, &slug, &storage_root);
-
-        let db = Database::connect(&config.database_url, 5)
-            .await
-            .expect("connect with the runtime role");
-        db.verify_runtime_role()
-            .await
-            .expect("the test runtime role must be the restricted one");
-
-        let store = FilesystemObjectStore::open_at(&storage_root)
-            .await
-            .expect("open the test object store");
-        let store: Arc<dyn ObjectStore> = Arc::new(store);
-
-        let state = AppState::new(Arc::new(config), db, store);
-        let router = otdel_api::app(state.clone());
-
-        Self {
-            router,
-            state,
-            bureau_id,
-            bureau_slug: slug,
-            storage_root,
-            admin_pool,
-        }
+        // No research configuration: the researcher is unconfigured, which is both the
+        // default state of the product and one of the things the 1D suite asserts.
+        Self::start_with_settings(ResearchOverrides::default()).await
     }
 
     /// Send a request and read the whole response.
@@ -463,8 +434,12 @@ pub async fn delete_bureau_as_admin(admin_pool: &PgPool, bureau_id: Uuid) {
     let mut tx = set_bureau_context(admin_pool, bureau_id).await;
     for statement in [
         "DELETE FROM otdel.jobs WHERE bureau_id = $1",
+        // Materials cascade to everything 1B/1C/1D derived from them, including research
+        // plans and their journals. The budget hangs off the bureau instead and is
+        // removed explicitly rather than relying on the cascade of the final DELETE.
         "DELETE FROM otdel.materials WHERE bureau_id = $1",
         "DELETE FROM otdel.partners WHERE bureau_id = $1",
+        "DELETE FROM otdel.research_budgets WHERE bureau_id = $1",
     ] {
         sqlx::query(statement)
             .bind(bureau_id)
@@ -507,7 +482,17 @@ pub async fn set_bureau_context(
     tx
 }
 
-fn test_config(runtime_url: &str, bureau_slug: &str, storage_root: &std::path::Path) -> Config {
+/// The environment every test application is built from.
+///
+/// Returned as a map rather than a `Config` so a suite can override individual variables
+/// (see [`ResearchOverrides`]) and still go through the same validation the server does
+/// at startup — a test that hand-built a `Config` could give itself a combination the
+/// real configuration loader would refuse.
+fn test_config_source(
+    runtime_url: &str,
+    bureau_slug: &str,
+    storage_root: &std::path::Path,
+) -> std::collections::BTreeMap<String, String> {
     let mut source = std::collections::BTreeMap::new();
     source.insert("OTDEL_DATABASE_URL".to_owned(), runtime_url.to_owned());
     source.insert(
@@ -521,5 +506,457 @@ fn test_config(runtime_url: &str, bureau_slug: &str, storage_root: &std::path::P
     );
     // Small limit so the “too large” test does not have to stream 25 MiB.
     source.insert("OTDEL_MAX_UPLOAD_BYTES".to_owned(), "4096".to_owned());
-    Config::load(&source).expect("test configuration")
+    // Recognition is off by default in tests **on purpose**: the suite must produce the
+    // same result on a machine with Tesseract installed and on one without. The tests
+    // that exercise a working engine install a fake one explicitly
+    // (`TestApp::extractor_with`), which is also the only way any of them can produce
+    // recognised text.
+    source.insert("OTDEL_OCR_ENABLED".to_owned(), "false".to_owned());
+    source
+}
+
+// --- phase 1B: driving the real worker ------------------------------------------------
+
+impl TestApp {
+    /// An extractor that models a machine where recognition is **switched on but not
+    /// installed** — the situation the "a scan is not reported as read" checks are about.
+    ///
+    /// Recognition is enabled in the configuration (so nothing is skipped for the wrong
+    /// reason) while both tools probe as missing, and the adapters themselves are the
+    /// [`otdel_extract::Disabled`] ones, so there is no path that could return text even
+    /// if the permission logic were wrong.
+    pub fn extractor(&self) -> Extractor {
+        let mut config = (*self.state.config).clone();
+        config.extraction.ocr.enabled = true;
+
+        let processor = Arc::new(PageProcessor::new(
+            Arc::new(otdel_extract::Disabled::new(
+                "tesseract",
+                "исполняемый файл `tesseract` не найден",
+            )),
+            Arc::new(otdel_extract::Disabled::new(
+                "pdftoppm",
+                "исполняемый файл `pdftoppm` не найден",
+            )),
+        ));
+
+        Extractor::new(
+            Arc::new(config),
+            self.state.db.clone(),
+            Arc::clone(&self.state.store),
+            processor,
+            ToolReport {
+                engine: ToolAvailability::Unavailable {
+                    reason: "исполняемый файл `tesseract` не найден".to_owned(),
+                },
+                rasteriser: ToolAvailability::Unavailable {
+                    reason: "исполняемый файл `pdftoppm` не найден".to_owned(),
+                },
+            },
+        )
+    }
+
+    /// An extractor with the supplied adapters, used by the tests that need a working
+    /// engine without depending on one being installed.
+    pub fn extractor_with(
+        &self,
+        engine: Arc<dyn OcrEngine>,
+        rasteriser: Arc<dyn PageRasteriser>,
+    ) -> Extractor {
+        let mut config = (*self.state.config).clone();
+        config.extraction.ocr.enabled = true;
+        let engine_version = "fake-engine 1.0".to_owned();
+
+        Extractor::new(
+            Arc::new(config),
+            self.state.db.clone(),
+            Arc::clone(&self.state.store),
+            Arc::new(PageProcessor::new(engine, rasteriser)),
+            ToolReport {
+                engine: ToolAvailability::Available {
+                    version: engine_version.clone(),
+                },
+                rasteriser: ToolAvailability::Available {
+                    version: engine_version,
+                },
+            },
+        )
+    }
+
+    /// Drain the queue once, the way `otdel-worker once` does.
+    pub async fn run_worker(&self, extractor: &Extractor) -> otdel_worker::ExtractionReport {
+        extractor
+            .run_pass(self.bureau_id, 16)
+            .await
+            .expect("the extraction pass must not fail as a whole")
+    }
+}
+
+// --- phase 1C: driving the product role -----------------------------------------------
+
+impl TestApp {
+    /// An application whose model adapter is the supplied one.
+    ///
+    /// The configuration of a test has no key, so the adapter built from it refuses
+    /// every call — which is exactly what the "no key" checks want, and exactly what
+    /// the positive checks cannot use. Those pass a scripted provider here; no test
+    /// ever reaches a network.
+    pub async fn start_with_provider(provider: Arc<dyn LlmProvider>) -> Self {
+        let app = Self::start().await;
+        let state = app.state.clone().with_provider(provider);
+        let router = otdel_api::app(state.clone());
+        Self {
+            router,
+            state,
+            ..app
+        }
+    }
+
+    /// The phase 1C worker, with the supplied provider.
+    pub fn knowledge_worker(&self, provider: Arc<dyn LlmProvider>) -> KnowledgeWorker {
+        KnowledgeWorker::new(
+            Arc::clone(&self.state.config),
+            self.state.db.clone(),
+            provider,
+        )
+    }
+
+    /// One understanding pass, the way `otdel-worker once` does it.
+    pub async fn run_knowledge(&self, worker: &KnowledgeWorker) -> otdel_worker::KnowledgeReport {
+        worker
+            .run_pass(self.bureau_id, 8)
+            .await
+            .expect("the understanding pass must not fail as a whole")
+    }
+}
+
+// --- phase 1D: driving the researcher ---------------------------------------------------
+
+impl TestApp {
+    /// An application whose research adapters are the supplied ones.
+    ///
+    /// A real researcher needs a search key, a network *and* somebody's money. No test
+    /// may acquire any of the three, so the 1D suites pass scripted adapters here and
+    /// drive the whole path — route, queue, budget, allowlist, quotation checking,
+    /// storage — without them. A test that forgets to do this gets the unconfigured
+    /// adapters, which is itself one of the cases worth asserting.
+    pub async fn start_with_research(
+        search: Arc<dyn SearchProvider>,
+        fetcher: Arc<dyn DocumentFetcher>,
+        llm: Arc<dyn LlmProvider>,
+        settings: ResearchOverrides,
+    ) -> Self {
+        let app = Self::start_with_settings(settings).await;
+        let state = app
+            .state
+            .clone()
+            .with_provider(llm)
+            .with_research_adapters(search, fetcher);
+        let router = otdel_api::app(state.clone());
+        Self {
+            router,
+            state,
+            ..app
+        }
+    }
+
+    /// The phase 1D worker, with the supplied adapters.
+    pub fn research_worker(
+        &self,
+        search: Arc<dyn SearchProvider>,
+        fetcher: Arc<dyn DocumentFetcher>,
+        llm: Arc<dyn LlmProvider>,
+    ) -> ResearchWorker {
+        ResearchWorker::new(
+            Arc::clone(&self.state.config),
+            self.state.db.clone(),
+            search,
+            fetcher,
+            llm,
+        )
+    }
+
+    /// Start with the phase 1E adapters replaced.
+    ///
+    /// Both are optional in production and both are optional here, which is the property
+    /// worth exercising: a suite that passes the unconfigured ones still gets a checked,
+    /// published, searchable version — only the vector half and the prose answer are
+    /// missing, and the response says so.
+    pub async fn start_with_retrieval(
+        llm: Arc<dyn LlmProvider>,
+        embeddings: Arc<dyn otdel_embed::EmbeddingProvider>,
+    ) -> Self {
+        let app = Self::start_with_settings(ResearchOverrides::default()).await;
+        let state = app
+            .state
+            .clone()
+            .with_provider(llm)
+            .with_embeddings(embeddings);
+        let router = otdel_api::app(state.clone());
+        Self {
+            router,
+            state,
+            ..app
+        }
+    }
+
+    /// Phase 1F: an app whose retention policy is switched on.
+    ///
+    /// Retention is off by default — a pilot that pruned its own history because a
+    /// default said so would lose the evidence of its first month — so the tests that
+    /// assert what a sweep removes have to turn it on explicitly, and they go through the
+    /// real `Config::load` in order to do it. A test cannot construct a policy the server
+    /// would refuse.
+    pub async fn start_with_retention(event_days: u32, job_days: Option<u32>) -> Self {
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert(
+            "OTDEL_RETENTION_EVENT_DAYS".to_owned(),
+            event_days.to_string(),
+        );
+        if let Some(days) = job_days {
+            overrides.insert("OTDEL_RETENTION_JOB_DAYS".to_owned(), days.to_string());
+        }
+        Self::start_with_env(overrides).await
+    }
+
+    /// The phase 1E worker, with the supplied optional adapters.
+    pub fn validation_worker(
+        &self,
+        llm: Arc<dyn LlmProvider>,
+        embeddings: Arc<dyn otdel_embed::EmbeddingProvider>,
+    ) -> otdel_worker::ValidationWorker {
+        otdel_worker::ValidationWorker::new(
+            Arc::clone(&self.state.config),
+            self.state.db.clone(),
+            llm,
+            embeddings,
+        )
+    }
+
+    /// One verification pass, the way `otdel-worker once` does it.
+    pub async fn run_validation(
+        &self,
+        worker: &otdel_worker::ValidationWorker,
+    ) -> otdel_worker::ValidationReport {
+        worker
+            .run_pass(self.bureau_id, 4)
+            .await
+            .expect("the verification pass must not fail as a whole")
+    }
+
+    /// Does this database have the pgvector column?
+    ///
+    /// The suite asserts different things depending on the answer, because both are real
+    /// deployments: the extension is not `trusted`, so a database whose operator never
+    /// installed it is the normal case, not a broken one.
+    pub async fn has_vector_column(&self) -> bool {
+        let mut tx = self
+            .state
+            .db
+            .begin_scoped(self.bureau_id)
+            .await
+            .expect("scoped transaction");
+        let present = otdel_db::publication_read::vector_column_exists(&mut tx)
+            .await
+            .expect("probing for the vector column");
+        tx.commit().await.expect("commit");
+        present
+    }
+
+    /// One research pass, the way `otdel-worker once` does it.
+    pub async fn run_research(&self, worker: &ResearchWorker) -> otdel_worker::ResearchReport {
+        worker
+            .run_pass(self.bureau_id, 4)
+            .await
+            .expect("the research pass must not fail as a whole")
+    }
+
+    /// Start with research configuration applied on top of the standard test settings.
+    /// Start with arbitrary extra environment applied on top of the test defaults.
+    ///
+    /// Everything still goes through the real `Config::load`, so an override that the
+    /// server would reject fails the test at startup rather than producing an app in a
+    /// state the product cannot be in.
+    pub async fn start_with_env(extra: std::collections::BTreeMap<String, String>) -> Self {
+        Self::start_with(ResearchOverrides::default(), extra).await
+    }
+
+    async fn start_with_settings(settings: ResearchOverrides) -> Self {
+        Self::start_with(settings, std::collections::BTreeMap::new()).await
+    }
+
+    async fn start_with(
+        settings: ResearchOverrides,
+        extra: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        let runtime_url = require_env("OTDEL_TEST_DATABASE_URL");
+        let admin_url = require_env("OTDEL_TEST_ADMIN_DATABASE_URL");
+
+        let admin_pool = PgPool::connect(&admin_url)
+            .await
+            .expect("connect with the migration role");
+
+        let slug = unique_slug();
+        let bureau_id = provision_bureau(&admin_pool, &slug).await;
+
+        let storage_root = std::env::temp_dir().join(format!("otdel-api-test-{}", Uuid::new_v4()));
+        let mut source = test_config_source(&runtime_url, &slug, &storage_root);
+        settings.apply(&mut source);
+        source.extend(extra);
+        let config = Config::load(&source).expect("test configuration");
+
+        let db = Database::connect(&config.database_url, 5)
+            .await
+            .expect("connect with the runtime role");
+        db.verify_runtime_role()
+            .await
+            .expect("the test runtime role must be the restricted one");
+
+        let store = FilesystemObjectStore::open_at(&storage_root)
+            .await
+            .expect("open the test object store");
+        let store: Arc<dyn ObjectStore> = Arc::new(store);
+
+        let state = AppState::new(Arc::new(config), db, store);
+        let router = otdel_api::app(state.clone());
+
+        Self {
+            router,
+            state,
+            bureau_id,
+            bureau_slug: slug,
+            storage_root,
+            admin_pool,
+        }
+    }
+}
+
+/// Research configuration a test wants applied on top of the defaults.
+///
+/// Only the values whose *effects* a test asserts on: the allowlist (which hosts may be
+/// read), the money (what stops a plan), and the two limits that decide when a pass ends.
+/// Everything else stays at the shipped default, so the suites exercise the configuration
+/// the pilot would really run.
+#[derive(Debug, Clone, Default)]
+pub struct ResearchOverrides {
+    pub allowed_hosts: Option<String>,
+    pub bureau_budget_micros: Option<u64>,
+    pub plan_budget_micros: Option<u64>,
+    pub cost_per_search_micros: Option<u64>,
+    pub cost_per_fetch_micros: Option<u64>,
+    pub cost_per_model_call_micros: Option<u64>,
+    pub max_sources_per_plan: Option<u32>,
+    pub max_queries_per_plan: Option<u32>,
+    pub max_passes_per_plan: Option<u32>,
+}
+
+impl ResearchOverrides {
+    /// The shape a working researcher has: a declared publisher, and enough money for a
+    /// handful of calls.
+    pub fn ready() -> Self {
+        Self {
+            allowed_hosts: Some("docs.example.org".to_owned()),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_hosts(mut self, hosts: &str) -> Self {
+        self.allowed_hosts = Some(hosts.to_owned());
+        self
+    }
+
+    pub fn with_bureau_budget(mut self, micros: u64) -> Self {
+        self.bureau_budget_micros = Some(micros);
+        self
+    }
+
+    pub fn with_plan_budget(mut self, micros: u64) -> Self {
+        self.plan_budget_micros = Some(micros);
+        self
+    }
+
+    pub fn with_search_cost(mut self, micros: u64) -> Self {
+        self.cost_per_search_micros = Some(micros);
+        self
+    }
+
+    pub fn with_fetch_cost(mut self, micros: u64) -> Self {
+        self.cost_per_fetch_micros = Some(micros);
+        self
+    }
+
+    pub fn with_model_cost(mut self, micros: u64) -> Self {
+        self.cost_per_model_call_micros = Some(micros);
+        self
+    }
+
+    pub fn with_max_sources(mut self, sources: u32) -> Self {
+        self.max_sources_per_plan = Some(sources);
+        self
+    }
+
+    pub fn with_max_queries(mut self, queries: u32) -> Self {
+        self.max_queries_per_plan = Some(queries);
+        self
+    }
+
+    pub fn with_max_passes(mut self, passes: u32) -> Self {
+        self.max_passes_per_plan = Some(passes);
+        self
+    }
+
+    fn apply(&self, source: &mut std::collections::BTreeMap<String, String>) {
+        // The search endpoint and key are set whenever a test declares an allowlist:
+        // the adapters injected afterwards are scripted, but the *configuration* has to
+        // read as ready or the routes would refuse before the fakes are ever consulted.
+        if let Some(hosts) = &self.allowed_hosts {
+            source.insert(
+                "OTDEL_RESEARCH_SEARCH_URL".to_owned(),
+                "https://search.invalid.test/v1/search".to_owned(),
+            );
+            source.insert(
+                "OTDEL_RESEARCH_API_KEY".to_owned(),
+                "srch-test-only-never-used".to_owned(),
+            );
+            source.insert("OTDEL_RESEARCH_ALLOWED_HOSTS".to_owned(), hosts.clone());
+        }
+        for (key, value) in [
+            ("OTDEL_RESEARCH_BUDGET_MICROS", self.bureau_budget_micros),
+            ("OTDEL_RESEARCH_PLAN_BUDGET_MICROS", self.plan_budget_micros),
+            (
+                "OTDEL_RESEARCH_COST_PER_SEARCH_MICROS",
+                self.cost_per_search_micros,
+            ),
+            (
+                "OTDEL_RESEARCH_COST_PER_FETCH_MICROS",
+                self.cost_per_fetch_micros,
+            ),
+            (
+                "OTDEL_RESEARCH_COST_PER_MODEL_CALL_MICROS",
+                self.cost_per_model_call_micros,
+            ),
+        ] {
+            if let Some(value) = value {
+                source.insert(key.to_owned(), value.to_string());
+            }
+        }
+        for (key, value) in [
+            (
+                "OTDEL_RESEARCH_MAX_SOURCES_PER_PLAN",
+                self.max_sources_per_plan,
+            ),
+            (
+                "OTDEL_RESEARCH_MAX_QUERIES_PER_PLAN",
+                self.max_queries_per_plan,
+            ),
+            (
+                "OTDEL_RESEARCH_MAX_PASSES_PER_PLAN",
+                self.max_passes_per_plan,
+            ),
+        ] {
+            if let Some(value) = value {
+                source.insert(key.to_owned(), value.to_string());
+            }
+        }
+    }
 }

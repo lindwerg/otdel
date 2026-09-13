@@ -1,0 +1,575 @@
+/*
+  OTDEL — phase 1E: checked versions, readiness, search and answers.
+
+  Same tokens as global.css; nothing here redefines a colour or a radius. Three
+  visual ideas, and all three are about not being believed too much.
+
+  1. A *verdict* is the loudest thing on a statement. Only `source_supported`
+     gets the success colour, and even it is worded as support by a source.
+     Everything else carries a second, explicit "not confirmed" marker in the
+     warning colour — because the difference between «гипотеза» and «подтверждено»
+     has to survive being skimmed.
+
+  2. A settled-but-unhappy state is never red. `blocked`, `revoked`,
+     `superseded`, `insufficient_evidence`, `evidence_only` and `keyword` are all
+     outcomes of the system working correctly, so they use --warn or the muted
+     ink. Only a genuine failure gets --warn-strong.
+
+  3. The model's prose sits in a box that does not look like a quotation. The
+     `.evidence__quote` family — a solid left rule in the accent colour — is
+     reserved for text a source really wrote; model wording gets a dashed border
+     and the warning-coloured badge, and never the accent rule.
+*/
+
+/* --- what this installation can do ----------------------------------------- */
+
+.retrieval-notice {
+  margin-top: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+
+.retrieval-notice[data-state='ready'] {
+  border-left-color: var(--accent);
+}
+
+.retrieval-notice h4 {
+  margin: 0 0 6px;
+  font-size: 0.9375rem;
+  color: var(--warn);
+}
+
+.retrieval-notice[data-state='ready'] h4 {
+  color: var(--accent);
+}
+
+.retrieval-notice p {
+  font-size: 0.8125rem;
+}
+
+.retrieval-notice__line {
+  color: var(--ink);
+}
+
+.retrieval-notice__validation {
+  margin-top: 6px;
+  color: var(--ink);
+}
+
+.retrieval-notice__missing {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0;
+  padding: 0;
+}
+
+.retrieval-notice__missing code {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  font-size: 0.75rem;
+  color: var(--ink);
+}
+
+.retrieval-notice__adapters {
+  margin: 10px 0 0;
+  font-size: 0.75rem;
+}
+
+.retrieval-notice__adapters dt {
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-top: 6px;
+}
+
+.retrieval-notice__adapters dd {
+  margin: 2px 0 0;
+  color: var(--ink);
+}
+
+.retrieval-notice__adapters dd[data-state='needs_configuration'],
+.retrieval-notice__adapters dd[data-state='no_embeddings'],
+.retrieval-notice__adapters dd[data-state='extension_missing'],
+.retrieval-notice__adapters dd[data-state='disabled'] {
+  color: var(--warn);
+}
+
+.retrieval-notice__footnote {
+  color: var(--muted);
+  font-size: 0.75rem;
+  margin-top: 8px;
+}
+
+/* --- versions --------------------------------------------------------------- */
+
+.publication-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.version-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.version {
+  display: block;
+  padding: 12px 14px;
+  margin-bottom: 8px;
+  border: 1px solid var(--line);
+  border-left: 3px solid transparent;
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.version[data-state='published'] {
+  border-left-color: var(--success);
+}
+
+/* Blocked and revoked are settled outcomes of a working check, never errors. */
+.version[data-state='blocked'],
+.version[data-state='revoked'] {
+  border-left-color: var(--warn);
+}
+
+.version[data-state='superseded'] {
+  border-left-color: var(--line);
+}
+
+.version__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.version__number {
+  font-size: 0.9375rem;
+}
+
+.version__status {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.version__status[data-tone='warn'] {
+  color: var(--warn);
+}
+
+.version__status[data-tone='error'] {
+  color: var(--warn-strong);
+}
+
+.version__status[data-tone='success'] {
+  color: var(--success);
+}
+
+.version__hint,
+.version__counts,
+.version__meta,
+.version__chunks,
+.version__fingerprint {
+  font-size: 0.8125rem;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.version__fingerprint {
+  font-size: 0.75rem;
+  word-break: break-all;
+}
+
+.version__blocked {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--warn);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--surface-2);
+  font-size: 0.8125rem;
+  color: var(--ink);
+}
+
+.version__blocked-title {
+  color: var(--warn);
+}
+
+.version__blocked ul {
+  margin: 6px 0 0 18px;
+  padding: 0;
+}
+
+.version__revoked {
+  margin-top: 8px;
+  font-size: 0.8125rem;
+  color: var(--ink);
+}
+
+.version__label,
+.claim__label,
+.run__label,
+.retrieval-result__label {
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.run__published,
+.run__meta {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.run__blocked {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--warn);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--surface-2);
+  font-size: 0.8125rem;
+}
+
+.run__blocked ul {
+  margin: 6px 0 0 18px;
+  padding: 0;
+}
+
+/* --- readiness: availability of knowledge, not permission -------------------- */
+
+.readiness {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+
+.readiness__caveat {
+  font-size: 0.8125rem;
+  color: var(--ink);
+}
+
+.readiness__list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+}
+
+.readiness__item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+.readiness__item:first-child {
+  border-top: 0;
+}
+
+.readiness__topic {
+  font-size: 0.875rem;
+  color: var(--ink);
+}
+
+.readiness__state {
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  text-align: right;
+}
+
+.readiness__state[data-tone='success'] {
+  color: var(--success);
+}
+
+.readiness__state[data-tone='warn'] {
+  color: var(--warn);
+}
+
+.readiness__reason {
+  grid-column: 1 / -1;
+  font-size: 0.8125rem;
+  color: var(--muted);
+}
+
+/* --- claims: only a source-supported one may look confirmed ------------------ */
+
+.claim-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.claim {
+  padding: 14px 0;
+  border-top: 1px solid var(--line);
+}
+
+.claim:first-child {
+  border-top: 0;
+}
+
+.claim__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.claim__verdict {
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--muted);
+  color: var(--muted);
+}
+
+.claim__verdict[data-tone='success'] {
+  border-color: var(--success);
+  color: var(--success);
+}
+
+.claim__verdict[data-tone='warn'] {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+/* The second, unmissable marker: read before the verdict is parsed. */
+.claim__unconfirmed {
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--warn);
+}
+
+.claim__scope {
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--warn);
+  padding: 1px 8px;
+  border: 1px solid var(--warn);
+  border-radius: 999px;
+}
+
+.claim__product {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.claim__statement {
+  margin-top: 8px;
+}
+
+.claim__attribute {
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.claim__value {
+  font-size: 1.0625rem;
+  font-weight: 600;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.claim__conditions,
+.claim__hint,
+.claim__note {
+  font-size: 0.8125rem;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+/* --- search and answers ------------------------------------------------------ */
+
+.retrieval-box {
+  margin-top: 22px;
+}
+
+.retrieval-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.retrieval-form .field {
+  flex: 1 1 260px;
+}
+
+.retrieval-result {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.retrieval-result[data-state='answered'],
+.retrieval-result[data-state='ok'] {
+  border-left-color: var(--success);
+}
+
+/* Named states, not failures. */
+.retrieval-result[data-state='evidence_only'],
+.retrieval-result[data-state='insufficient_evidence'] {
+  border-left-color: var(--warn);
+}
+
+.retrieval-result[data-state='no_published_version'] {
+  border-left-color: var(--muted);
+}
+
+.retrieval-result__state {
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.retrieval-result__state[data-tone='success'] {
+  color: var(--success);
+}
+
+.retrieval-result__state[data-tone='warn'] {
+  color: var(--warn);
+}
+
+.retrieval-result__message {
+  font-size: 0.875rem;
+  color: var(--ink);
+  margin-top: 4px;
+}
+
+.retrieval-result__version,
+.retrieval-result__mode {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.retrieval-result__mode[data-mode='keyword'] {
+  color: var(--warn);
+}
+
+.retrieval-result__degraded,
+.retrieval-result__conditions,
+.retrieval-result__limitations ul,
+.retrieval-result__rejections ul {
+  margin: 6px 0 0 18px;
+  padding: 0;
+  font-size: 0.8125rem;
+  color: var(--muted);
+}
+
+.retrieval-result__limitations,
+.retrieval-result__rejections {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--warn);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--surface-2);
+}
+
+.retrieval-result__subheading {
+  margin: 14px 0 6px;
+  font-size: 0.8125rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* Prose from the model: dashed, never the accent rule a quotation gets. */
+.answer-text {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px dashed var(--warn);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.answer-text__body {
+  margin-top: 4px;
+  font-size: 0.9375rem;
+  line-height: 1.55;
+  color: var(--ink);
+  white-space: pre-wrap;
+}
+
+.answer-none {
+  margin-top: 10px;
+  font-size: 0.875rem;
+  color: var(--ink);
+}
+
+.hit-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+}
+
+.hit {
+  padding: 10px 0;
+  border-top: 1px dotted var(--line);
+  transition: border-color 150ms ease;
+}
+
+.hit:first-child {
+  border-top: 0;
+}
+
+.hit:hover {
+  border-top-color: var(--accent);
+}
+
+.hit__matched {
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* --- retraction: a reason is required --------------------------------------- */
+
+.retract {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-md);
+}
+
+.retract .field {
+  flex: 1 1 260px;
+}
+
+.retract__note {
+  flex: 1 1 100%;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hit {
+    transition: none;
+  }
+}

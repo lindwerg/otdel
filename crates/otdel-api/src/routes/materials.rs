@@ -13,9 +13,10 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{body::Body, Json};
 use otdel_core::model::{media_type_string, Material};
+use otdel_core::updates::{EventActor, EventKind};
 use otdel_core::{validate, AppError};
 use otdel_db::materials::{self, InsertOutcome, NewMaterial};
-use otdel_db::{jobs, partners};
+use otdel_db::{events, jobs, partners};
 use otdel_storage::{ObjectKey, ObjectNamespace};
 use tracing::{error, info};
 use uuid::Uuid;
@@ -37,10 +38,26 @@ pub async fn list(
     if !partners::exists(&mut tx, partner_id).await? {
         return Err(partner_not_found());
     }
-    let items = materials::list_for_partner(&mut tx, partner_id).await?;
+    // With the page roll-up: the listing is where the owner sees how far reading got,
+    // and the counters come from the page rows themselves.
+    let items = materials::list_for_partner_with_extraction(&mut tx, partner_id).await?;
     tx.commit().await?;
 
     Ok(Json(ItemsResponse::new(items)))
+}
+
+/// `GET /api/partners/{id}/materials/{material_id}` — one material with its page summary.
+pub async fn show(
+    State(state): State<AppState>,
+    session: Session,
+    ApiPath((partner_id, material_id)): ApiPath<(Uuid, Uuid)>,
+) -> ApiResult<Json<Material>> {
+    let mut tx = state.db.begin_scoped(session.bureau_id).await?;
+    let material =
+        materials::get_in_partner_with_extraction(&mut tx, partner_id, material_id).await?;
+    tx.commit().await?;
+
+    material.map(Json).ok_or_else(material_not_found)
 }
 
 /// `POST /api/partners/{id}/materials` — one file per request.
@@ -87,7 +104,42 @@ pub async fn upload(
         let material = match &outcome {
             InsertOutcome::Created(material) | InsertOutcome::Duplicate(material) => material,
         };
-        jobs::enqueue_extraction(&mut tx, partner_id, material.id).await?;
+        let job = jobs::enqueue_extraction(&mut tx, partner_id, material.id).await?;
+
+        // Phase 1F: the history line, in the same transaction as the row it describes.
+        // A duplicate is recorded too, and as its own kind: "я загрузил файл и ничего не
+        // произошло" has an answer, and the answer is that these bytes were already here.
+        let (kind, summary) = match &outcome {
+            InsertOutcome::Created(material) => (
+                EventKind::MaterialUploaded,
+                format!(
+                    "загружен материал «{}» ({} байт); поставлен в очередь на чтение",
+                    material.filename, material.size_bytes
+                ),
+            ),
+            InsertOutcome::Duplicate(material) => (
+                EventKind::MaterialDuplicate,
+                format!(
+                    "повторная загрузка «{}»: файл с тем же содержимым уже есть у этого \
+                     партнёра, новая копия не создана",
+                    material.filename
+                ),
+            ),
+        };
+        events::record(
+            &mut tx,
+            &events::NewEvent::new(kind, EventActor::Owner, summary)
+                .for_partner(partner_id)
+                .about_material(material.id)
+                .about_job(job.id)
+                .with_detail(serde_json::json!({
+                    "media_type": material.media_type,
+                    "size_bytes": material.size_bytes,
+                    "sha256": material.sha256,
+                })),
+        )
+        .await?;
+
         tx.commit().await?;
         Ok::<_, otdel_db::DbError>(outcome)
     }
@@ -198,10 +250,15 @@ pub async fn retry(
         return Err(ApiError::new(stored.material.status.retry_refusal()));
     }
 
-    let material = materials::requeue(&mut tx, partner_id, material_id)
+    materials::requeue(&mut tx, partner_id, material_id)
         .await?
         .ok_or_else(material_not_found)?;
     let job = jobs::requeue_extraction(&mut tx, partner_id, material_id).await?;
+    // Re-read with the page summary attached, so the client sees the same shape the
+    // listing returns and knows what is still recorded from the previous run.
+    let material = materials::get_in_partner_with_extraction(&mut tx, partner_id, material_id)
+        .await?
+        .ok_or_else(material_not_found)?;
     tx.commit().await?;
 
     info!(

@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OTDEL · Блок 1 — Партнёр и продуктовая база знаний (макет)</title>
+<meta name="robots" content="noindex, nofollow">
+<link rel="stylesheet" href="assets/fonts/manrope.css">
+<link rel="stylesheet" href="prototype.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Перейти к содержимому</a>
+
+<div class="demo-bar" role="region" aria-label="Демонстрационный режим">
+  <span class="demo-bar__badge"><i class="demo-dot" aria-hidden="true"></i>Макет · демонстрационные данные · без сохранения</span>
+  <label class="demo-bar__scenario" for="scenario-select">Сценарий
+    <select id="scenario-select">
+      <option value="empty">Пусто</option>
+      <option value="processing">Обработка</option>
+      <option value="partial">Частично</option>
+      <option value="ready">Готово</option>
+      <option value="error">Ошибка</option>
+    </select>
+  </label>
+  <details class="demo-bar__details">
+    <summary>Подробнее</summary>
+    <p>Сценарий переключается вручную для показа состояний интерфейса. Ни один индикатор здесь не измеряет реальное время или процент работы ИИ. Партнёр «BASIS» отражает реальный пилот; «Тестовый партнёр» — синтетические данные для показа интерфейса.</p>
+  </details>
+</div>
+
+<div class="mobile-topbar">
+  <button type="button" class="mobile-menu-btn" id="mobile-menu-btn" aria-expanded="false" aria-controls="sidebar">
+    <svg width="18" height="14" viewBox="0 0 18 14" fill="none" aria-hidden="true"><path d="M0 1h18M0 7h18M0 13h18" stroke="currentColor" stroke-width="1.6"/></svg>
+    <span class="visually-hidden">Партнёры</span>
+  </button>
+  <strong>OTDEL</strong>
+</div>
+
+<div class="shell">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>OTDEL</div>
+    <nav aria-label="Партнёры">
+      <span class="nav-label">Партнёры</span>
+      <div class="partner-list" id="partner-list"></div>
+    </nav>
+    <button type="button" class="button button-primary sidebar-cta" id="open-new-partner">+ Добавить партнёра</button>
+  </aside>
+
+  <main class="workspace" id="main">
+    <header class="partner-header">
+      <div class="partner-header__info">
+        <h1><span id="partner-name">—</span> <span class="partner-header__sub" id="partner-subtitle"></span></h1>
+        <p class="partner-header__status"><span class="status-dot" aria-hidden="true"></span><strong id="partner-status-label"></strong> — <span id="partner-status-text"></span></p>
+      </div>
+      <div class="partner-header__otto">
+        <img id="partner-otto" src="assets/otto/welcome.png" alt="" aria-hidden="true" width="56" height="56">
+      </div>
+    </header>
+
+    <div class="tabs" role="tablist" aria-label="Разделы партнёра">
+      <button type="button" role="tab" id="tab-materials" aria-controls="panel-materials" aria-selected="true" tabindex="0">Материалы</button>
+      <button type="button" role="tab" id="tab-knowledge" aria-controls="panel-knowledge" aria-selected="false" tabindex="-1">Знания</button>
+      <button type="button" role="tab" id="tab-gaps" aria-controls="panel-gaps" aria-selected="false" tabindex="-1">Пробелы</button>
+      <button type="button" role="tab" id="tab-versions" aria-controls="panel-versions" aria-selected="false" tabindex="-1">Версии</button>
+    </div>
+
+    <section class="panel" id="panel-materials" role="tabpanel" aria-labelledby="tab-materials" tabindex="0"></section>
+    <section class="panel" id="panel-knowledge" role="tabpanel" aria-labelledby="tab-knowledge" tabindex="0" hidden></section>
+    <section class="panel" id="panel-gaps" role="tabpanel" aria-labelledby="tab-gaps" tabindex="0" hidden></section>
+    <section class="panel" id="panel-versions" role="tabpanel" aria-labelledby="tab-versions" tabindex="0" hidden></section>
+  </main>
+</div>
+
+<dialog class="dialog" id="new-partner-dialog" aria-labelledby="new-partner-title">
+  <form id="new-partner-form" novalidate>
+    <h2 id="new-partner-title">Добавить партнёра</h2>
+    <p>Создаёт черновик только в этой вкладке браузера — ничего не сохраняется и никуда не отправляется.</p>
+
+    <label for="partner-name-input">Название или рабочее обозначение <span class="required" aria-hidden="true">*</span>
+      <input type="text" id="partner-name-input" name="name" required
+        aria-describedby="partner-name-error">
+    </label>
+    <p class="field-error" id="partner-name-error" hidden></p>
+
+    <label for="partner-comment-input">Пояснение <small>Необязательно — любой дополнительный контекст</small>
+      <textarea id="partner-comment-input" name="comment"></textarea>
+    </label>
+
+    <div class="dialog-actions">
+      <button type="button" class="button button-ghost" id="cancel-new-partner">Отмена</button>
+      <button type="submit" class="button button-primary">Создать черновик</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog class="dialog" id="upload-dialog" aria-labelledby="upload-title">
+  <h2 id="upload-title">Материалы партнёра</h2>
+  <p class="dialog-subtle" id="upload-partner-line"></p>
+  <div class="upload-area">
+    <p>Добавьте каталоги, презентации и фотографии.</p>
+    <label for="materials-file-input">Файлы (PDF, изображения)</label>
+    <input type="file" id="materials-file-input" multiple accept=".pdf,image/*">
+    <p class="upload-note">Демонстрация: файлы не загружаются и не сохраняются — показаны только выбранные имена.</p>
+    <ul class="file-list" id="materials-file-list" aria-live="polite"></ul>
+  </div>
+  <div class="dialog-actions">
+    <button type="button" class="button button-primary" id="close-upload">Готово</button>
+  </div>
+</dialog>
+
+<dialog class="dialog drawer" id="evidence-drawer" aria-labelledby="evidence-title">
+  <div class="drawer__header">
+    <h2 id="evidence-title">Источник утверждения</h2>
+    <button type="button" class="drawer__close" id="close-evidence" aria-label="Закрыть">
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M1 1l12 12M13 1L1 13" stroke="currentColor" stroke-width="1.6"/></svg>
+    </button>
+  </div>
+  <div id="evidence-body"></div>
+</dialog>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<script src="prototype.js"></script>
+</body>
+</html>

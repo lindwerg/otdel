@@ -1,0 +1,263 @@
+{
+  "meta": {
+    "name": "OTDEL — charcoal/gold workspace (Блок 1 BASIS)",
+    "description": "Тёмная рабочая палитра OTDEL: угольный фон, приглушённое золото как единственный акцент, тёплые нейтральные тона текста. Извлечено из исходного продукта Otdel (apps/web) и применено к прототипу блока 1 без переписывания бизнес-логики. Значения цвета, типографики базового масштаба, отступов и форм — измеренные (source); мотивика, характер взаимодействия и часть визуальных эффектов — качественные оценки по коду, без живого скриншота (inferred).",
+    "source_references": [
+      "Otdel/apps/web/src/app/globals.css (source project)",
+      "Otdel/apps/web/src/components/otdel-workspace/workspace.module.css (source project)",
+      "design/ASSET-PROVENANCE.md",
+      "design/assets/fonts/manrope.css (реальные файлы шрифта Manrope Variable + OFL.txt, добавлены отдельно, не изменялись)"
+    ],
+    "created_at": "2026-09-13"
+  },
+
+  "design_system": {
+    "color": {
+      "palette_type": "monochromatic",
+      "primary": { "hex": "#101213", "role": "фон приложения (source: globals.css --bg)" },
+      "secondary": { "hex": "#191b1c", "role": "поверхность панелей/карточек (source: globals.css --surface)" },
+      "accent": { "hex": "#cbb578", "role": "единственный акцент: CTA, ссылки, статусные точки, фокус-рамка близка к нему (source: globals.css --accent)" },
+      "neutral": {
+        "scale": ["#101213", "#191b1c", "#222424", "#343733", "#777b70", "#aeafa6", "#ede9df"],
+        "usage": "Тёплая угольно-бежевая нейтральная шкала: тёмные значения — фон/поверхности/приподнятые панели, #343733 — линии и разделители, #777b70 — граница полей ввода, #aeafa6 — вторичный текст, #ede9df — основной текст (source: globals.css)"
+      },
+      "semantic": {
+        "success": "#cbb578 (source: тот же акцент используется для badge 'success'/'опубликовано' — отдельного зелёного не заведено, инвертировано в inferred-примечание ниже)",
+        "warning": "#e1bb8d (source: workspace.module.css .sectionLabel/.badge amber)",
+        "error": "#efb5a4 / #ffd0bc (source: globals.css --error-text и workspace .probe-error/.errorBox — тёплый лососевый, не красный)",
+        "info": "#aeafa6 (inferred: вторичный нейтральный текст используется как информационный тон, отдельного info-цвета в источнике нет)"
+      },
+      "surface": {
+        "background": "#101213",
+        "card": "#191b1c",
+        "elevated": "#222424"
+      },
+      "contrast_strategy": "subtle layers — тёмные слои отличаются друг от друга на 1 шаг яркости (#101213→#191b1c→#222424), текст #ede9df на тёмном фоне даёт высокий контраст, вторичный текст #aeafa6 — пониженный контраст для второстепенной информации (source)"
+    },
+
+    "typography": {
+      "type_scale": {
+        "display": { "size": "clamp(25px, 2.45vw, 36px)", "weight": "570", "line_height": "1.2", "tracking": "-1.4px" },
+        "heading_1": { "size": "clamp(24px, 2.3vw, 34px)", "weight": "580", "line_height": "1.3", "tracking": "-1.2px" },
+        "heading_2": { "size": "1.375rem", "weight": "620", "line_height": "1.3", "tracking": "-0.4px" },
+        "heading_3": { "size": "1.0625rem", "weight": "650", "line_height": "1.4", "tracking": "-0.4px" },
+        "body": { "size": "0.9375rem", "weight": "400", "line_height": "1.6", "tracking": "normal" },
+        "body_small": { "size": "0.875rem", "weight": "400", "line_height": "1.7", "tracking": "normal" },
+        "caption": { "size": "0.8125rem", "weight": "400", "line_height": "1.5", "tracking": "0.1px" },
+        "overline": { "size": "0.75rem", "weight": "650", "line_height": "1.3", "tracking": "0.5px" }
+      },
+      "font_families": {
+        "heading": "\"Manrope Variable\", \"Manrope\", system-ui, sans-serif",
+        "body": "\"Manrope Variable\", \"Manrope\", system-ui, sans-serif",
+        "mono": "ui-monospace, \"SF Mono\", \"Consolas\", monospace (inferred — не встречается в источнике, добавлен как системный запасной вариант на случай кода/артикулов)"
+      },
+      "font_style_notes": "Source: Manrope Variable, геометричный гуманистический гротеск, повышенные насыщенные веса (550–750) для акцентных заголовков и отрицательный трекинг на крупных размерах. Прототип подключает настоящий переменный файл шрифта локально из design/assets/fonts/manrope.css (вариативные woff2, OFL-лицензия, без CDN и внешних сетевых запросов) — системный стек указан только как запасной вариант в font-family."
+    },
+
+    "spacing": {
+      "base_unit": "4px (inferred из наблюдаемых шагов 4/6/8/12/14/16/20/24 — сетка кратна 2px, устойчивый базовый шаг не заявлен явно в source)",
+      "scale": [4, 6, 8, 10, 12, 14, 16, 18, 20, 24, 32, 38],
+      "content_density": "comfortable",
+      "section_rhythm": "Панели/секции разделяются 20–24px по вертикали, крупные блоки (hero/metrics) — 26–30px; на мобильных значения сжимаются на 15–20% (source: workspace.module.css media-запросы)"
+    },
+
+    "layout": {
+      "grid_system": "CSS Grid с двухколоночным каркасом сайдбар+контент на десктопе, одна колонка на мобильных (source)",
+      "max_content_width": "1120–1460px в зависимости от экрана (source: .main max-width 1460px; сужено в прототипе до 1120–1180px под объём блока 1)",
+      "columns": "адаптивно 1 → 2 → 3 логических трека в зависимости от ширины (source: heroGrid/bottomGrid переключаются на repeat(3, ...) от 1101px)",
+      "gutter": "16px мобильный / 20–24px десктоп (source: --grid-gap: 24px)",
+      "breakpoints": ["360px (база)", "600px", "760/768px", "1000px", "1100/1200px", "1440px", "1600px"],
+      "alignment_tendency": "strict grid с редкими асимметричными акцентами (напр. широкая карточка + узкая боковая колонка)"
+    },
+
+    "shape": {
+      "border_radius": {
+        "small": "6–8px (бейджи, мелкие элементы)",
+        "medium": "9–10px (поля ввода, кнопки)",
+        "large": "13–16px (панели, диалоги)",
+        "pill": "не используется — скругления везде прямоугольные с малым радиусом, отдельной pill-формы в source нет (inferred: 'none observed')"
+      },
+      "border_usage": "subtle 1px — почти все панели, поля и кнопки очерчены тонкой линией var(--line)/var(--field-line); отдельного 'без границ' стиля мало (source)",
+      "divider_style": "сплошная 1px линия #343733 между строками списков; пунктирная линия используется только для необязательных/технических зон (upload dashed, prototype tools dashed) (source)"
+    },
+
+    "elevation": {
+      "shadow_style": "soft diffused, применяется точечно",
+      "levels": {
+        "low": "0 2px 2px rgba(0,0,0,0.19) — основная кнопка (source: workspace .primary)",
+        "medium": "0 3px 7px rgba(0,0,0,0.19) — hover основной кнопки (source)",
+        "high": "0 24px 80px rgba(0,0,0,0.19) — модальные диалоги (source: workspace .dialog)"
+      },
+      "depth_cues": "разница яркости поверхностей (#101213/#191b1c/#222424) — основной приём глубины; тени — второстепенный, редкий приём только для интерактивных/плавающих элементов (source)"
+    },
+
+    "iconography": {
+      "style": "line/outline, минималистичные геометрические SVG (inferred по разметке .preview svg { flex-shrink: 0 } и использованию инлайн-SVG для крестика/иконки меню — конкретный набор иконок в CSS не виден)",
+      "stroke_weight": "около 1.5–1.6px (inferred по немногим встреченным путям, напр. крестик закрытия)",
+      "size_scale": "16–21px внутри строк интерфейса, 36–44px для кнопок-иконок (source: .iconButton min 36px, .brandMark 21×23px)",
+      "preferred_set": "не задан явно в исходниках — предположительно кастомный SVG-набор, не подключённая библиотека (inferred)"
+    },
+
+    "motion": {
+      "easing": "ease (по умолчанию браузера — явной кривой Безье в source не задано)",
+      "duration_scale": { "micro": "0.15s", "normal": "0.2–0.3s (inferred, не встречено явных значений кроме 0.15s)", "macro": "не используется" },
+      "entrance_pattern": "без анимации появления — контент рендерится сразу (source: только transition на hover/focus состояниях, keyframe-анимаций в исходниках нет)",
+      "exit_pattern": "мгновенное скрытие/закрытие без анимации выхода (source)",
+      "philosophy": "minimal functional — движение используется только как обратная связь на hover/focus (цвет, тень, рамка), не как декоративный приём"
+    },
+
+    "components": {
+      "button_style": "заполненный золотой primary с тёмным текстом и лёгкой тенью; outline-кнопка на поверхности с тонкой рамкой; текстовая ghost-кнопка золотого цвета без рамки (source)",
+      "input_style": "тёмное поле #191b1c/#222424, рамка ~#707268–#777b70, скругление 8–10px, паддинг 10–14px, плейсхолдер приглушённый (source)",
+      "card_style": "панель с тонкой рамкой var(--line), скругление 13–16px, паддинг 20–24px, без теней в состоянии покоя (source)",
+      "navigation_pattern": "узкая боковая колонка с редким списком пунктов + активное состояние через смену фона (#292b27) и жирности; на блоке 1 сокращена до одного смыслового раздела «Партнёры», без generic-меню на нереализованные блоки (inferred адаптация под BASIS-объём)",
+      "modal_style": "нативный элемент dialog по центру (обычные диалоги) или прижатый к правому краю (drawer-доказательства), с тёмной поверхностью, скруглением 14–16px и лёгким золотистым backdrop (source формы; drawer-компоновка — inferred адаптация под 'source drawer' требование)",
+      "list_style": "плоские построчные списки с верхней тонкой линией-разделителем вместо карточек-в-карточках (source: .caseRow, .reviewFacts, .material-item и т.п.)",
+      "component_notes": "Провенанс: цвета/радиусы/тени/паддинги кнопок, полей, панелей, табов и диалогов — прямое измерение из globals.css и workspace.module.css (source). Компоновка блока 1 (сайдбар только с партнёрами, вкладки Материалы/Знания/Пробелы/Версии, drawer доказательств) — новый слой поверх тех же токенов, спроектированный под задание BASIS (inferred/new, не скопирован 1:1 из исходного приложения)."
+    }
+  },
+
+  "design_style": {
+    "aesthetic": {
+      "mood": ["спокойный", "деловой", "сдержанно-премиальный", "точный", "тихий"],
+      "visual_metaphor": "тёмный рабочий кабинет с единственным золотым акцентом — «мастерская», а не «панель управления»",
+      "era_influence": "современный тёмный интерфейс 2020-х (dark mode SaaS/финтех), без ретро- или футуристических отсылок",
+      "genre": "деловой B2B-инструмент с редакционной сдержанностью (не generic SaaS card grid)",
+      "personality_traits": ["сдержанный", "точный", "немногословный", "надёжный", "спокойно уверенный"],
+      "adjectives": ["угольный", "золотистый", "тихий", "выверенный", "тёплый-тёмный"]
+    },
+    "visual_language": {
+      "complexity": "moderate",
+      "ornamentation": "subtle accents — единственное украшение: золотая точка-индикатор, тонкая рамка, изредка маскот Отто",
+      "whitespace_usage": "умеренно плотное распределение с чёткими внутренними отступами панелей (24px), не воздушный лендинг, а рабочий инструмент",
+      "visual_weight_distribution": "вес сосредоточен в заголовке партнёра и активной вкладке; вторичные блоки визуально тише (приглушённый текст, тонкие рамки)",
+      "focal_strategy": "distributed interest с одним первичным CTA на секцию — фокус смещается по разделу, а не на единственный герой-элемент",
+      "contrast_level": "moderate — высокий контраст текста на фоне, но между соседними поверхностями контраст низкий (тональные слои)",
+      "texture_usage": "none — плоские заливки, без градиентов, шумов или паттернов"
+    },
+    "composition": {
+      "hierarchy_method": "spatial isolation + typographic hierarchy (паттерн: заголовок раздела крупнее и жирнее, вторичный текст явно приглушён)",
+      "balance_type": "asymmetric — широкая основная колонка и узкая вспомогательная (напр. факт + drawer, список + Отто)",
+      "flow_direction": "вертикальный сверху вниз внутри раздела, с горизонтальными вкладками как верхним переключателем контекста",
+      "grouping_strategy": "группировка тонкой рамкой панели и внутренним разделителем-линией между элементами списка, а не тенью или цветным фоном",
+      "negative_space_role": "разделяет смысловые блоки и снижает плотность делового интерфейса, не используется как самостоятельный декоративный приём"
+    },
+    "imagery": {
+      "photo_treatment": "не используется — фотографий в интерфейсе блока 1 нет",
+      "illustration_style": "единственный маскот Отто (PNG, графитовый фон, без перекраски фильтрами) — используется скромно, малым размером, как «тихая поддержка», не как декоративный герой",
+      "graphic_elements": ["золотая точка статуса", "тонкие геометрические бейджи", "SVG-иконки меню/крестика"],
+      "pattern_usage": "none",
+      "image_shape": "прямоугольная область с скруглением 10–11px под аватар Отто; крупные иллюстрации Отто — без обрезки, на прозрачном/графитовом фоне без маски"
+    },
+    "interaction_feel": {
+      "feedback_style": "мгновенная смена цвета/рамки/тени на hover и focus-visible, без анимационных эффектов",
+      "hover_behavior": "лёгкое осветление поверхности (surface → surface-2) или акцента (accent → accent-hover), без масштабирования и смещения",
+      "transition_personality": "fade-subtle — короткие 0.15s переходы цвета/тени, не 'бодрые' и не 'кинематографичные'",
+      "loading_style": "текстовые статус-строки без процентов и таймеров ('идёт разбор материалов'), без спиннеров/прогресс-баров, показывающих несуществующую точность",
+      "microinteraction_density": "low — минимум декоративных микровзаимодействий, фокус на ясности состояния"
+    },
+    "brand_voice_in_ui": {
+      "tone": "тихий, точный, уважительный к пользователю — без маркетингового энтузиазма",
+      "formality": "деловой, но не бюрократический; на «вы» через нейтральные конструкции",
+      "cta_style": "subtle suggestion / direct imperative в умеренной дозе — один явный глагол действия на секцию ('Загрузить материалы', 'Добавить партнёра'), без срочности и восклицательных знаков",
+      "empty_state_approach": "спокойное объяснение, что появится и почему сейчас пусто, с маленькой иллюстрацией Отто и без искусственного ободрения",
+      "error_tone": "фактическое, без вины пользователя: что произошло, что делать дальше, без алармистского красного или паники"
+    }
+  },
+
+  "visual_effects": {
+    "overview": {
+      "effect_intensity": "none",
+      "performance_tier": "lightweight",
+      "fallback_strategy": "reduce to CSS — при prefers-reduced-motion все переходы и анимации отключаются полностью (source: media-запрос в обоих исходных файлах и в prototype.css)",
+      "primary_technology": "CSS only"
+    },
+    "background_effects": {
+      "type": "none",
+      "description": "Сплошная заливка фона без градиентов, шума или движения.",
+      "technology": "CSS only",
+      "params": { "color_palette": ["#101213"], "speed": "none", "density": "none", "opacity": "1", "blend_mode": "normal" }
+    },
+    "particle_systems": {
+      "enabled": false,
+      "type": "none",
+      "description": "Частицы отсутствуют.",
+      "technology": "none",
+      "params": { "count": 0, "shape": "none", "size_range": "none", "movement_pattern": "none", "color_behavior": "none", "interaction": "none", "spawn_area": "none" }
+    },
+    "3d_elements": {
+      "enabled": false,
+      "type": "none",
+      "description": "3D-элементы отсутствуют.",
+      "technology": "none",
+      "params": { "renderer": "none", "lighting": "none", "camera": "none", "materials": "none", "geometry": "none", "post_processing": [], "interaction_model": "none" }
+    },
+    "shader_effects": {
+      "enabled": false,
+      "type": "none",
+      "description": "Шейдерные эффекты отсутствуют.",
+      "technology": "none",
+      "params": { "uniforms": "none", "vertex_manipulation": "none", "fragment_output": "none", "noise_type": "none", "distortion": "none" }
+    },
+    "scroll_effects": {
+      "parallax": { "enabled": false, "layers": "0", "depth_range": "none", "speed_curve": "none" },
+      "scroll_triggered_animations": { "enabled": false, "trigger_points": "none", "animation_type": "none", "scrub_behavior": "none" },
+      "scroll_morphing": { "enabled": false, "description": "Прокрутка не используется как триггер анимации; страница — рабочий инструмент, а не сценарий с раскрытием по скроллу." }
+    },
+    "text_effects": {
+      "type": "none",
+      "description": "Текст статичен, без покадровой/посимвольной анимации.",
+      "technology": "none",
+      "params": { "split_strategy": "none", "animation_per_unit": "none", "stagger": "none", "effect_style": "none" }
+    },
+    "cursor_effects": {
+      "enabled": false,
+      "type": "none",
+      "description": "Курсор системный, без кастомизации.",
+      "params": { "shape": "none", "size": "none", "blend_mode": "none", "trail": "none", "interaction_zone": "none" }
+    },
+    "image_effects": {
+      "type": "none",
+      "description": "Изображения Отто выводятся без фильтров, перекраски или hover-искажений — по требованию провенанса ассетов их нельзя перекрашивать CSS-фильтрами.",
+      "technology": "CSS only",
+      "params": { "filter_pipeline": "none", "hover_transform": "none", "reveal_animation": "none", "distortion_type": "none" }
+    },
+    "glassmorphism_neumorphism": {
+      "enabled": false,
+      "style": "none",
+      "params": { "blur_radius": "0", "transparency": "none", "border_treatment": "none", "shadow_type": "none", "light_source_angle": "none" }
+    },
+    "canvas_drawings": {
+      "enabled": false,
+      "type": "none",
+      "description": "Canvas не используется.",
+      "technology": "none",
+      "params": { "draw_method": "none", "animation_loop": "none", "color_scheme": "none", "responsiveness": "none", "interaction": "none" }
+    },
+    "svg_animations": {
+      "enabled": false,
+      "type": "none",
+      "description": "SVG используется только как статичная иконка (крестик, гамбургер), без анимации пути или морфинга.",
+      "params": { "animation_method": "none", "path_morphing": "none", "stroke_animation": "none", "filter_effects": "none" }
+    },
+    "composite_notes": "Единственный лёгкий backdrop-эффект в источнике — полупрозрачный золотистый ::backdrop с blur(3px) под модальными диалогами (source: workspace.module.css .dialog::backdrop). В прототипе он сохранён в уменьшенном виде (blur 2px, низкая непрозрачность) как единственный визуальный эффект сверх плоского CSS; при prefers-reduced-motion все transition/animation отключаются, blur остаётся статичным и не является анимацией. Остальные категории эффектов в reference-коде не встречаются (false/none), и в прототипе намеренно не добавлялись, чтобы не создавать 'тяжёлый' интерфейс, не свойственный деловому инструменту."
+  },
+
+  "provenance_notes": {
+    "purpose": "Явное разделение источника значений, как требует задание: что измерено из кода Otdel (source), а что — качественная оценка/адаптация под блок 1 (inferred/new), без доступа к живому скриншоту приложения.",
+    "source_measured": [
+      "design_system.color — все hex-значения (globals.css :root, workspace.module.css .preview переменные)",
+      "design_system.typography.type_scale — размеры/веса/трекинг, снятые с конкретных селекторов (.pageHeading h1, .hero h2, .panel h2, body font)",
+      "design_system.shape и elevation — радиусы, толщины рамок, box-shadow значения из workspace.module.css",
+      "design_system.motion.duration_scale.micro (0.15s) и полное отключение анимаций в prefers-reduced-motion — дословно из обоих исходных CSS",
+      "visual_effects — отсутствие particle/3D/shader/parallax/glass-эффектов подтверждено отсутствием соответствующего кода в обоих файлах; единственный найденный эффект — backdrop-filter blur на диалогах"
+    ],
+    "inferred_or_adapted": [
+      "design_system.iconography — набор и толщина иконок не описаны в CSS явно, оценены по единичным встреченным SVG-путям",
+      "design_system.spacing.base_unit — обобщённый шаг 4px выведен из наблюдаемых величин, не заявлен как правило в источнике",
+      "design_style (весь раздел) — качественная интерпретация настроения/характера по коду и копирайтингу, не измеряется напрямую в CSS",
+      "Компоновка блока 1 (сайдбар только с разделом «Партнёры», вкладки Материалы/Знания/Пробелы/Версии, drawer доказательств, экран нового партнёра) — новая структура, спроектированная под docs/block-01-spec.md; токены взяты из источника, но сама структура экрана в исходном Otdel-репозитории не существует в таком виде",
+      "Шрифт: реальный файл Manrope Variable подключён локально (design/assets/fonts/manrope.css, woff2 + OFL.txt), без CDN и без сетевых запросов — соответствует source без визуального отклонения"
+    ]
+  }
+}

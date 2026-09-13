@@ -1,0 +1,22 @@
+[package]
+name = "otdel-api-bin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "OTDEL API server binary and its operational subcommands."
+
+[[bin]]
+name = "otdel-api"
+path = "src/main.rs"
+
+[dependencies]
+otdel-api.workspace = true
+otdel-core.workspace = true
+otdel-db.workspace = true
+
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "otdel-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Domain model, configuration and validation shared by the OTDEL backend crates."
+
+[dependencies]
+argon2.workspace = true
+base64.workspace = true
+chrono.workspace = true
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -9,6 +9,15 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  # The exact stable release this workspace is developed and tested against. Kept
+  # identical to `channel` in rust-toolchain.toml — bump both together. A floating
+  # `stable` would change the compiler and clippy's lint set between runs, and CI treats
+  # warnings as errors.
+  RUST_VERSION: "1.98.1"
+
 jobs:
   repository-check:
     name: repository-check
@@ -26,39 +35,160 @@ jobs:
         with:
           node-version: "22"
 
-      # scripts/check.mjs's manifest-vs-CI enforcement gate deliberately and
-      # unconditionally FAILS if Cargo.toml / package.json /
-      # apps/web/package.json is present (no pattern-matching of workflow
-      # text — too easy to fake). That is what keeps the notices below from
-      # being hardcoded forever: see docs/development.md.
-      - name: Repository hygiene check (make check)
-        run: make check
+      - name: Repository hygiene check
+        run: node scripts/check.mjs
 
-      # --- Status: runtime test suites are pending, not silently skipped. ---
-      # Each notice is conditional on the corresponding manifest actually
-      # being absent, so this workflow stops claiming "pending" the moment a
-      # manifest is added (at which point the enforcement gate above requires
-      # a real job to exist here too).
-      - name: Report pending Rust checks
-        if: hashFiles('Cargo.toml') == ''
-        run: echo "::notice title=Rust checks pending::No Cargo.toml found yet; cargo fmt/clippy/test will run once the Rust workspace is scaffolded (see docs/development.md)."
+  # Runs unconditionally: the Rust workspace exists. (A job-level `if:` could not use
+  # `hashFiles` anyway — that function is not available in the `jobs.<id>.if` context,
+  # and jobs are evaluated before any checkout has happened.
+  # https://docs.github.com/en/actions/reference/workflows-and-actions/contexts)
+  rust-check:
+    name: rust-check (fmt, clippy, unit tests)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+
+      # dtolnay/rust-toolchain, pinned to a full commit SHA (not a mutable branch).
+      # The version itself comes from RUST_VERSION above and matches rust-toolchain.toml.
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable branch
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      # actions/cache v4, pinned to a full commit SHA.
+      - name: Cache cargo registry and target directory
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # The toolchain version is part of the key: build artifacts from another
+          # compiler must not be restored into a pinned-toolchain build.
+          key: ${{ runner.os }}-cargo-${{ env.RUST_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ env.RUST_VERSION }}-
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Library unit tests need no database. The database-backed suites run in the
+      # integration job below — they are never skipped silently.
+      - name: Unit tests
+        run: cargo test --workspace --lib
+
+      - name: Build the binaries
+        run: cargo build --workspace --bins
+
+  rust-integration:
+    name: rust-integration (database-backed API tests)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Same family as the local pilot: PostgreSQL 17 with pgvector available.
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: otdel_superuser
+          POSTGRES_PASSWORD: ci-superuser-password
+          POSTGRES_DB: otdel
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U otdel_superuser -d otdel"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable branch
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache cargo registry and target directory
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-it-${{ env.RUST_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-it-${{ env.RUST_VERSION }}-
+
+      # The same two-role setup the local pilot uses: the tests verify that row-level
+      # security really applies to the runtime role, which only works if the roles differ.
+      - name: Create the database roles and the test database
+        env:
+          PGPASSWORD: ci-superuser-password
+        run: |
+          set -euo pipefail
+          psql -h 127.0.0.1 -U otdel_superuser -d otdel -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE otdel_migrator LOGIN PASSWORD 'ci-migrator-password'
+              NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOINHERIT;
+          CREATE ROLE otdel_app LOGIN PASSWORD 'ci-app-password'
+              NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOINHERIT;
+          CREATE DATABASE otdel_test OWNER otdel_migrator;
+          REVOKE ALL ON DATABASE otdel_test FROM PUBLIC;
+          GRANT CONNECT ON DATABASE otdel_test TO otdel_migrator, otdel_app;
+          SQL
+          psql -h 127.0.0.1 -U otdel_superuser -d otdel_test -v ON_ERROR_STOP=1 <<'SQL'
+          REVOKE ALL ON SCHEMA public FROM PUBLIC;
+          GRANT USAGE ON SCHEMA public TO otdel_migrator;
+          SQL
+
+      # The hash is produced by the binary itself rather than pasted in, so no
+      # hand-written credential string lives in this file. The password is a throwaway
+      # value for a database that exists for the length of this job.
+      - name: Generate a throwaway owner password hash
+        run: |
+          set -euo pipefail
+          hash="$(printf '%s' "ci-only-owner-password" | cargo run --quiet --bin otdel-api -- hash-password)"
+          test -n "$hash"
+          echo "OTDEL_OWNER_PASSWORD_HASH=$hash" >> "$GITHUB_ENV"
+
+      - name: Apply migrations and provision the bureau
+        env:
+          OTDEL_DATABASE_URL: postgres://otdel_app:ci-app-password@127.0.0.1:5432/otdel_test
+          OTDEL_DATABASE_ADMIN_URL: postgres://otdel_migrator:ci-migrator-password@127.0.0.1:5432/otdel_test
+          OTDEL_BUREAU_SLUG: local
+        run: |
+          set -euo pipefail
+          cargo run --bin otdel-api -- migrate
+          cargo run --bin otdel-api -- bootstrap
+          # Re-running must be a no-op (regression for the search_path/_sqlx_migrations bug).
+          cargo run --bin otdel-api -- migrate
+
+      - name: Integration tests
+        env:
+          OTDEL_TEST_DATABASE_URL: postgres://otdel_app:ci-app-password@127.0.0.1:5432/otdel_test
+          OTDEL_TEST_ADMIN_DATABASE_URL: postgres://otdel_migrator:ci-migrator-password@127.0.0.1:5432/otdel_test
+          OTDEL_TEST_SUPERUSER_URL: postgres://otdel_superuser:ci-superuser-password@127.0.0.1:5432/otdel_test
+        # The whole workspace, including the suites that need PostgreSQL. If the database
+        # were missing these tests fail loudly rather than reporting success.
+        run: cargo test --workspace
+
+  # --- Web checks remain pending until the web app exists. ---
+  # The frontend worker owns .github/workflows/web.yml and apps/web; this workflow does
+  # not pretend to run web tests that do not exist here.
+  web-status:
+    name: web-status
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
 
       - name: Report pending web checks
         if: hashFiles('package.json', 'apps/web/package.json') == ''
-        run: echo "::notice title=Web checks pending::No package.json found yet; npm/pnpm lint/build/test will run once the web app is scaffolded (see docs/development.md)."
-
-  # --- Conditional jobs, documented but inert until their manifests exist. ---
-  # These are intentionally NOT wired up as real steps yet: adding a `run:`
-  # step here today would either fail (missing manifest) or silently pass
-  # without checking anything, which would be misleading. This is not just a
-  # documentation convention: scripts/check.mjs's manifest-vs-CI enforcement
-  # gate FAILS `make check` (and therefore this CI job) the moment
-  # Cargo.toml / package.json / apps/web/package.json is added without a
-  # matching real job below. The PR that adds such a manifest must add the
-  # real job in the same PR, for example:
-  #   - rust-check: actions/checkout -> dtolnay/rust-toolchain (pinned SHA) ->
-  #       cargo fmt --check, cargo clippy --all-targets -- -D warnings,
-  #       cargo test, gated on `if: hashFiles('Cargo.toml') != ''`.
-  #   - web-check: actions/checkout -> actions/setup-node (pinned SHA) ->
-  #       npm/pnpm ci, lint, build, test, gated on
-  #       `if: hashFiles('package.json') != ''`.
+        run: echo "::notice title=Web checks pending::No package.json found yet; the web workflow is added together with apps/web (see docs/development.md)."

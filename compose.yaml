@@ -1,0 +1,45 @@
+# OTDEL block 1 — local pilot services.
+#
+# Isolated from every other project on this machine:
+#   * compose project name `otdel-block1` (set below, not inherited from the directory);
+#   * PostgreSQL published on 127.0.0.1:58432 only (never 0.0.0.0, never 5432);
+#   * its own named volume.
+# Running `docker compose up -d` here does not touch containers of other projects.
+#
+# Image: pgvector/pgvector:pg17 — PostgreSQL 17 with the pgvector extension available.
+# Phase 1A stores no embeddings and the migrations do **not** create the extension; the
+# image is used so that `/ready` reports pgvector as genuinely available instead of
+# absent, and so 1C can enable it without changing the database.
+#
+# Credentials come from .local/db.env, which `scripts/dev-init.sh` generates with random
+# values. That file is git-ignored and is never printed.
+
+name: otdel-block1
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: otdel-block1-postgres
+    restart: unless-stopped
+    env_file:
+      - .local/db.env
+    environment:
+      # Superuser database/user of the container itself. The application never uses it:
+      # it connects as the restricted runtime role created by the init script below.
+      POSTGRES_DB: otdel
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      - "127.0.0.1:58432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d otdel"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  pgdata:
+    name: otdel-block1-pgdata

@@ -1,0 +1,29 @@
+[package]
+name = "otdel-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "HTTP API of OTDEL phase 1A: sessions, partners, material intake and the job list."
+
+[dependencies]
+otdel-core.workspace = true
+otdel-db.workspace = true
+otdel-storage.workspace = true
+
+axum.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+sqlx.workspace = true
+tower.workspace = true

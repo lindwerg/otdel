@@ -31,7 +31,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use crate::config::{duration_secs_or, parse_u64_or, string_or, ConfigSource};
+use crate::config::{duration_secs_or, parse_bool, parse_u64_or, string_or, ConfigSource};
 use crate::error::AppError;
 use crate::llm_config::ApiKey;
 use crate::secret;
@@ -52,7 +52,16 @@ const MIN_REQUEST_INTERVAL_RANGE: (u64, u64) = (0, 60_000);
 const MAX_PASSES_RANGE: (u64, u64) = (1, 10);
 /// OpenRouter clamps the tool's own `max_results` at 25.
 const OPENROUTER_MAX_RESULTS_RANGE: (u64, u64) = (1, 25);
+/// Perplexity's own ceiling is lower than the tool's: the documentation gives 1–20.
+const PERPLEXITY_MAX_RESULTS_RANGE: (u64, u64) = (1, 20);
 const OPENROUTER_MAX_TOTAL_RESULTS_RANGE: (u64, u64) = (1, 200);
+/// How many times one request may run the search tool. One is the default and five is
+/// already a lot: past that the *call* count, not the result count, is what spends money.
+const OPENROUTER_MAX_USES_RANGE: (u64, u64) = (1, 5);
+/// Characters of each result the tool is asked to return. OpenRouter documents 1–100 000.
+const OPENROUTER_MAX_CHARACTERS_RANGE: (u64, u64) = (200, 100_000);
+/// Most domains one search may be restricted to. A longer list is not a filter.
+const MAX_DOMAIN_FILTER_ENTRIES: usize = 20;
 /// Ten currency units per single call is already absurd; beyond it a typo is likelier
 /// than an intention.
 const COST_RANGE: (u64, u64) = (0, 10_000_000);
@@ -105,10 +114,17 @@ impl SearchProviderKind {
 
 /// Which engine OpenRouter is asked to run the search on.
 ///
-/// An allowlist, not a free string. OpenRouter also exposes `perplexity` and
-/// `firecrawl`; they are deliberately not here, because an engine this system has never
-/// priced and never tested is not something an environment variable should be able to
-/// switch on silently.
+/// An allowlist, not a free string: an engine this system has never priced and never
+/// tested is not something an environment variable should be able to switch on silently.
+/// `firecrawl` is still absent for exactly that reason — it bills in Firecrawl's own
+/// credits rather than in OpenRouter's, so its spend would not appear in this ledger at
+/// all.
+///
+/// [`SearchEngine::Perplexity`] is the engine the owner chose for this installation. It is
+/// **Perplexity Search run as the server tool's `perplexity` engine**, which is not the
+/// same product as a `perplexity/*` chat model: the model would answer from its own
+/// search and bill as tokens, while this one returns links that go through the same
+/// allowlist, robots and snapshot pipeline as every other lead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchEngine {
     /// Let OpenRouter choose. For a model without built-in search this means Exa, and
@@ -116,6 +132,8 @@ pub enum SearchEngine {
     Auto,
     Exa,
     Parallel,
+    /// Perplexity Search, priced by OpenRouter per request.
+    Perplexity,
     /// The model provider's own built-in search. Priced by that provider, so its cost is
     /// only ever known from what the response reports.
     Native,
@@ -127,6 +145,7 @@ impl SearchEngine {
             Self::Auto => "auto",
             Self::Exa => "exa",
             Self::Parallel => "parallel",
+            Self::Perplexity => "perplexity",
             Self::Native => "native",
         }
     }
@@ -136,12 +155,47 @@ impl SearchEngine {
             "auto" => Ok(Self::Auto),
             "exa" => Ok(Self::Exa),
             "parallel" => Ok(Self::Parallel),
+            "perplexity" => Ok(Self::Perplexity),
             "native" => Ok(Self::Native),
             other => Err(AppError::validation(format!(
                 "OTDEL_RESEARCH_OPENROUTER_ENGINE must be one of `auto`, `exa`, `parallel`, \
-                 `native`, got `{other}`"
+                 `perplexity`, `native`, got `{other}`"
             ))),
         }
+    }
+
+    /// How many results this engine may be asked for.
+    ///
+    /// The tool's own clamp is 25; Perplexity's documented ceiling is 20, and asking for
+    /// more is a configuration that would be silently reduced by the provider — which is
+    /// how a forecast stops matching an invoice.
+    pub const fn max_results_range(self) -> (u64, u64) {
+        match self {
+            Self::Perplexity => PERPLEXITY_MAX_RESULTS_RANGE,
+            _ => OPENROUTER_MAX_RESULTS_RANGE,
+        }
+    }
+
+    /// Does this engine honour a result count at all?
+    ///
+    /// `native` does not: the model provider decides how much it searched, so sending
+    /// `max_results` would claim a bound that is not there.
+    pub const fn honours_result_count(self) -> bool {
+        !matches!(self, Self::Native)
+    }
+
+    /// Does it honour `max_characters` and `search_context_size` (per-result excerpt size)?
+    pub const fn honours_excerpt_bounds(self) -> bool {
+        !matches!(self, Self::Native | Self::Auto)
+    }
+
+    /// Does it honour `allowed_domains`?
+    ///
+    /// Exa, Parallel and Perplexity do. For `native` OpenRouter documents it as varying by
+    /// provider, so nothing is sent: a filter that may be ignored must not be reported to
+    /// the owner as a filter that was applied.
+    pub const fn honours_domain_filter(self) -> bool {
+        matches!(self, Self::Exa | Self::Parallel | Self::Perplexity)
     }
 
     /// The declared tariff of this engine: `(base_micros, included_results,
@@ -150,6 +204,11 @@ impl SearchEngine {
     /// From OpenRouter's published prices for its server tool. They are defaults the
     /// owner can override, not a promise about an invoice — the same rule as everywhere
     /// else in this phase.
+    ///
+    /// Only Exa's line has ever been checked against a real charge from this repository
+    /// (7 474 micros observed against 7 000 declared plus tokens). Every other line here,
+    /// Perplexity's included, is **provisional**: published, arithmetically applied, and
+    /// not yet confirmed by a settlement.
     const fn default_tariff(self) -> (u64, u32, u64) {
         match self {
             // $0.007 per request including ten results, then $0.001 each. `auto` is
@@ -158,6 +217,16 @@ impl SearchEngine {
             Self::Auto | Self::Exa => (7_000, 10, 1_000),
             // $0.005 per request in Parallel's default mode; results are not metered.
             Self::Parallel => (5_000, u32::MAX, 0),
+            // "$0.005 per request using OpenRouter credits" — a flat price with no
+            // per-result component published, so none is invented here, and nothing is
+            // carried over from Exa's line above.
+            //
+            // **Provisional.** It is read from OpenRouter's server-tool documentation and
+            // has not yet been checked against a real invoice for this engine: no paid
+            // Perplexity call has been made from this repository. Until one has, this is a
+            // forecast like any other declared tariff, and `usage.cost` from the response
+            // is the only number allowed to settle the ledger.
+            Self::Perplexity => (5_000, u32::MAX, 0),
             // Passed through to the model provider, which prices it in its own tokens.
             // There is no separate per-request tariff to declare.
             Self::Native => (0, u32::MAX, 0),
@@ -397,6 +466,25 @@ pub struct OpenRouterSearchSettings {
     /// Ceiling on results one plan may accumulate across all of its searches. Bounds the
     /// spend of a plan whose every query keeps finding new links.
     pub max_total_results_per_plan: u32,
+    /// How many times **one request** may run the search tool.
+    ///
+    /// A result limit is not a call limit, and conflating them is how a single reserved
+    /// search turns into an unbounded number of billed ones: the model decides how often
+    /// to call the tool, and every call is a separate charge. This is the provider-side
+    /// ceiling on that, sent on the wire, and the forecast multiplies by it.
+    pub max_uses_per_request: u32,
+    /// Characters of each result the tool is asked to return.
+    ///
+    /// The excerpts are never evidence — the page itself is read through the fetcher — so
+    /// this exists to bound the model tokens spent reading them, not to gather text.
+    pub max_characters_per_result: u32,
+    /// Ask the engine to search only inside the declared host allowlist.
+    ///
+    /// Off by default, and deliberately so: the allowlist is a *reading* boundary, and
+    /// narrowing the search to it can turn a real answer into an empty result list
+    /// without saying why. When it is on, the same list is sent as `allowed_domains` and
+    /// the interface says the search was filtered.
+    pub filter_to_allowed_hosts: bool,
     /// Declared price of one search request, covering `included_results` results.
     pub base_micros: u64,
     pub included_results: u32,
@@ -421,6 +509,11 @@ impl Default for OpenRouterSearchSettings {
             engine: SearchEngine::Auto,
             max_results: 5,
             max_total_results_per_plan: 20,
+            // One tool call per request. The model is asked to search once; this is the
+            // provider enforcing it rather than the prompt hoping for it.
+            max_uses_per_request: 1,
+            max_characters_per_result: 1_500,
+            filter_to_allowed_hosts: false,
             base_micros,
             included_results,
             extra_result_micros,
@@ -440,6 +533,10 @@ impl OpenRouterSearchSettings {
     /// model's built-in search when the model has one, and to Exa when it does not. A
     /// model like `openai/gpt-4o-mini` has none, so `auto` means Exa, and both the
     /// interface and the tariff say Exa rather than "auto, we will see".
+    ///
+    /// An engine the owner named explicitly is returned unchanged. There is no path here
+    /// from `perplexity` to anything else: a chosen engine that fails, fails visibly, and
+    /// is never quietly served by Exa at Exa's price.
     pub fn effective_engine(&self) -> SearchEngine {
         match self.engine {
             SearchEngine::Auto if native_search_capable(&self.model) => SearchEngine::Native,
@@ -460,13 +557,40 @@ impl OpenRouterSearchSettings {
             .saturating_add(extra.saturating_mul(self.extra_result_micros))
     }
 
-    /// What one search call is expected to cost in total, tokens included.
+    /// What one search **request** is expected to cost in total, tokens included.
+    ///
+    /// The engine tariff is multiplied by [`Self::max_uses_per_request`], because that is
+    /// the number of searches the provider is allowed to run inside one request and each
+    /// one is charged. Reserving a single search while permitting several would under-
+    /// reserve exactly when the model is most expensive.
     ///
     /// This is the number reserved before the call. The number *settled* after it is what
     /// the provider reported, when it reports anything.
     pub fn forecast_micros(&self) -> u64 {
         self.search_cost_micros(self.max_results)
+            .saturating_mul(u64::from(self.max_uses_per_request.max(1)))
             .saturating_add(self.token_allowance_micros)
+    }
+
+    /// The allowlist as a domain filter for the engine, or empty when none is sent.
+    ///
+    /// `.gost.ru` and `gost.ru` both become `gost.ru`: the engine's filter is a domain
+    /// match, and a leading dot is this system's own notation for "and its subdomains".
+    /// Nothing is widened — a bare entry stays exactly as narrow as it was for *reading*,
+    /// and the read-time allowlist check is unchanged either way.
+    pub fn domain_filter(&self, allowed_hosts: &HostAllowlist) -> Vec<String> {
+        if !self.filter_to_allowed_hosts || !self.effective_engine().honours_domain_filter() {
+            return Vec::new();
+        }
+        let mut domains: Vec<String> = Vec::new();
+        for entry in allowed_hosts.entries() {
+            let domain = entry.strip_prefix('.').unwrap_or(entry).to_owned();
+            if !domains.contains(&domain) {
+                domains.push(domain);
+            }
+        }
+        domains.truncate(MAX_DOMAIN_FILTER_ENTRIES);
+        domains
     }
 
     /// Full URL of the chat-completions endpoint that carries the tool.
@@ -953,12 +1077,31 @@ fn load_openrouter(
         _ => defaults.engine,
     };
 
+    // The engine decides the ceiling, so it has to be resolved before the count is read:
+    // Perplexity stops at 20 where the tool itself would allow 25, and a configuration the
+    // provider would silently clamp is a forecast that silently stops matching the invoice.
+    let effective_engine = OpenRouterSearchSettings {
+        engine,
+        model: model.clone(),
+        ..defaults.clone()
+    }
+    .effective_engine();
+
+    let results_range = effective_engine.max_results_range();
     let max_results = bounded_u32(
         source,
         "OTDEL_RESEARCH_OPENROUTER_MAX_RESULTS",
-        u64::from(defaults.max_results),
-        OPENROUTER_MAX_RESULTS_RANGE,
-    )?;
+        u64::from(defaults.max_results).min(results_range.1),
+        results_range,
+    )
+    .map_err(|_| {
+        AppError::validation(format!(
+            "OTDEL_RESEARCH_OPENROUTER_MAX_RESULTS must be between {} and {} for engine `{}`",
+            results_range.0,
+            results_range.1,
+            effective_engine.as_str()
+        ))
+    })?;
     let max_total_results_per_plan = bounded_u32(
         source,
         "OTDEL_RESEARCH_OPENROUTER_MAX_TOTAL_RESULTS",
@@ -973,16 +1116,36 @@ fn load_openrouter(
         ));
     }
 
-    // The tariff defaults follow the engine the owner actually selected, so switching
-    // from Exa to Parallel does not leave the forecast quoting Exa's price.
-    let (base_default, included_default, extra_default) = {
-        let resolved = OpenRouterSearchSettings {
-            engine,
-            model: model.clone(),
-            ..defaults.clone()
-        };
-        resolved.effective_engine().default_tariff()
+    let max_uses_per_request = bounded_u32(
+        source,
+        "OTDEL_RESEARCH_OPENROUTER_MAX_USES",
+        u64::from(defaults.max_uses_per_request),
+        OPENROUTER_MAX_USES_RANGE,
+    )?;
+    let max_characters_per_result = bounded_u32(
+        source,
+        "OTDEL_RESEARCH_OPENROUTER_MAX_CHARACTERS",
+        u64::from(defaults.max_characters_per_result),
+        OPENROUTER_MAX_CHARACTERS_RANGE,
+    )?;
+    let filter_to_allowed_hosts = match source.get("OTDEL_RESEARCH_OPENROUTER_DOMAIN_FILTER") {
+        Some(value) if !value.trim().is_empty() => {
+            parse_bool(&value, "OTDEL_RESEARCH_OPENROUTER_DOMAIN_FILTER")?
+        }
+        _ => defaults.filter_to_allowed_hosts,
     };
+    if filter_to_allowed_hosts && !effective_engine.honours_domain_filter() {
+        return Err(AppError::validation(format!(
+            "OTDEL_RESEARCH_OPENROUTER_DOMAIN_FILTER cannot be used with engine `{}`: \
+             OpenRouter does not document a domain filter for it, and a filter that may be \
+             ignored must not be shown as one that was applied",
+            effective_engine.as_str()
+        )));
+    }
+
+    // The tariff defaults follow the engine the owner actually selected, so switching
+    // from Exa to Perplexity does not leave the forecast quoting Exa's price.
+    let (base_default, included_default, extra_default) = effective_engine.default_tariff();
 
     Ok(OpenRouterSearchSettings {
         base_url,
@@ -990,6 +1153,9 @@ fn load_openrouter(
         engine,
         max_results,
         max_total_results_per_plan,
+        max_uses_per_request,
+        max_characters_per_result,
+        filter_to_allowed_hosts,
         base_micros: bounded_u64(
             source,
             "OTDEL_RESEARCH_OPENROUTER_SEARCH_BASE_MICROS",
@@ -1206,6 +1372,25 @@ mod tests {
         let settings = ResearchSettings::load(&source)
             .expect("the shipped .env.example must be a configuration the loader accepts");
 
+        // The engine the owner selected, in the file an owner copies. If this drifts back
+        // to `auto`, an installation that believes it runs Perplexity runs Exa instead —
+        // at a different price — and nothing would say so.
+        assert_eq!(
+            settings.openrouter.engine,
+            SearchEngine::Perplexity,
+            "the shipped example must select the engine this installation chose"
+        );
+        assert_eq!(
+            settings.openrouter.effective_engine(),
+            SearchEngine::Perplexity
+        );
+        assert!(!settings.openrouter.is_exa_fallback());
+        // Its tariff comes from the engine, not from a stale literal left in the file.
+        assert_eq!(settings.openrouter.base_micros, 5_000);
+        assert_eq!(settings.openrouter.extra_result_micros, 0);
+        // And one request may run exactly one search.
+        assert_eq!(settings.openrouter.max_uses_per_request, 1);
+
         // And it must ship as *not ready*: the example carries no key and no allowlist, so
         // a copied-and-run installation makes no external call until the owner decides to.
         assert!(
@@ -1300,8 +1485,116 @@ mod tests {
     }
 
     #[test]
+    fn perplexity_is_the_chosen_engine_and_is_priced_and_bounded_as_its_own() {
+        // F04: the engine the owner selected. It is configured explicitly, it resolves to
+        // itself, and nothing in the loader can turn it into Exa.
+        let settings = openrouter(&[("OTDEL_RESEARCH_OPENROUTER_ENGINE", "perplexity")]);
+        let engine = &settings.openrouter;
+        assert_eq!(engine.engine, SearchEngine::Perplexity);
+        assert_eq!(engine.effective_engine(), SearchEngine::Perplexity);
+        assert!(
+            !engine.is_exa_fallback(),
+            "an explicitly chosen engine is never an Exa fallback"
+        );
+        assert_eq!(settings.availability(), SearchAvailability::Ready);
+
+        // $0.005 per request, flat: the published Perplexity price, not Exa's 7 000 and
+        // not Exa's per-result surcharge.
+        assert_eq!(engine.base_micros, 5_000);
+        assert_eq!(engine.search_cost_micros(1), 5_000);
+        assert_eq!(engine.search_cost_micros(20), 5_000);
+        // One tool call by default, so the forecast is one search plus the token allowance.
+        assert_eq!(engine.max_uses_per_request, 1);
+        assert_eq!(engine.forecast_micros(), 5_000 + 3_000);
+        assert_eq!(settings.costs.search_micros, engine.forecast_micros());
+
+        // The model stays a separate setting: the engine searches, the model reads.
+        assert_eq!(engine.model, "openai/gpt-4o-mini");
+    }
+
+    #[test]
+    fn perplexity_stops_at_twenty_results_where_the_tool_itself_allows_twenty_five() {
+        // Documented per-engine ceiling. Accepting 25 would mean reserving for results the
+        // provider was never going to return.
+        let twenty = openrouter(&[
+            ("OTDEL_RESEARCH_OPENROUTER_ENGINE", "perplexity"),
+            ("OTDEL_RESEARCH_OPENROUTER_MAX_RESULTS", "20"),
+        ]);
+        assert_eq!(twenty.openrouter.max_results, 20);
+        assert_eq!(twenty.limits.max_results_per_query, 20);
+
+        let mut pairs = openrouter_pairs();
+        pairs.push(("OTDEL_RESEARCH_OPENROUTER_ENGINE", "perplexity"));
+        pairs.push(("OTDEL_RESEARCH_OPENROUTER_MAX_RESULTS", "21"));
+        let error = ResearchSettings::load(&env(&pairs)).unwrap_err();
+        assert!(error.message.contains("perplexity"), "{}", error.message);
+
+        // Exa keeps its own, higher ceiling.
+        let exa = openrouter(&[
+            ("OTDEL_RESEARCH_OPENROUTER_ENGINE", "exa"),
+            ("OTDEL_RESEARCH_OPENROUTER_MAX_RESULTS", "25"),
+            ("OTDEL_RESEARCH_OPENROUTER_MAX_TOTAL_RESULTS", "25"),
+        ]);
+        assert_eq!(exa.openrouter.max_results, 25);
+    }
+
+    #[test]
+    fn a_result_limit_is_not_a_call_limit() {
+        // The distinction R08 exists for: the model decides how often to run the tool, and
+        // every run is charged. The ceiling is configuration, and the forecast follows it.
+        let single = openrouter(&[("OTDEL_RESEARCH_OPENROUTER_ENGINE", "perplexity")]);
+        assert_eq!(single.openrouter.forecast_micros(), 5_000 + 3_000);
+
+        let three = openrouter(&[
+            ("OTDEL_RESEARCH_OPENROUTER_ENGINE", "perplexity"),
+            ("OTDEL_RESEARCH_OPENROUTER_MAX_USES", "3"),
+        ]);
+        assert_eq!(three.openrouter.max_uses_per_request, 3);
+        assert_eq!(
+            three.openrouter.forecast_micros(),
+            3 * 5_000 + 3_000,
+            "three permitted searches are three charges, not one"
+        );
+
+        // Zero calls is not a configuration, and an unbounded count is not one either.
+        for uses in ["0", "6"] {
+            let mut pairs = openrouter_pairs();
+            pairs.push(("OTDEL_RESEARCH_OPENROUTER_MAX_USES", uses));
+            assert!(ResearchSettings::load(&env(&pairs)).is_err(), "{uses}");
+        }
+    }
+
+    #[test]
+    fn the_domain_filter_is_off_by_default_and_never_widens_the_allowlist() {
+        let hosts = HostAllowlist::parse("docs.cntd.ru, .gost.ru, .gost.ru").unwrap();
+
+        // Off by default: narrowing the *search* to the reading allowlist can turn a real
+        // answer into an empty list, so it is a decision the owner makes.
+        let default = openrouter(&[("OTDEL_RESEARCH_OPENROUTER_ENGINE", "perplexity")]);
+        assert!(!default.openrouter.filter_to_allowed_hosts);
+        assert!(default.openrouter.domain_filter(&hosts).is_empty());
+
+        let filtered = openrouter(&[
+            ("OTDEL_RESEARCH_OPENROUTER_ENGINE", "perplexity"),
+            ("OTDEL_RESEARCH_OPENROUTER_DOMAIN_FILTER", "true"),
+        ]);
+        assert_eq!(
+            filtered.openrouter.domain_filter(&hosts),
+            vec!["docs.cntd.ru".to_owned(), "gost.ru".to_owned()],
+            "`.gost.ru` is this system's notation for a suffix; the engine wants the domain"
+        );
+
+        // An engine OpenRouter does not document a filter for must not pretend to have one.
+        let mut pairs = openrouter_pairs();
+        pairs.push(("OTDEL_RESEARCH_OPENROUTER_ENGINE", "native"));
+        pairs.push(("OTDEL_RESEARCH_OPENROUTER_DOMAIN_FILTER", "true"));
+        let error = ResearchSettings::load(&env(&pairs)).unwrap_err();
+        assert!(error.message.contains("DOMAIN_FILTER"), "{}", error.message);
+    }
+
+    #[test]
     fn the_engine_is_an_allowlist_not_a_free_string() {
-        for engine in ["exa", "parallel", "native", "auto", "EXA"] {
+        for engine in ["exa", "parallel", "native", "auto", "perplexity", "EXA"] {
             assert!(
                 ResearchSettings::load(&env(&{
                     let mut pairs = openrouter_pairs();
@@ -1313,8 +1606,9 @@ mod tests {
             );
         }
         // Engines this system has never priced and never tested must not be reachable by
-        // typing their name into an environment variable.
-        for engine in ["perplexity", "firecrawl", "google", ""] {
+        // typing their name into an environment variable. `firecrawl` stays out because it
+        // bills in its own credits, which this ledger would never see.
+        for engine in ["firecrawl", "google", "perplexity/sonar", ""] {
             let result = ResearchSettings::load(&env(&{
                 let mut pairs = openrouter_pairs();
                 pairs.push(("OTDEL_RESEARCH_OPENROUTER_ENGINE", engine));

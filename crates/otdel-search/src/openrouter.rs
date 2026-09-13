@@ -8,12 +8,22 @@
 //! { "model": "openai/gpt-4o-mini",
 //!   "messages": [ … ],
 //!   "tools": [ { "type": "openrouter:web_search",
-//!                "parameters": { "engine": "exa", "max_results": 5,
-//!                                "max_total_results": 20,
+//!                "parameters": { "engine": "perplexity", "max_results": 3,
+//!                                "max_total_results": 20, "max_uses": 1,
+//!                                "max_characters": 1500,
 //!                                "search_context_size": "low" } } ] }
 //! ```
 //!
-//! Two properties of this design deserve stating, because both are easy to lose.
+//! `engine` is the owner's choice and is sent verbatim; for this installation it is
+//! `perplexity`. There is no path in this adapter from a chosen engine to a different one:
+//! a Perplexity search that fails returns a failure, and is never quietly re-run on Exa at
+//! Exa's price.
+//!
+//! `max_uses` is the bound that a result count is not. `max_results` limits one search;
+//! the *model* decides how many searches to run, and each one is billed, so the request
+//! carries an explicit ceiling on the calls themselves rather than trusting the prompt.
+//!
+//! Three properties of this design deserve stating, because all three are easy to lose.
 //!
 //! **The model finds links; it never becomes the source.** Its prose answer is dropped on
 //! the floor — only the annotation URLs survive, and each of them is then put through the
@@ -22,6 +32,12 @@
 //! SHA-256 snapshot. Nothing this adapter returns is quotable. The annotation's own
 //! `content` is stored exactly like a search snippet: a lead the owner may read, never
 //! evidence, never an instruction.
+//!
+//! **What was requested and what was observed stay separate.** The engine this system
+//! asked for is known from the configuration; whether the provider confirms it depends on
+//! whether the response says so. [`crate::SearchBilling::observed_engine`] is `None` when
+//! it does not, rather than being filled in from the request — a confirmation nobody gave
+//! is not one to record.
 //!
 //! **The prompt it sends is the query the plan already vetted.** `otdel_research::query`
 //! refuses to build a query that names the partner, and the topic is filtered through the
@@ -56,6 +72,9 @@ const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_HITS: usize = 50;
 const MAX_SNIPPET_CHARS: usize = 600;
 const MAX_TITLE_CHARS: usize = 300;
+/// Identifiers and engine names are short; anything longer is not one.
+const MAX_REQUEST_ID_CHARS: usize = 120;
+const MAX_ENGINE_CHARS: usize = 40;
 /// Enough tokens to list a handful of links, not enough to write an essay nobody reads.
 const MAX_OUTPUT_TOKENS: u32 = 700;
 /// Smallest per-result excerpt OpenRouter offers. The excerpts are never used as
@@ -91,6 +110,9 @@ pub trait ChatTransport: Send + Sync {
 pub struct OpenRouterSearch {
     transport: Arc<dyn ChatTransport>,
     settings: OpenRouterSearchSettings,
+    /// Domains the engine is asked to search inside, empty unless the owner switched the
+    /// filter on. Never a substitute for the read-time allowlist, which still runs.
+    allowed_domains: Vec<String>,
     description: AdapterDescription,
     min_request_interval: Duration,
     last_request: Mutex<Option<Instant>>,
@@ -131,14 +153,23 @@ impl OpenRouterSearch {
         let engine = openrouter.effective_engine();
         let host = transport.endpoint_host();
 
+        let allowed_domains = openrouter.domain_filter(&settings.allowed_hosts);
+
         let mut message = format!(
             "Исследователь ищет источники через {} ({}, движок {}, до {} результатов на \
-             запрос).",
+             запрос, не больше {} поисков в одном запросе).",
             host.clone().unwrap_or_else(|| "openrouter.ai".to_owned()),
             openrouter.model,
             engine.as_str(),
-            openrouter.max_results
+            openrouter.max_results,
+            openrouter.max_uses_per_request
         );
+        if !allowed_domains.is_empty() {
+            message.push_str(&format!(
+                " Поиск ограничен доменами: {}.",
+                allowed_domains.join(", ")
+            ));
+        }
         if openrouter.is_exa_fallback() {
             message.push_str(&format!(
                 " Модель {} не умеет искать сама, поэтому `auto` — это Exa, и тариф \
@@ -163,6 +194,7 @@ impl OpenRouterSearch {
             },
             min_request_interval: settings.limits.min_request_interval,
             last_request: Mutex::new(None),
+            allowed_domains,
             settings: openrouter,
             transport,
         }
@@ -185,16 +217,31 @@ impl OpenRouterSearch {
     }
 
     /// The request body. Every bound in it is configuration, not a literal.
+    ///
+    /// Only what the chosen engine documents as supported is sent. A parameter an engine
+    /// ignores is worse than a missing one: it shows up in the interface as a bound that
+    /// is in force when it is not.
     fn body(&self, request: &SearchRequest) -> Value {
-        let max_results = request
-            .max_results
-            .clamp(1, self.settings.max_results.max(1));
+        let engine = self.settings.effective_engine();
 
-        let mut parameters = json!({
-            "max_results": max_results,
-            "max_total_results": self.settings.max_total_results_per_plan,
-            "search_context_size": SEARCH_CONTEXT_SIZE,
-        });
+        // A call ceiling, always. The result count bounds one search; this bounds how many
+        // searches one request may run, and without it the model decides that on its own.
+        let mut parameters = json!({ "max_uses": self.settings.max_uses_per_request.max(1) });
+
+        if engine.honours_result_count() {
+            let max_results = request
+                .max_results
+                .clamp(1, self.settings.max_results.max(1));
+            parameters["max_results"] = json!(max_results);
+            parameters["max_total_results"] = json!(self.settings.max_total_results_per_plan);
+        }
+        if engine.honours_excerpt_bounds() {
+            parameters["max_characters"] = json!(self.settings.max_characters_per_result);
+            parameters["search_context_size"] = json!(SEARCH_CONTEXT_SIZE);
+        }
+        if !self.allowed_domains.is_empty() {
+            parameters["allowed_domains"] = json!(self.allowed_domains);
+        }
         // `auto` is left unsaid rather than sent: the tool's own default is auto, and
         // naming an engine this system did not choose would misreport who decided.
         if self.settings.engine != SearchEngine::Auto {
@@ -229,6 +276,8 @@ impl SearchProvider for OpenRouterSearch {
         let envelope = self.transport.post(&self.body(request)).await?;
         let hits = parse_citations(&envelope, request.max_results as usize)?;
         let mut billing = parse_billing(&envelope);
+        // What was asked for. What actually served the request is `observed_engine`, and it
+        // stays `None` unless the provider said so itself.
         billing.engine = Some(self.settings.effective_engine().as_str().to_owned());
         billing.exa_fallback = self.settings.is_exa_fallback();
 
@@ -236,7 +285,9 @@ impl SearchProvider for OpenRouterSearch {
         debug!(
             hits = hits.len(),
             duration_ms = duration.as_millis() as u64,
-            engine = billing.engine.as_deref().unwrap_or("—"),
+            requested_engine = billing.engine.as_deref().unwrap_or("—"),
+            observed_engine = billing.observed_engine.as_deref().unwrap_or("не сообщён"),
+            searches = billing.search_requests.unwrap_or_default(),
             reported_micros = billing.reported_micros.unwrap_or_default(),
             "openrouter web search finished"
         );
@@ -355,24 +406,51 @@ fn parse_billing(envelope: &Value) -> SearchBilling {
 
     // OpenAPI calls it `server_tool_use_details`; the prose and the Responses API call it
     // `server_tool_use`. Reading both costs one line and avoids a silently missing count.
-    let search_requests = usage
-        .and_then(|usage| {
-            usage
-                .get("server_tool_use_details")
-                .or_else(|| usage.get("server_tool_use"))
-        })
+    let tool_details = usage.and_then(|usage| {
+        usage
+            .get("server_tool_use_details")
+            .or_else(|| usage.get("server_tool_use"))
+    });
+    let search_requests = tool_details
         .and_then(|details| details.get("web_search_requests"))
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok());
 
     SearchBilling {
         engine: None,
+        observed_engine: observed_engine(envelope, tool_details),
+        request_id: text_field(envelope, &["id"], MAX_REQUEST_ID_CHARS),
         exa_fallback: false,
         reported_micros,
         prompt_tokens: tokens("prompt_tokens"),
         completion_tokens: tokens("completion_tokens"),
         search_requests,
     }
+}
+
+/// The engine the **provider** named, if it named one anywhere this adapter can see.
+///
+/// OpenRouter's documented response schema does not promise to echo the engine back, so
+/// this looks in the places it could plausibly appear and returns `None` when none of them
+/// carries it. `None` is an honest answer: it means the provider did not say, and the
+/// caller must not read "we asked for perplexity" as "perplexity confirmed". The
+/// alternative — copying the request into this field — is how an unverified claim becomes
+/// evidence in a journal.
+fn observed_engine(envelope: &Value, tool_details: Option<&Value>) -> Option<String> {
+    const NAMES: &[&str] = &["engine", "web_search_engine", "search_engine"];
+
+    tool_details
+        .and_then(|details| text_field(details, NAMES, MAX_ENGINE_CHARS))
+        .or_else(|| {
+            envelope
+                .pointer("/choices/0/message/annotations/0")
+                .and_then(|annotation| text_field(annotation, NAMES, MAX_ENGINE_CHARS))
+        })
+        .or_else(|| {
+            envelope
+                .get("usage")
+                .and_then(|usage| text_field(usage, NAMES, MAX_ENGINE_CHARS))
+        })
 }
 
 /// The first present field, cleaned of control characters and bounded.
@@ -572,6 +650,77 @@ mod tests {
     }
 
     #[test]
+    fn the_chosen_engine_on_the_wire_is_exactly_perplexity() {
+        // F04/R08: the engine the owner selected, asserted as the literal value that
+        // leaves this machine. `perplexity` here is the *search engine* of the server tool,
+        // which is why the model beside it is still an ordinary chat model.
+        let adapter = adapter(&[
+            ("OTDEL_RESEARCH_OPENROUTER_ENGINE", "perplexity"),
+            ("OTDEL_RESEARCH_OPENROUTER_MAX_RESULTS", "3"),
+        ]);
+        let body = adapter.body(&request());
+        let parameters = &body["tools"][0]["parameters"];
+
+        assert_eq!(body["tools"][0]["type"], "openrouter:web_search");
+        assert_eq!(parameters["engine"], "perplexity");
+        assert_eq!(parameters["max_results"], 3);
+        // The call ceiling, not just the result ceiling.
+        assert_eq!(parameters["max_uses"], 1);
+        assert_eq!(parameters["max_total_results"], 20);
+        assert_eq!(parameters["max_characters"], 1_500);
+        assert_eq!(parameters["search_context_size"], "low");
+        // Nothing anywhere in the request asks for a second engine or leaks the key.
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("exa"), "{rendered}");
+        assert!(!rendered.contains("sk-or-v1-"), "{rendered}");
+    }
+
+    #[test]
+    fn a_call_ceiling_is_sent_even_when_the_owner_allows_several() {
+        let body = adapter(&[
+            ("OTDEL_RESEARCH_OPENROUTER_ENGINE", "perplexity"),
+            ("OTDEL_RESEARCH_OPENROUTER_MAX_USES", "2"),
+        ])
+        .body(&request());
+        assert_eq!(body["tools"][0]["parameters"]["max_uses"], 2);
+    }
+
+    #[test]
+    fn only_parameters_the_engine_documents_are_sent() {
+        // `native` search is the model provider's own: it honours neither a result count
+        // nor an excerpt size, and sending them would show the owner bounds that are not
+        // in force.
+        let native = adapter(&[("OTDEL_RESEARCH_OPENROUTER_ENGINE", "native")]).body(&request());
+        let parameters = &native["tools"][0]["parameters"];
+        assert_eq!(parameters["engine"], "native");
+        assert_eq!(parameters["max_uses"], 1, "the call ceiling always applies");
+        assert!(parameters.get("max_results").is_none());
+        assert!(parameters.get("max_characters").is_none());
+        assert!(parameters.get("search_context_size").is_none());
+    }
+
+    #[test]
+    fn the_domain_filter_is_absent_unless_the_owner_asked_for_it() {
+        let unfiltered = adapter(&[("OTDEL_RESEARCH_OPENROUTER_ENGINE", "perplexity")]);
+        assert!(unfiltered.body(&request())["tools"][0]["parameters"]
+            .get("allowed_domains")
+            .is_none());
+
+        let filtered = adapter(&[
+            ("OTDEL_RESEARCH_OPENROUTER_ENGINE", "perplexity"),
+            ("OTDEL_RESEARCH_OPENROUTER_DOMAIN_FILTER", "true"),
+            ("OTDEL_RESEARCH_ALLOWED_HOSTS", "docs.example.org,.gost.ru"),
+        ]);
+        let body = filtered.body(&request());
+        assert_eq!(
+            body["tools"][0]["parameters"]["allowed_domains"],
+            json!(["docs.example.org", "gost.ru"]),
+            "the declared publishers, with no wildcard and nothing added for convenience"
+        );
+        assert!(filtered.describe().message.contains("ограничен доменами"));
+    }
+
+    #[test]
     fn auto_is_left_unsaid_and_a_chosen_engine_is_sent() {
         let auto = adapter(&[]).body(&request());
         assert!(
@@ -751,6 +900,68 @@ mod tests {
             parse_billing(&json!({"usage": {"cost": null}})).reported_micros,
             None
         );
+    }
+
+    #[test]
+    fn the_request_id_is_kept_and_an_unreported_engine_stays_unknown() {
+        let silent = parse_billing(&json!({
+            "id": "gen-1700000000-abcdef",
+            "usage": {"cost": 0.005, "server_tool_use_details": {"web_search_requests": 1}},
+        }));
+        assert_eq!(silent.request_id.as_deref(), Some("gen-1700000000-abcdef"));
+        assert_eq!(
+            silent.observed_engine, None,
+            "the provider named no engine, so nothing may be claimed as confirmation"
+        );
+
+        // When it does name one, it is recorded as the provider's word, next to — never
+        // instead of — what was requested.
+        let spoken = parse_billing(&json!({
+            "usage": {"server_tool_use_details": {"web_search_requests": 1, "engine": "perplexity"}},
+        }));
+        assert_eq!(spoken.observed_engine.as_deref(), Some("perplexity"));
+    }
+
+    #[tokio::test]
+    async fn a_perplexity_answer_reports_what_was_asked_and_what_was_confirmed() {
+        struct Scripted;
+
+        #[async_trait]
+        impl ChatTransport for Scripted {
+            async fn post(&self, body: &Value) -> Result<Value, SearchError> {
+                assert_eq!(body["tools"][0]["parameters"]["engine"], "perplexity");
+                assert_eq!(body["tools"][0]["parameters"]["max_uses"], 1);
+                // A response shaped like OpenRouter's, which says nothing about the engine.
+                Ok(json!({
+                    "id": "gen-abc",
+                    "choices": [{"message": {"annotations": [{
+                        "type": "url_citation",
+                        "url_citation": {"url": "https://docs.example.org/gost"},
+                    }]}}],
+                    "usage": {"cost": 0.0055, "server_tool_use_details": {"web_search_requests": 1}},
+                }))
+            }
+            fn endpoint_host(&self) -> Option<String> {
+                Some("openrouter.ai".to_owned())
+            }
+        }
+
+        let settings = settings(&[("OTDEL_RESEARCH_OPENROUTER_ENGINE", "perplexity")]);
+        let adapter = OpenRouterSearch::with_transport(&settings, Arc::new(Scripted));
+        let answer = adapter.search(&request()).await.unwrap();
+
+        assert_eq!(answer.billing.engine.as_deref(), Some("perplexity"));
+        assert_eq!(
+            answer.billing.observed_engine, None,
+            "silence is reported as silence, not as confirmation"
+        );
+        assert!(
+            !answer.billing.exa_fallback,
+            "an explicitly chosen engine is never an Exa fallback"
+        );
+        assert_eq!(answer.billing.reported_micros, Some(5_500));
+        assert_eq!(answer.billing.search_requests, Some(1));
+        assert_eq!(answer.billing.request_id.as_deref(), Some("gen-abc"));
     }
 
     #[tokio::test]

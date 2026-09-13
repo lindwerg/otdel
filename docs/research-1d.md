@@ -22,10 +22,27 @@ pays for both.
 { "model": "openai/gpt-4o-mini",
   "messages": [ … ],
   "tools": [ { "type": "openrouter:web_search",
-               "parameters": { "engine": "exa", "max_results": 5,
-                               "max_total_results": 20,
+               "parameters": { "engine": "perplexity", "max_results": 5,
+                               "max_total_results": 20, "max_uses": 1,
+                               "max_characters": 1500,
                                "search_context_size": "low" } } ] }
 ```
+
+`engine` is the owner's choice, sent verbatim. For this installation it is **`perplexity`**
+— Perplexity Search run as the server tool's engine, which is not the same product as a
+`perplexity/*` chat model: that model would answer from its own search and bill as tokens,
+while this returns links that go through the pipeline below. The model beside it stays an
+ordinary chat model and is a separate setting: the engine finds sources, the model reads
+them. An engine named explicitly resolves to itself — there is **no fallback to Exa**, so a
+Perplexity search that fails returns a failure rather than being re-run somewhere else at
+another price.
+
+`max_uses` is the bound a result count is not. `max_results` limits what one search returns;
+the *model* decides how many searches to run, and each one is charged, so the request
+carries an explicit ceiling on the calls themselves rather than trusting the prompt to ask
+for one. One search returning three links is one charge; three searches returning one link
+each are three. Only what the chosen engine documents as supported is sent: `native` honours
+neither a result count nor an excerpt size, so neither is included for it.
 
 What comes back is a chat answer with `url_citation` annotations. **Only the annotations
 are used.** The model's prose is discarded — including any URL it writes into it, which
@@ -108,12 +125,15 @@ OTDEL_LLM_MODEL=openai/gpt-4o-mini
 OTDEL_LLM_BASE_URL=https://openrouter.ai/api/v1
 
 OTDEL_RESEARCH_PROVIDER=openrouter
+OTDEL_RESEARCH_OPENROUTER_ENGINE=perplexity
 OTDEL_RESEARCH_ALLOWED_HOSTS=docs.cntd.ru,.gost.ru
 ```
 
-That is the whole of it: the engine defaults to `auto`, the result count to 5, the plan
-allowance to 20, and the tariff to Exa's published price. Everything else in
-[`.env.example`](../.env.example) is there to be tuned, not to be filled in.
+That is the whole of it: the engine is `perplexity` as shipped in
+[`.env.example`](../.env.example), the result count defaults to 5 (Perplexity's own ceiling
+is 20, below the tool's 25), one request may run one search, the plan allowance is 20
+results, and the tariff follows the engine rather than a literal left behind by a previous
+one. Everything else in the example is there to be tuned, not to be filled in.
 
 There is one real call in the repository to prove the wire format is right —
 `crates/otdel-search/tests/openrouter_smoke.rs`, `#[ignore]`d so neither CI nor a local
@@ -125,8 +145,17 @@ export OTDEL_RESEARCH_ALLOWED_HOSTS=docs.cntd.ru
 cargo test -p otdel-search --test openrouter_smoke -- --ignored --nocapture
 ```
 
-It asks one neutral question about a published standard, takes three results, fetches
-nothing, stores nothing and prints only public URLs.
+It asks one neutral question about a published standard, takes three results, runs the
+search tool at most once (`max_uses=1`), fetches nothing, stores nothing and prints only
+public URLs. It pins `engine=perplexity` itself rather than trusting the environment, so a
+forgotten variable cannot turn a Perplexity acceptance run into an Exa one, and it asserts
+the engine on the wire before spending anything.
+
+It prints **requested** and **observed** engine as two separate facts. OpenRouter's response
+schema does not promise to echo the engine back, so `observed_engine` stays empty when it
+says nothing — and empty is reported as empty. Copying the request into that field would
+turn "we asked for Perplexity" into "the provider confirmed Perplexity", which is a
+confirmation nobody gave.
 
 ## The pipeline
 
@@ -299,11 +328,21 @@ interpretation runs — and settled at what was actually used; the difference go
 With OpenRouter the price of a search is not a flat number somebody typed into a variable.
 It is built from the engine's published tariff and the result count:
 
-| Engine | Declared tariff |
-|---|---|
-| `exa` (and `auto`, for a model without built-in search) | 7 000 micros per request, 10 results included, 1 000 per further result |
-| `parallel` | 5 000 micros per request, results not metered |
-| `native` | nothing of its own — the model provider bills it in tokens |
+| Engine | Declared tariff | Confirmed by a charge? |
+|---|---|---|
+| `perplexity` (the engine this installation runs) | 5 000 micros per request, results not metered | **no — provisional** |
+| `exa` (and `auto`, for a model without built-in search) | 7 000 micros per request, 10 results included, 1 000 per further result | yes, once (see below) |
+| `parallel` | 5 000 micros per request, results not metered | no |
+| `native` | nothing of its own — the model provider bills it in tokens | n/a |
+
+Every line comes from OpenRouter's published server-tool prices. Only the Exa one has ever
+been checked against a real charge from this repository; Perplexity's is **provisional**
+until a paid call settles against it, and the interface says so in as many words rather
+than printing an unverified number as if it were an invoice.
+
+Then multiplied by `max_uses`, because that is how many searches one request may run. A
+forecast that reserved one search while permitting three would be wrong by a factor of
+three exactly when the plan is most expensive.
 
 plus a **token allowance**: the model that runs the tool reads its own results, and those
 tokens are part of the bill. That sum is what the ledger *reserves* before the call.
@@ -401,7 +440,9 @@ cd apps/web && npm test    # the interface
 |---|---|
 | `otdel-core` unit tests | configuration states (nothing set → what is missing), the allowlist's matching rules, redaction, the 1D vocabulary |
 | `otdel-search` unit tests | URL refusals (scheme, port, IP literal, credentials, CRLF), every internal IP range including IPv4-mapped IPv6, the guarded resolver, robots parsing, HTML→text, response shapes, the unconfigured adapters reaching no network |
-| `otdel-search::openrouter` unit tests | the `openrouter:web_search` request body, `auto` left unsaid and a chosen engine sent, the result clamp, citations nested and flat, an answer with no citations refused rather than reported empty, `usage.cost` read in micros under both spellings of the server-tool field, the key absent from the body |
+| `otdel-search::openrouter` unit tests | the `openrouter:web_search` request body, `engine: "perplexity"` asserted as the literal value on the wire with `max_uses`, `max_results`, `max_total_results` and `max_characters` beside it, `auto` left unsaid and a chosen engine sent, parameters omitted for an engine that does not honour them, the domain filter absent unless asked for, the result clamp, citations nested and flat, an answer with no citations refused rather than reported empty, `usage.cost` read in micros under both spellings of the server-tool field, the request id kept, an unreported engine left unknown rather than echoed, the key absent from the body |
+| `otdel-search` crate tests | the shipped Perplexity configuration builds the OpenRouter adapter and states its engine and call ceiling; the same configuration without a key has no HTTP client at all and its refusal is not chargeable |
+| `otdel-core::research_config` unit tests | `perplexity` accepted, priced flat at its own published tariff and never an Exa fallback; its 20-result ceiling against the tool's 25; a call limit distinct from a result limit, with the forecast multiplying by it; the domain filter off by default, never widening the allowlist and refused for an engine without one; the shipped `.env.example` selecting Perplexity and loading |
 | `otdel-search/tests/openrouter_smoke.rs` | one **real** call, `#[ignore]`d: run by hand to confirm the wire format against the live service |
 | `otdel-research` unit tests | query building and the partner-name refusal, prompt bounds and injection containment, every validation rule, budget arithmetic, the exact model-request count a catalogue will produce |
 | `otdel-worker` unit tests | permanent vs transient classification, pass bookkeeping |
@@ -426,7 +467,11 @@ pilot database, with `migrate` applied twice to confirm idempotency.
   a name resolving to loopback is *refused*.)
 
 **One deliberate exception, run by hand.** `crates/otdel-search/tests/openrouter_smoke.rs`
-is `#[ignore]`d and was executed once against the live service with the pilot's key:
+is `#[ignore]`d. The run recorded below was made against the live service with the pilot's
+key **on the Exa engine**, before Perplexity was implemented. The Perplexity path has **not
+yet been executed against the live service**: its wire format, bounds, tariff and labels are
+covered by unit tests over a scripted transport only, and the first paid Perplexity call is
+still outstanding acceptance work.
 
 ```
 engine=exa (configured auto, exa fallback: true), model=openai/gpt-4o-mini,
@@ -439,11 +484,19 @@ completion_tokens=Some(228) web_search_requests=Some(1)
 ```
 
 Three real links to the standard that was asked about, one search request, and a cost the
-provider stated itself. It confirms four things at once: the request shape is right, `auto`
-really does resolve to Exa for this model, `usage.cost` really is returned without being
-asked for, and the Exa tariff is what the documentation says — 7 000 of the 7 474 is the
-request, the rest is tokens. Nothing was fetched, nothing was stored, and the key appears
-in no line of that output.
+provider stated itself. It confirms four things at once **for Exa**: the request shape is
+right, `auto` really does resolve to Exa for this model, `usage.cost` really is returned
+without being asked for, and the Exa tariff is what the documentation says — 7 000 of the
+7 474 is the request, the rest is tokens. Nothing was fetched, nothing was stored, and the
+key appears in no line of that output.
+
+None of that transfers to Perplexity. A different engine is a different wire contract and a
+different price, and carrying Exa's evidence over to it is exactly the confusion F04
+recorded. What remains to be proved live, in one bounded run: that `engine: "perplexity"` is
+accepted rather than rejected or silently substituted, that the answer carries
+`url_citation` annotations in the shape this adapter parses, that `usage.cost` is present
+and lands near 5 000 micros plus tokens, that `web_search_requests` is 1 under `max_uses=1`,
+and whether the response names the engine at all.
 
 Ten defects were found and fixed — two by the suite, one by the database, and seven by an
 adversarial review of the finished code:

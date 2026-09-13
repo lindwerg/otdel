@@ -90,6 +90,9 @@ function providerOpenRouter(
       model: 'openai/gpt-4o-mini',
       max_results: 5,
       max_total_results_per_plan: 20,
+      max_uses_per_request: 1,
+      max_characters_per_result: 1_500,
+      search_domains: [],
       forecast_micros: 10_000,
       search_base_micros: 7_000,
       included_results: 10,
@@ -669,6 +672,62 @@ describe('ResearchPanel', () => {
     // And it is labelled a forecast, not an invoice.
     expect(within(engine).getByText(/Это прогноз по объявленному тарифу/)).toBeInTheDocument()
     expect(within(engine).getByText(/включая 10 результатов/)).toBeInTheDocument()
+  })
+
+  it('shows the chosen Perplexity engine as itself, with its own flat price and call limit', async () => {
+    // The configuration this installation actually runs. `perplexity` is shown without an
+    // arrow: an explicitly chosen engine resolves to itself, and the owner must not be
+    // left wondering whether something else will really serve the request.
+    install({
+      overviewBody: overview({
+        provider: providerOpenRouter({
+          configured: 'perplexity',
+          effective: 'perplexity',
+          exa_fallback: false,
+          max_results: 3,
+          max_uses_per_request: 1,
+          // 0,005 per search, flat, plus 0,003 of tokens.
+          forecast_micros: 8_000,
+          search_base_micros: 5_000,
+          extra_result_micros: 0,
+        }),
+      }),
+    })
+    renderPanel()
+
+    const engine = await screen.findByRole('region', { name: 'Поиск' })
+    expect(within(engine).getAllByText('perplexity').length).toBeGreaterThan(0)
+    expect(within(engine).queryByText(/→/)).not.toBeInTheDocument()
+    expect(within(engine).queryByText(/не умеет искать сама/)).not.toBeInTheDocument()
+    // Results and calls are two different bounds, and both are stated.
+    expect(within(engine).getByText(/Один поиск на запрос/)).toBeInTheDocument()
+    expect(
+      within(engine).getByText(/за поиск независимо от числа результатов/),
+    ).toBeInTheDocument()
+    // 0,005 за поиск + 0,003 на токены. Показывается ровно столько, сколько заложено:
+    // округление до копейки скрыло бы разницу между тарифами двух движков.
+    expect(within(engine).getByText('0,008 USD')).toBeInTheDocument()
+    expect(within(engine).getByText(/Это прогноз по объявленному тарифу/)).toBeInTheDocument()
+  })
+
+  it('names the domains when the search itself was narrowed to them', async () => {
+    install({
+      overviewBody: overview({
+        provider: providerOpenRouter({
+          configured: 'perplexity',
+          effective: 'perplexity',
+          exa_fallback: false,
+          search_domains: ['docs.cntd.ru', 'gost.ru'],
+        }),
+      }),
+    })
+    renderPanel()
+
+    const engine = await screen.findByRole('region', { name: 'Поиск' })
+    expect(within(engine).getByText(/docs\.cntd\.ru, gost\.ru/)).toBeInTheDocument()
+    expect(
+      within(engine).getByText(/список разрешённых для чтения источников действует в любом случае/),
+    ).toBeInTheDocument()
   })
 
   it('says plainly when auto had to fall back to Exa, and whose key is being spent', async () => {

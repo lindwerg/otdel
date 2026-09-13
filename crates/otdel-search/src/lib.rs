@@ -227,6 +227,66 @@ mod tests {
         );
     }
 
+    /// The configuration this installation actually ships with: OpenRouter's server tool
+    /// on the Perplexity engine.
+    fn perplexity(pairs: &[(&str, &str)]) -> ResearchSettings {
+        let mut all: Vec<(&str, &str)> = vec![
+            ("OTDEL_RESEARCH_PROVIDER", "openrouter"),
+            ("OTDEL_RESEARCH_OPENROUTER_ENGINE", "perplexity"),
+            ("OTDEL_LLM_MODEL", "openai/gpt-4o-mini"),
+            ("OTDEL_RESEARCH_ALLOWED_HOSTS", "docs.example.org"),
+        ];
+        all.extend_from_slice(pairs);
+        settings(&all)
+    }
+
+    #[test]
+    fn the_selected_perplexity_configuration_builds_the_openrouter_adapter() {
+        let provider = build_search_provider(&perplexity(&[(
+            "OTDEL_LLM_API_KEY",
+            "sk-or-v1-0123456789abcdef",
+        )]));
+        let description = provider.describe();
+
+        assert!(description.is_ready());
+        assert_eq!(description.provider, "openrouter_web_search");
+        assert_eq!(description.endpoint_host.as_deref(), Some("openrouter.ai"));
+        // The owner is told which engine will search and how many searches one request may
+        // run, before anything is spent.
+        assert!(
+            description.message.contains("движок perplexity"),
+            "{description:?}"
+        );
+        assert!(
+            description.message.contains("не больше 1 поисков"),
+            "{description:?}"
+        );
+        assert!(!format!("{description:?}").contains("sk-or-v1-"));
+    }
+
+    #[tokio::test]
+    async fn the_perplexity_configuration_without_a_key_has_no_network_at_all() {
+        // The safety property of the phase, checked on the configuration that is actually
+        // shipped: no key means an adapter with no HTTP client, not an adapter that fails
+        // on the first call after opening a socket.
+        let provider = build_search_provider(&perplexity(&[]));
+        assert_eq!(provider.describe().state, "needs_configuration");
+        assert_eq!(provider.describe().missing, vec!["OTDEL_LLM_API_KEY"]);
+
+        let error = provider
+            .search(&SearchRequest {
+                query: "толщина цинкового покрытия ГОСТ 9.307".to_owned(),
+                max_results: 3,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SearchError::NotConfigured(_)));
+        assert!(
+            !error.was_sent(),
+            "nothing left the machine, so nothing may be charged"
+        );
+    }
+
     #[test]
     fn a_disabled_researcher_stays_disabled_even_with_a_key_present() {
         let disabled = settings(&[

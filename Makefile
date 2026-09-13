@@ -13,4 +13,5 @@ check:
 # the server root is design/, not the repository root — nothing outside design/ is
 # reachable through this server.
 preview:
+	@test -f design/index.html || { echo "Prototype not present: merge design-system PR first"; exit 1; }
 	python3 -m http.server 4173 --bind 127.0.0.1 --directory design

@@ -6,9 +6,10 @@ and the recorded extraction queue. The API is exactly
 [`implementation-contract.md`](implementation-contract.md); nothing beyond it is
 implemented.
 
-**Documents are not read yet.** An uploaded file is stored, hashed and queued, and its
-status stays `queued` until the phase 1B worker exists. No text, page count or extracted
-fact is produced, and nothing in this phase pretends otherwise (`page_count` is `null`).
+**Reading documents is phase 1B**, and it now exists — see
+[`extraction-1b.md`](extraction-1b.md). Within *this* phase an uploaded file is stored,
+hashed and queued and nothing more: its status stays `queued`, `page_count` is `null`, and
+no text is produced until the worker picks it up.
 
 ## Quick start
 
@@ -42,9 +43,10 @@ regenerates them, which invalidates the database roles already created.
 |---|---|
 | `crates/otdel-core` | Domain model, configuration, validation, secrets. No I/O, fully unit-testable. |
 | `crates/otdel-storage` | `ObjectStore` trait + local filesystem backend (streaming, hashing, staging). |
-| `crates/otdel-db` | PostgreSQL: bureau-scoped transactions, partners, materials, jobs, sessions. |
+| `crates/otdel-db` | PostgreSQL: bureau-scoped transactions, partners, materials, jobs, sessions, pages. |
+| `crates/otdel-extract` | Phase 1B: PDF text layer (pure Rust), layout/tables, OCR adapters. |
 | `crates/otdel-api` | Axum router, session/CSRF, upload/download handlers, integration tests. |
-| `crates/otdel-worker` | Maintenance tasks (no extraction). |
+| `crates/otdel-worker` | Extraction pipeline (1B) + recovery maintenance. |
 | `apps/api`, `apps/worker` | Thin binaries: `otdel-api`, `otdel-worker`. |
 | `migrations/` | SQL, applied by the migration role only. |
 | `infra/postgres/initdb/` | Role and test-database creation on first container start. |
@@ -58,8 +60,9 @@ otdel-api bootstrap      # provision the configured bureau
 otdel-api hash-password  # reads a password on stdin, prints the Argon2 hash
 otdel-api check-config   # loads and validates the environment, prints it redacted
 
-otdel-worker run         # maintenance passes until stopped
-otdel-worker once        # one pass, then exit
+otdel-worker run         # extraction + maintenance until stopped
+otdel-worker once        # one pass of each, then exit
+otdel-worker probe       # report OCR/rasteriser availability, then exit
 ```
 
 ## Security decisions worth knowing
@@ -109,10 +112,10 @@ maintenance worker reports such orphans for the same reason instead of collectin
 
 ## Maintenance worker
 
-Phase 1A maintenance only: expired/idle sessions are purged, jobs whose lease expired go
-back to `queued` (or `failed` at the attempt limit), staging files from interrupted
-uploads are swept, and orphan objects are counted and logged. It does not touch the
-extraction queue's work — that is 1B.
+The recovery half of `otdel-worker`: expired/idle sessions are purged, jobs whose lease
+expired go back to `queued` (or `failed` at the attempt limit), staging files from
+interrupted uploads are swept, and orphan objects are counted and logged. The extraction
+half that consumes the queue is documented in [`extraction-1b.md`](extraction-1b.md).
 
 ## Tests
 
@@ -166,7 +169,9 @@ nothing else depends on it. There is a regression test for repeated application.
 
 Migrations `0001`/`0002` have been applied to the pilot database with real data. They are
 frozen: further schema changes go into new migration files, and recorded checksums are
-never rewritten.
+never rewritten. Phase 1B adds `0003_extraction.sql` (pages, source regions, table cells,
+plus the extraction bookkeeping columns) as a separate, additive file for exactly that
+reason.
 
 ## pgvector
 

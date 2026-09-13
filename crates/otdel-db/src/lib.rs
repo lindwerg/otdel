@@ -13,7 +13,10 @@
 
 pub mod error;
 pub mod jobs;
+pub mod knowledge;
+pub mod knowledge_read;
 pub mod materials;
+pub mod pages;
 pub mod partners;
 pub mod sessions;
 pub mod tenancy;
@@ -38,6 +41,26 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations"
 /// `_sqlx_migrations` bookkeeping table in one predictable schema (`public`) instead of
 /// following whatever default the role happens to have — see [`run_migrations`].
 const MIGRATION_SEARCH_PATH: &str = "public";
+
+/// Tenant tables whose row-level security is verified before the server serves a
+/// request. Grows with the schema: 1A intake, 1B page evidence, 1C product draft.
+const TENANT_TABLES: [&str; 15] = [
+    "partners",
+    "materials",
+    "jobs",
+    "material_pages",
+    "page_regions",
+    "table_cells",
+    "knowledge_runs",
+    "product_categories",
+    "products",
+    "knowledge_facts",
+    "knowledge_evidence",
+    "glossary_terms",
+    "knowledge_qa",
+    "knowledge_gaps",
+    "knowledge_questions",
+];
 
 #[derive(Debug, Clone)]
 pub struct Database {
@@ -88,7 +111,16 @@ impl Database {
     /// *me* on this table right now”, covering both privileges and `FORCE ROW LEVEL
     /// SECURITY`.
     pub async fn verify_runtime_role(&self) -> DbResult<()> {
-        let row = sqlx::query(
+        // Every tenant table, checked by name. A table added by a later migration that
+        // is not listed here would be isolated by its policy but unverified at startup,
+        // so the list grows with the schema.
+        let checks: String = TENANT_TABLES
+            .iter()
+            .enumerate()
+            .map(|(index, table)| format!(", row_security_active('otdel.{table}') AS rls_{index}"))
+            .collect();
+
+        let row = sqlx::query(&format!(
             "SELECT current_user AS role_name, \
                     r.rolsuper AS is_superuser, \
                     r.rolbypassrls AS bypasses_rls, \
@@ -99,52 +131,46 @@ impl Database {
                           JOIN pg_namespace n ON n.oid = c.relnamespace \
                          WHERE n.nspname = 'otdel' AND c.relkind = 'r' AND c.relowner = r.oid \
                     ) AS owns_tables, \
-                    row_security_active('otdel.partners') AS rls_partners, \
-                    row_security_active('otdel.materials') AS rls_materials, \
-                    row_security_active('otdel.jobs') AS rls_jobs, \
                     has_table_privilege(current_user, 'otdel.sessions', 'SELECT') AS reads_sessions \
-               FROM pg_roles r WHERE r.rolname = current_user",
-        )
+                    {checks} \
+               FROM pg_roles r WHERE r.rolname = current_user"
+        ))
         .fetch_one(&self.pool)
         .await?;
 
         let role_name: String = row.try_get("role_name")?;
-        let mut problems: Vec<&str> = Vec::new();
-        if row.try_get::<bool, _>("is_superuser")? {
-            problems.push("the role is SUPERUSER");
-        }
-        if row.try_get::<bool, _>("bypasses_rls")? {
-            problems.push("the role has BYPASSRLS");
-        }
-        if row.try_get::<bool, _>("can_create_role")? {
-            problems.push("the role has CREATEROLE");
-        }
-        if row.try_get::<bool, _>("can_create_db")? {
-            problems.push("the role has CREATEDB");
-        }
-        if row.try_get::<bool, _>("owns_tables")? {
-            problems.push("the role owns tables in the otdel schema");
-        }
-        if row.try_get::<bool, _>("reads_sessions")? {
-            problems.push("the role can read otdel.sessions directly");
-        }
-        for (column, table) in [
-            ("rls_partners", "otdel.partners"),
-            ("rls_materials", "otdel.materials"),
-            ("rls_jobs", "otdel.jobs"),
+        let mut problems: Vec<String> = Vec::new();
+        for (column, problem) in [
+            ("is_superuser", "the role is SUPERUSER"),
+            ("bypasses_rls", "the role has BYPASSRLS"),
+            ("can_create_role", "the role has CREATEROLE"),
+            ("can_create_db", "the role has CREATEDB"),
+            ("owns_tables", "the role owns tables in the otdel schema"),
+            (
+                "reads_sessions",
+                "the role can read otdel.sessions directly",
+            ),
         ] {
-            if !row.try_get::<bool, _>(column)? {
-                problems.push(match table {
-                    "otdel.partners" => "row-level security is not applied on otdel.partners",
-                    "otdel.materials" => "row-level security is not applied on otdel.materials",
-                    _ => "row-level security is not applied on otdel.jobs",
-                });
+            if row.try_get::<bool, _>(column)? {
+                problems.push(problem.to_owned());
+            }
+        }
+
+        // Every tenant table, including the 1B evidence tables and the 1C draft: a
+        // quoted fragment of a catalogue is partner data exactly as much as the
+        // original file is.
+        for (index, table) in TENANT_TABLES.iter().enumerate() {
+            if !row.try_get::<bool, _>(format!("rls_{index}").as_str())? {
+                problems.push(format!(
+                    "row-level security is not applied on otdel.{table}"
+                ));
             }
         }
 
         if problems.is_empty() {
             tracing::info!(
                 database_role = %role_name,
+                tables_checked = TENANT_TABLES.len(),
                 "runtime database role verified: row-level security applies to it"
             );
             return Ok(());
@@ -152,7 +178,7 @@ impl Database {
 
         Err(DbError::UnsafeRuntimeRole {
             role: role_name,
-            problems: problems.iter().map(|p| (*p).to_owned()).collect(),
+            problems,
         })
     }
 

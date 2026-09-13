@@ -27,7 +27,10 @@ use otdel_api::state::AppState;
 use otdel_core::config::Config;
 use otdel_core::secret;
 use otdel_db::Database;
+use otdel_extract::{OcrEngine, PageProcessor, PageRasteriser, ToolAvailability};
+use otdel_llm::LlmProvider;
 use otdel_storage::{FilesystemObjectStore, ObjectStore};
+use otdel_worker::{Extractor, KnowledgeWorker, ToolReport};
 use serde_json::Value;
 use sqlx::{Executor, PgPool};
 use tower::ServiceExt;
@@ -521,5 +524,126 @@ fn test_config(runtime_url: &str, bureau_slug: &str, storage_root: &std::path::P
     );
     // Small limit so the “too large” test does not have to stream 25 MiB.
     source.insert("OTDEL_MAX_UPLOAD_BYTES".to_owned(), "4096".to_owned());
+    // Recognition is off by default in tests **on purpose**: the suite must produce the
+    // same result on a machine with Tesseract installed and on one without. The tests
+    // that exercise a working engine install a fake one explicitly
+    // (`TestApp::extractor_with`), which is also the only way any of them can produce
+    // recognised text.
+    source.insert("OTDEL_OCR_ENABLED".to_owned(), "false".to_owned());
     Config::load(&source).expect("test configuration")
+}
+
+// --- phase 1B: driving the real worker ------------------------------------------------
+
+impl TestApp {
+    /// An extractor that models a machine where recognition is **switched on but not
+    /// installed** — the situation the "a scan is not reported as read" checks are about.
+    ///
+    /// Recognition is enabled in the configuration (so nothing is skipped for the wrong
+    /// reason) while both tools probe as missing, and the adapters themselves are the
+    /// [`otdel_extract::Disabled`] ones, so there is no path that could return text even
+    /// if the permission logic were wrong.
+    pub fn extractor(&self) -> Extractor {
+        let mut config = (*self.state.config).clone();
+        config.extraction.ocr.enabled = true;
+
+        let processor = Arc::new(PageProcessor::new(
+            Arc::new(otdel_extract::Disabled::new(
+                "tesseract",
+                "исполняемый файл `tesseract` не найден",
+            )),
+            Arc::new(otdel_extract::Disabled::new(
+                "pdftoppm",
+                "исполняемый файл `pdftoppm` не найден",
+            )),
+        ));
+
+        Extractor::new(
+            Arc::new(config),
+            self.state.db.clone(),
+            Arc::clone(&self.state.store),
+            processor,
+            ToolReport {
+                engine: ToolAvailability::Unavailable {
+                    reason: "исполняемый файл `tesseract` не найден".to_owned(),
+                },
+                rasteriser: ToolAvailability::Unavailable {
+                    reason: "исполняемый файл `pdftoppm` не найден".to_owned(),
+                },
+            },
+        )
+    }
+
+    /// An extractor with the supplied adapters, used by the tests that need a working
+    /// engine without depending on one being installed.
+    pub fn extractor_with(
+        &self,
+        engine: Arc<dyn OcrEngine>,
+        rasteriser: Arc<dyn PageRasteriser>,
+    ) -> Extractor {
+        let mut config = (*self.state.config).clone();
+        config.extraction.ocr.enabled = true;
+        let engine_version = "fake-engine 1.0".to_owned();
+
+        Extractor::new(
+            Arc::new(config),
+            self.state.db.clone(),
+            Arc::clone(&self.state.store),
+            Arc::new(PageProcessor::new(engine, rasteriser)),
+            ToolReport {
+                engine: ToolAvailability::Available {
+                    version: engine_version.clone(),
+                },
+                rasteriser: ToolAvailability::Available {
+                    version: engine_version,
+                },
+            },
+        )
+    }
+
+    /// Drain the queue once, the way `otdel-worker once` does.
+    pub async fn run_worker(&self, extractor: &Extractor) -> otdel_worker::ExtractionReport {
+        extractor
+            .run_pass(self.bureau_id, 16)
+            .await
+            .expect("the extraction pass must not fail as a whole")
+    }
+}
+
+// --- phase 1C: driving the product role -----------------------------------------------
+
+impl TestApp {
+    /// An application whose model adapter is the supplied one.
+    ///
+    /// The configuration of a test has no key, so the adapter built from it refuses
+    /// every call — which is exactly what the "no key" checks want, and exactly what
+    /// the positive checks cannot use. Those pass a scripted provider here; no test
+    /// ever reaches a network.
+    pub async fn start_with_provider(provider: Arc<dyn LlmProvider>) -> Self {
+        let app = Self::start().await;
+        let state = app.state.clone().with_provider(provider);
+        let router = otdel_api::app(state.clone());
+        Self {
+            router,
+            state,
+            ..app
+        }
+    }
+
+    /// The phase 1C worker, with the supplied provider.
+    pub fn knowledge_worker(&self, provider: Arc<dyn LlmProvider>) -> KnowledgeWorker {
+        KnowledgeWorker::new(
+            Arc::clone(&self.state.config),
+            self.state.db.clone(),
+            provider,
+        )
+    }
+
+    /// One understanding pass, the way `otdel-worker once` does it.
+    pub async fn run_knowledge(&self, worker: &KnowledgeWorker) -> otdel_worker::KnowledgeReport {
+        worker
+            .run_pass(self.bureau_id, 8)
+            .await
+            .expect("the understanding pass must not fail as a whole")
+    }
 }

@@ -5,14 +5,23 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Maintenance tasks for OTDEL: session purge, job lease recovery, storage staging sweep and orphan reporting."
+description = "OTDEL background worker: document extraction (phase 1B) plus session purge, job lease recovery, storage staging sweep and orphan reporting."
 
 [dependencies]
 otdel-core.workspace = true
 otdel-db.workspace = true
+otdel-extract.workspace = true
+otdel-knowledge.workspace = true
+otdel-llm.workspace = true
 otdel-storage.workspace = true
 
+futures-util.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+otdel-extract = { workspace = true, features = ["fixtures"] }
+sqlx.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,23 @@
+# Credentials and private runtime data
+.env
+.env.*
+!.env.example
+.local/
+data/
+materials/
+private/
+docs/worker-runs/
+*.pdf
+*.zip
+*.pem
+*.key
+# Generated files
+node_modules/
+target/
+dist/
+coverage/
+test-results/
+playwright-report/
+__pycache__/
+.DS_Store
+.worktrees/

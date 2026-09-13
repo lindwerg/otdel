@@ -1,87 +1,39 @@
 # OTDEL
 
-> Status: **design/prototype planning stage** (2026-09-13). This is not a
-> running application yet. There is no Rust workspace, no web app scaffold,
-> and no Docker services in this repository yet. Nothing below should be read
-> as "it's built" — it describes what exists and what is planned, honestly.
+Система агентского бюро. Первый блок превращает материалы партнёра в проверяемую продуктовую базу знаний: источники → извлечение → продуктолог → исследование → проверка → автоматическая публикация.
 
-OTDEL is planned as a system that turns a partner's raw materials (catalogs,
-presentations, spec sheets) into a verified, versioned product knowledge base:
-ingestion → structure extraction → drafting → limited industry research →
-verification → automatic publication of a knowledge version, with sources and
-gaps tracked throughout. The current specification for the first block
-("partner and product knowledge base") is in
-[docs/block-01-spec.md](docs/block-01-spec.md); background and the initial
-scoping decisions are in [docs/project-start.md](docs/project-start.md).
+**Сейчас готовы план, дизайн-прототип и система разработки.** Рабочий backend, загрузка/обработка PDF и вызовы моделей ещё не реализованы. Их строим последовательно по этапам 1A–1F.
 
-Planned target: public repository at
-[github.com/lindwerg/otdel](https://github.com/lindwerg/otdel).
+## Посмотреть и проверить
 
-## Planned stack (not yet scaffolded)
-
-- **Backend**: Rust (proposed: Tokio, Axum, SQLx), running as a server and
-  background worker process from one codebase.
-- **Database**: PostgreSQL, with the pgvector extension (in the same
-  database, not a separate store) for semantic search.
-- **Web**: eventually TypeScript/React; not started.
-- **Files**: an S3-compatible store for original documents and derived pages
-  (planned; not configured today).
-
-These are engineering choices from the spec, not commitments about specific
-crate/library versions — see [docs/block-01-spec.md](docs/block-01-spec.md)
-§3 and §14 for what is still an open decision and why no Docker services or
-provider credentials exist yet.
-
-## What actually exists in this repository today
-
-- `docs/` — product/process specs and planning notes (`block-01-spec.md`,
-  `project-start.md`, `development.md`, plus this-session's worker/config
-  notes). `docs/block-01-plan.md` and `docs/block-01-design.md` are owned by
-  other parallel work; this worktree/branch may simply not be synced yet, so
-  their absence here is not permanent. Links to
-  them will only work once they land.
-- `design/` — a static, standalone HTML/CSS/JS prototype of the interface
-  (developed as a separate, parallel task) plus the Otto mascot assets; see
-  [design/ASSET-PROVENANCE.md](design/ASSET-PROVENANCE.md). It is a visual
-  prototype only — it is not wired to any backend.
-- Repository/process tooling owned by this task: `Makefile`, `scripts/`,
-  `.github/`, `.editorconfig`, `.env.example`, `CONTRIBUTING.md`, this
-  `README.md`.
-
-## Quick start
+Требуются Git, Node.js 22+ и Python 3.
 
 ```sh
-make check    # repository hygiene checks — Node.js >= 22, no install needed
-make preview  # serve design/ only, at http://127.0.0.1:4173
+make check
+make preview
 ```
 
-`make check` runs `scripts/check.mjs`: tracked-file hygiene (no committed
-`.env`/private data/PDFs/ZIPs/keys, no obvious credential patterns, no
-unresolved merge conflicts), JSON/JS syntax validation, `git diff --check`,
-and minimal presence/shape checks for the core docs. It is a lightweight
-hygiene check for this stage, not a linter or test runner, and it does not
-claim to be an exhaustive secret scanner. Full details:
-[docs/development.md](docs/development.md).
+Макет открывается на [localhost:4173](http://127.0.0.1:4173). В нём можно переключать состояния, открывать источники, создавать временный черновик и выбирать имена файлов. Данные демонстрационные, живут только в памяти вкладки; настоящей загрузки и обработки нет.
 
-`make preview` serves **only** the `design/` directory (nothing else in the
-repository) on `127.0.0.1:4173` using Python's standard `http.server`, so
-nothing is exposed beyond that one directory or beyond the local machine.
+`make preview` обслуживает каталог `design/` на localhost; если макет ещё не получен, команда объяснит причину. `make check` проверяет отслеживаемые файлы, JS/JSON и гигиену репозитория. Перед проверкой новых файлов их нужно добавить в индекс Git. Эта проверка не заменяет тесты будущего приложения или исчерпывающий поиск секретов.
 
-## Contributing
+## План и дизайн
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the mechanics and
-[docs/development.md](docs/development.md) for the full workflow: branching
-and worktrees, review/CI expectations for a protected `main`, and how
-secrets/private data (BASIS catalogs, company datasets) are kept out of the
-repository.
+- [Спецификация блока 1](docs/block-01-spec.md).
+- [Последовательный план 1A–1F и финальная приёмка](docs/block-01-plan.md).
+- [Дизайн-контракт, экраны и состояния](docs/block-01-design.md).
+- [Машиночитаемый профиль дизайна](design/design-dna.json).
+- [Исходные изображения Отто и происхождение стиля](design/ASSET-PROVENANCE.md).
+- [Отчёт проверки подготовки](docs/p0-verification.md).
 
-## Specs and planning docs
+Технологическая основа: Rust для API и worker; PostgreSQL + pgvector; React/TypeScript для интерфейса; S3-совместимое хранилище оригиналов. Конкретные версии и провайдеры фиксируются при реализации. Дизайн: графит, тёплое золото, Manrope и оригинальный красный Отто из предоставленного владельцем Otdel.
 
-- [docs/block-01-spec.md](docs/block-01-spec.md) — current specification for
-  block 1 (partner & product knowledge base).
-- [docs/project-start.md](docs/project-start.md) — initial scoping decisions
-  and material review notes.
-- [docs/development.md](docs/development.md) — day-to-day development
-  workflow for this repository.
-- `docs/block-01-plan.md` and `docs/block-01-design.md` — owned by other
-  parallel work; may not be present in this worktree/branch until synced.
+## Разработка
+
+[Репозиторий](https://github.com/lindwerg/otdel) · [задачи блока 1](https://github.com/lindwerg/otdel/milestone/1) · [правила разработки](docs/development.md) · [участие](CONTRIBUTING.md).
+
+ASTRA определяет задачу и принимает результат; Claude реализует её в собственной ветке/worktree. Каждая задача проходит diff-review, соответствующие тесты и PR. `main` защищён обязательным `repository-check`, актуальной базой, разрешением обсуждений и запретом force-push/удаления.
+
+Проверка стадии прототипа остановит PR с новым Cargo/package-манифестом: в этом же PR необходимо подключить реальные build/lint/test и заменить временный guard. Зелёный CI сегодня не означает, что Rust-приложение протестировано.
+
+Реальные материалы BASIS, архивы компаний, письма, локальная карта исходников и ключи остаются вне публичного репозитория. `.env.example` содержит только примеры для будущих адаптеров. Для просмотра макета ключи не нужны.

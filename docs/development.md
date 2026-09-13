@@ -118,10 +118,10 @@ It performs:
    (`docs/block-01-design.md`, `docs/block-01-plan.md`) are validated only if
    present in the current checkout — a worktree/branch that hasn't synced
    with `main` yet simply won't have them, which is not itself a failure.
-10. Manifest-vs-CI enforcement gate: **fails** if `Cargo.toml`,
-    `package.json`, or `apps/web/package.json` exists but
-    `.github/workflows/ci.yml` doesn't yet contain the matching real
-    build/lint/test commands — see the CI section below.
+10. Prototype-stage guard: **fails unconditionally** when `Cargo.toml`,
+    `package.json`, or `apps/web/package.json` appears. The PR introducing
+    the application must replace that temporary guard and add real
+    build/lint/test jobs. The checker does not infer job execution from YAML text.
 
 `make check` does **not** run Rust or web application tests, because no such
 code/manifests exist yet. See the CI section below for how that changes.
@@ -131,8 +131,7 @@ code/manifests exist yet. See the CI section below for how that changes.
 `make preview` runs `python3 -m http.server 4173 --bind 127.0.0.1 --directory
 design`. This serves **only** the contents of `design/` (the static
 prototype: `index.html`, `prototype.js`/`prototype.css`, `assets/`), bound to
-`127.0.0.1` (localhost only, never `0.0.0.0`), so nothing outside `design/`
-and nothing beyond the local machine is exposed by this command.
+`127.0.0.1` (localhost only, never `0.0.0.0`), serving that directory on localhost. Do not add symlinks to private files; tracked symlinks are rejected by `make check`.
 
 ## CI
 

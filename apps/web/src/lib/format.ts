@@ -1,4 +1,16 @@
-import type { MaterialStatus } from '../api/types'
+import type {
+  ExtractionSummary,
+  FactKind,
+  KnowledgeFact,
+  KnowledgeRunStatus,
+  MaterialStatus,
+  PageStatus,
+  QueryOutcome,
+  QuestionAudience,
+  ResearchPlanStatus,
+  SourceStatus,
+  TextSource,
+} from '../api/types'
 
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return '—'
@@ -47,13 +59,13 @@ const MATERIAL_STATUS: Record<MaterialStatus, StatusPresentation> = {
     tone: 'progress',
   },
   completed: {
-    label: 'Готово',
-    defaultHint: 'Обработка завершена.',
+    label: 'Прочитано',
+    defaultHint: 'Все страницы обработаны.',
     tone: 'success',
   },
   partial: {
-    label: 'Частично готово',
-    defaultHint: 'Часть страниц не удалось обработать.',
+    label: 'Прочитано частично',
+    defaultHint: 'Часть страниц не удалось прочитать.',
     tone: 'warn',
   },
   failed: {
@@ -78,4 +90,370 @@ export function materialStatusPresentation(status: MaterialStatus): StatusPresen
   )
 }
 
-export const RETRYABLE_MATERIAL_STATUSES: MaterialStatus[] = ['failed', 'partial', 'quarantined']
+/**
+ * Statuses the server actually accepts for a material retry.
+ *
+ * `quarantined` is deliberately absent: the backend refuses it (the content
+ * itself was rejected, so repeating cannot change the outcome), and offering a
+ * button that can only ever fail is worse than offering none.
+ */
+export const RETRYABLE_MATERIAL_STATUSES: MaterialStatus[] = ['failed', 'partial']
+
+// --- Phase 1B: pages -------------------------------------------------------
+
+/**
+ * Per-page labels. Wording matters here more than anywhere else in the app:
+ * `needs_ocr` must not read as a failure of the document and must never read as
+ * success, and `empty` is reserved for a page that genuinely holds nothing.
+ */
+const PAGE_STATUS: Record<PageStatus, StatusPresentation> = {
+  pending: {
+    label: 'Ожидает чтения',
+    defaultHint: 'Страница учтена, но ещё не прочитана.',
+    tone: 'neutral',
+  },
+  extracted: {
+    label: 'Прочитана',
+    defaultHint: 'Содержимое страницы извлечено.',
+    tone: 'success',
+  },
+  empty: {
+    label: 'Пустая',
+    defaultHint: 'На странице нет ни текста, ни изображений.',
+    tone: 'neutral',
+  },
+  needs_ocr: {
+    label: 'Нужно распознавание',
+    defaultHint: 'Текстового слоя нет; распознавание не выполнено.',
+    tone: 'warn',
+  },
+  partial: {
+    label: 'Прочитана частично',
+    defaultHint: 'Часть содержимого страницы осталась непрочитанной.',
+    tone: 'warn',
+  },
+  failed: {
+    label: 'Ошибка чтения',
+    defaultHint: 'Страницу не удалось прочитать.',
+    tone: 'error',
+  },
+}
+
+export function pageStatusPresentation(status: PageStatus): StatusPresentation {
+  return PAGE_STATUS[status] ?? { label: status, defaultHint: '', tone: 'neutral' }
+}
+
+/** Page statuses the server accepts for a single-page retry. */
+export const RETRYABLE_PAGE_STATUSES: PageStatus[] = [
+  'pending',
+  'needs_ocr',
+  'partial',
+  'failed',
+]
+
+const TEXT_SOURCE_LABEL: Record<TextSource, string> = {
+  none: 'текст не получен',
+  text_layer: 'из текстового слоя',
+  ocr: 'распознаванием',
+}
+
+export function textSourceLabel(source: TextSource): string {
+  return TEXT_SOURCE_LABEL[source] ?? source
+}
+
+/**
+ * Counts of page outcomes, as a plain sentence.
+ *
+ * Deliberately counts rather than a percentage: a share of pages read is not a
+ * measure of how much of the document is understood, and a progress bar with an
+ * invented estimate is exactly what docs/block-01-spec.md §11 forbids.
+ */
+export function extractionCountsLine(summary: ExtractionSummary): string {
+  const parts: string[] = []
+  const add = (count: number, label: string) => {
+    if (count > 0) parts.push(`${count} ${label}`)
+  }
+  add(summary.pages_extracted, 'прочитано')
+  add(summary.pages_partial, 'частично')
+  add(summary.pages_needs_ocr, 'ждут распознавания')
+  add(summary.pages_empty, 'пустых')
+  add(summary.pages_failed, 'с ошибкой')
+  add(summary.pages_pending, 'в очереди')
+
+  if (parts.length === 0) {
+    return `Страниц: ${summary.pages_total}. Ни одна ещё не прочитана.`
+  }
+  return `Страниц: ${summary.pages_total} — ${parts.join(', ')}.`
+}
+
+/**
+ * Which tools produced this result. Returns `null` when nothing is recorded, so
+ * the interface stays silent rather than claiming an engine that never ran.
+ */
+export function extractionToolsLine(summary: ExtractionSummary): string | null {
+  const parts: string[] = []
+  if (summary.parser_name) {
+    parts.push(`разбор: ${summary.parser_name} ${summary.parser_version ?? ''}`.trim())
+  }
+  if (summary.ocr_engine) {
+    parts.push(`распознавание: ${summary.ocr_version ?? summary.ocr_engine}`)
+  }
+  return parts.length > 0 ? parts.join(' · ') : null
+}
+
+// --- Phase 1C: the product draft -------------------------------------------
+
+/**
+ * Labels for an understanding run.
+ *
+ * `needs_provider` is deliberately not an error: nothing failed, the model
+ * adapter simply has not been configured yet. Calling it "ошибка" would send
+ * the owner looking for a problem in the material.
+ */
+const RUN_STATUS: Record<KnowledgeRunStatus, StatusPresentation> = {
+  queued: {
+    label: 'В очереди на разбор',
+    defaultHint: 'Материал прочитан и ждёт продуктолога.',
+    tone: 'neutral',
+  },
+  running: {
+    label: 'Разбирается',
+    defaultHint: 'Продуктолог читает страницы материала.',
+    tone: 'progress',
+  },
+  completed: {
+    label: 'Разобран',
+    defaultHint: 'Все предложения модели подтверждены источником.',
+    tone: 'success',
+  },
+  partial: {
+    label: 'Разобран частично',
+    defaultHint: 'Часть предложений модели отклонена — причины ниже.',
+    tone: 'warn',
+  },
+  failed: {
+    label: 'Разбор не выполнен',
+    defaultHint: 'Черновик не создан.',
+    tone: 'error',
+  },
+  needs_provider: {
+    label: 'Ожидает настройки модели',
+    defaultHint: 'Ключ провайдера не задан: обращений к модели не было.',
+    tone: 'warn',
+  },
+}
+
+export function runStatusPresentation(status: KnowledgeRunStatus): StatusPresentation {
+  return RUN_STATUS[status] ?? { label: status, defaultHint: '', tone: 'neutral' }
+}
+
+const FACT_KIND_LABEL: Record<FactKind, string> = {
+  characteristic: 'характеристика',
+  limitation: 'ограничение',
+  application: 'применение',
+  commercial: 'коммерческое условие',
+}
+
+export function factKindLabel(kind: FactKind): string {
+  return FACT_KIND_LABEL[kind] ?? kind
+}
+
+const AUDIENCE_LABEL: Record<QuestionAudience, string> = {
+  partner: 'вопрос партнёру',
+  industry: 'вопрос для отраслевого исследования',
+}
+
+export function questionAudienceLabel(audience: QuestionAudience): string {
+  return AUDIENCE_LABEL[audience] ?? audience
+}
+
+/**
+ * The value with its unit, exactly as recorded.
+ *
+ * The unit is appended only when the server stored one — it does that only when
+ * the unit is literally written in the source — so a bare number stays a bare
+ * number instead of acquiring a plausible unit here.
+ */
+export function factValueLine(fact: KnowledgeFact): string {
+  return fact.unit ? `${fact.value_text} ${fact.unit}` : fact.value_text
+}
+
+/** Where a quotation comes from, as a sentence: «каталог.pdf, стр. 3». */
+export function evidenceSourceLine(filename: string, pageNumber: number): string {
+  return `${filename}, стр. ${pageNumber}`
+}
+
+// --- Phase 1D: bounded industry research -----------------------------------
+
+/**
+ * Labels for a research plan.
+ *
+ * Three of these are deliberately not errors. `needs_provider` means nothing is
+ * configured — no request was made and no money was reserved. `budget_exhausted`
+ * means the run stopped where it was told to stop, which is the feature working.
+ * `cancelled` means the owner pressed stop. Calling any of them "ошибка" would
+ * send somebody looking for a problem that is not there.
+ */
+const PLAN_STATUS: Record<ResearchPlanStatus, StatusPresentation> = {
+  queued: {
+    label: 'В очереди на исследование',
+    defaultHint: 'Вопрос утверждён и ждёт исследователя.',
+    tone: 'neutral',
+  },
+  running: {
+    label: 'Исследуется',
+    defaultHint: 'Исследователь ищет и читает источники.',
+    tone: 'progress',
+  },
+  completed: {
+    label: 'Исследовано',
+    defaultHint: 'Все найденные источники прочитаны, выводы подтверждены цитатами.',
+    tone: 'success',
+  },
+  partial: {
+    label: 'Исследовано частично',
+    defaultHint: 'Часть источников не прочитана или часть выводов отклонена — причины ниже.',
+    tone: 'warn',
+  },
+  failed: {
+    label: 'Исследование не выполнено',
+    defaultHint: 'Выводы не получены.',
+    tone: 'error',
+  },
+  needs_provider: {
+    label: 'Ожидает настройки исследователя',
+    defaultHint: 'Поиск не настроен: внешних запросов не было, бюджет не расходовался.',
+    tone: 'warn',
+  },
+  budget_exhausted: {
+    label: 'Остановлено по бюджету',
+    defaultHint: 'Деньги на исследования закончились; работа остановлена, а не продолжена.',
+    tone: 'warn',
+  },
+  cancelled: {
+    label: 'Остановлено владельцем',
+    defaultHint: 'Исследование прервано по вашей команде.',
+    tone: 'neutral',
+  },
+}
+
+export function planStatusPresentation(status: ResearchPlanStatus): StatusPresentation {
+  return PLAN_STATUS[status] ?? { label: status, defaultHint: '', tone: 'neutral' }
+}
+
+/**
+ * What became of one discovered URL.
+ *
+ * Every value except `fetched` means *no content was obtained*, and each names a
+ * different reason. A journal that said only "не прочитано" would be useless,
+ * and one that silently dropped the row would make the search look empty.
+ */
+const SOURCE_STATUS: Record<SourceStatus, StatusPresentation> = {
+  discovered: {
+    label: 'Найдено, не читалось',
+    defaultHint: 'Ссылка получена от поиска; страница ещё не загружалась.',
+    tone: 'neutral',
+  },
+  skipped_host: {
+    label: 'Хост не разрешён',
+    defaultHint: 'Этот сайт не входит в список разрешённых источников.',
+    tone: 'neutral',
+  },
+  skipped_robots: {
+    label: 'Запрещено robots.txt',
+    defaultHint: 'Сайт просит не читать эту страницу автоматически.',
+    tone: 'neutral',
+  },
+  skipped_limit: {
+    label: 'Не вошло в лимит',
+    defaultHint: 'Предел страниц, времени или бюджета исчерпан до этой ссылки.',
+    tone: 'warn',
+  },
+  skipped_type: {
+    label: 'Формат не читается',
+    defaultHint: 'На этом этапе читаются только HTML и текст.',
+    tone: 'neutral',
+  },
+  fetched: {
+    label: 'Прочитано',
+    defaultHint: 'Страница загружена; сохранены снимок текста и хеш содержимого.',
+    tone: 'success',
+  },
+  failed: {
+    label: 'Ошибка загрузки',
+    defaultHint: 'Страницу не удалось прочитать.',
+    tone: 'error',
+  },
+}
+
+export function sourceStatusPresentation(status: SourceStatus): StatusPresentation {
+  return SOURCE_STATUS[status] ?? { label: status, defaultHint: '', tone: 'neutral' }
+}
+
+const QUERY_OUTCOME_LABEL: Record<QueryOutcome, string> = {
+  ok: 'выполнен',
+  failed: 'ошибка провайдера',
+  // Sent, no answer: charged anyway, because the provider may well have billed it.
+  unknown: 'исход неизвестен — требуется сверка расхода',
+  refused: 'не отправлялся',
+}
+
+export function queryOutcomeLabel(outcome: QueryOutcome): string {
+  return QUERY_OUTCOME_LABEL[outcome] ?? outcome
+}
+
+const SEARCH_ADAPTER_LABEL: Record<string, string> = {
+  openrouter_web_search: 'OpenRouter web search',
+  http_json: 'внешний поиск',
+  fake: 'тестовый поиск',
+}
+
+/**
+ * The provider string of a journalled query, as a person reads it.
+ *
+ * The worker writes `adapter/engine` (`openrouter_web_search/exa`) when it knows
+ * which engine served the call, and the bare adapter when nothing ran. The engine
+ * is kept visible rather than folded into the adapter name, because with `auto`
+ * the two are different answers and the price follows the engine.
+ */
+export function searchProviderLabel(provider: string): string {
+  const [adapter, engine] = provider.split('/', 2)
+  const name = SEARCH_ADAPTER_LABEL[adapter] ?? adapter
+  return engine ? `${name} · ${engine}` : name
+}
+
+/**
+ * An amount of research money, as a person reads it: `0,005 USD`.
+ *
+ * Amounts are integers — millionths of a currency unit — everywhere, and are
+ * never converted between currencies. Trailing zeros of the fraction carry no
+ * information and are dropped, so a whole number stays a whole number.
+ */
+export function formatMicros(micros: number, currency: string): string {
+  if (!Number.isFinite(micros)) return `— ${currency}`
+  const negative = micros < 0
+  const absolute = Math.abs(Math.trunc(micros))
+  const units = Math.floor(absolute / 1_000_000)
+  const fraction = absolute % 1_000_000
+
+  const rendered =
+    fraction === 0
+      ? String(units)
+      : `${units},${String(fraction).padStart(6, '0').replace(/0+$/, '')}`
+  return `${negative ? '-' : ''}${rendered} ${currency}`
+}
+
+/** Bytes downloaded, as a sentence. Reuses the upload formatter's units. */
+export function formatFetchedBytes(bytes: number): string {
+  return formatBytes(bytes)
+}
+
+/** Pages whose outcome the owner may still be able to change. */
+export function pagesNeedingAttention(summary: ExtractionSummary): number {
+  return (
+    summary.pages_needs_ocr +
+    summary.pages_partial +
+    summary.pages_failed +
+    summary.pages_pending
+  )
+}

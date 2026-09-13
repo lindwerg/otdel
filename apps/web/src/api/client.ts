@@ -1,9 +1,25 @@
 import type {
   ApiErrorBody,
+  GlossaryTerm,
   Job,
+  KnowledgeGap,
+  KnowledgeOverview,
+  KnowledgeRun,
   ListResponse,
   Material,
+  MaterialPage,
+  PageDetail,
   Partner,
+  ProductNode,
+  ProviderState,
+  QaEntry,
+  ResearchBudget,
+  ResearchFinding,
+  ResearchOverview,
+  ResearchPlan,
+  ResearchProviderState,
+  ResearchQueryRecord,
+  ResearchSource,
   SessionResponse,
 } from './types'
 
@@ -173,8 +189,207 @@ export function retryMaterial(
   )
 }
 
-export function originalMaterialUrl(partnerId: string, materialId: string): string {
-  return `/api/partners/${encodeURIComponent(partnerId)}/materials/${encodeURIComponent(materialId)}/original`
+export function getMaterial(partnerId: string, materialId: string): Promise<Material> {
+  return apiRequest<Material>(
+    `/partners/${encodeURIComponent(partnerId)}/materials/${encodeURIComponent(materialId)}`,
+  )
+}
+
+/**
+ * Authorised download of the stored original.
+ *
+ * `page` appends the standard PDF open parameter (`#page=N`), which browser and
+ * desktop viewers honour. It is a real link into the source document — phase 1B
+ * stores no page images, so nothing here pretends a rendered page exists.
+ */
+export function originalMaterialUrl(
+  partnerId: string,
+  materialId: string,
+  page?: number,
+): string {
+  const base = `/api/partners/${encodeURIComponent(partnerId)}/materials/${encodeURIComponent(materialId)}/original`
+  return page && page > 0 ? `${base}#page=${page}` : base
+}
+
+// --- Pages (phase 1B) ------------------------------------------------------
+
+function pagesPath(partnerId: string, materialId: string): string {
+  return `/partners/${encodeURIComponent(partnerId)}/materials/${encodeURIComponent(materialId)}/pages`
+}
+
+export async function listPages(
+  partnerId: string,
+  materialId: string,
+): Promise<MaterialPage[]> {
+  const res = await apiRequest<ListResponse<MaterialPage>>(pagesPath(partnerId, materialId))
+  return res.items
+}
+
+export function getPage(
+  partnerId: string,
+  materialId: string,
+  pageNumber: number,
+): Promise<PageDetail> {
+  return apiRequest<PageDetail>(
+    `${pagesPath(partnerId, materialId)}/${encodeURIComponent(String(pageNumber))}`,
+  )
+}
+
+export function retryPage(
+  partnerId: string,
+  materialId: string,
+  pageNumber: number,
+  csrfToken: string,
+): Promise<MaterialPage> {
+  return apiRequest<MaterialPage>(
+    `${pagesPath(partnerId, materialId)}/${encodeURIComponent(String(pageNumber))}/retry`,
+    { method: 'POST', csrfToken },
+  )
+}
+
+// --- Knowledge (phase 1C) --------------------------------------------------
+
+function knowledgePath(partnerId: string, suffix = ''): string {
+  return `/partners/${encodeURIComponent(partnerId)}/knowledge${suffix}`
+}
+
+/**
+ * State of the model adapter. Not partner data: it describes the installation,
+ * and it never contains the key — only which provider, model and host would be
+ * used.
+ */
+export function fetchProviderState(): Promise<ProviderState> {
+  return apiRequest<ProviderState>('/knowledge/provider')
+}
+
+export function fetchKnowledgeOverview(partnerId: string): Promise<KnowledgeOverview> {
+  return apiRequest<KnowledgeOverview>(knowledgePath(partnerId))
+}
+
+export async function listKnowledgeProducts(partnerId: string): Promise<ProductNode[]> {
+  const res = await apiRequest<ListResponse<ProductNode>>(knowledgePath(partnerId, '/products'))
+  return res.items
+}
+
+export async function listGlossary(partnerId: string): Promise<GlossaryTerm[]> {
+  const res = await apiRequest<ListResponse<GlossaryTerm>>(knowledgePath(partnerId, '/glossary'))
+  return res.items
+}
+
+export async function listKnowledgeQa(partnerId: string): Promise<QaEntry[]> {
+  const res = await apiRequest<ListResponse<QaEntry>>(knowledgePath(partnerId, '/qa'))
+  return res.items
+}
+
+export async function listGaps(partnerId: string): Promise<KnowledgeGap[]> {
+  const res = await apiRequest<ListResponse<KnowledgeGap>>(knowledgePath(partnerId, '/gaps'))
+  return res.items
+}
+
+/**
+ * Queue the product role over one material.
+ *
+ * Idempotent server-side: while a run is queued or running, this returns that
+ * run instead of starting a second one. A 409 means the server refused with a
+ * stated reason (no key configured, or the material has not been read yet) —
+ * the caller shows that reason rather than a generic failure.
+ */
+export function understandMaterial(
+  partnerId: string,
+  materialId: string,
+  csrfToken: string,
+): Promise<KnowledgeRun> {
+  return apiRequest<KnowledgeRun>(
+    `/partners/${encodeURIComponent(partnerId)}/materials/${encodeURIComponent(materialId)}/understand`,
+    { method: 'POST', csrfToken },
+  )
+}
+
+// --- Research (phase 1D) ---------------------------------------------------
+
+function researchPath(partnerId: string, suffix = ''): string {
+  return `/partners/${encodeURIComponent(partnerId)}/research${suffix}`
+}
+
+/**
+ * State of the researcher. Not partner data: it describes the installation, and
+ * it never contains a key — only which endpoint, which hosts and which model
+ * would be used.
+ */
+export function fetchResearchProviderState(): Promise<ResearchProviderState> {
+  return apiRequest<ResearchProviderState>('/research/provider')
+}
+
+export function fetchResearchBudget(): Promise<ResearchBudget> {
+  return apiRequest<ResearchBudget>('/research/budget')
+}
+
+export function fetchResearchOverview(partnerId: string): Promise<ResearchOverview> {
+  return apiRequest<ResearchOverview>(researchPath(partnerId))
+}
+
+export async function listResearchFindings(partnerId: string): Promise<ResearchFinding[]> {
+  const res = await apiRequest<ListResponse<ResearchFinding>>(
+    researchPath(partnerId, '/findings'),
+  )
+  return res.items
+}
+
+export async function listResearchSources(
+  partnerId: string,
+  planId: string,
+): Promise<ResearchSource[]> {
+  const res = await apiRequest<ListResponse<ResearchSource>>(
+    researchPath(partnerId, `/plans/${encodeURIComponent(planId)}/sources`),
+  )
+  return res.items
+}
+
+export async function listResearchQueries(
+  partnerId: string,
+  planId: string,
+): Promise<ResearchQueryRecord[]> {
+  const res = await apiRequest<ListResponse<ResearchQueryRecord>>(
+    researchPath(partnerId, `/plans/${encodeURIComponent(planId)}/queries`),
+  )
+  return res.items
+}
+
+/**
+ * Approve one industry question for bounded research.
+ *
+ * Idempotent server-side: while a plan is queued or running this returns that
+ * plan. A settled plan is put back in the queue, bounded by the pass limit. A
+ * 409 means the server refused with a stated reason — nothing configured, the
+ * budget is empty, or the question has used every pass it was allowed — and the
+ * caller shows that reason rather than a generic failure.
+ */
+export function approveResearch(
+  partnerId: string,
+  questionId: string,
+  csrfToken: string,
+): Promise<ResearchPlan> {
+  return apiRequest<ResearchPlan>(
+    researchPath(partnerId, `/questions/${encodeURIComponent(questionId)}/plan`),
+    { method: 'POST', csrfToken },
+  )
+}
+
+/**
+ * Ask a running plan to stop.
+ *
+ * The worker settles it at its next checkpoint, which is always *before* a
+ * chargeable call — so stopping never leaves money half-spent.
+ */
+export function stopResearch(
+  partnerId: string,
+  planId: string,
+  csrfToken: string,
+): Promise<ResearchPlan> {
+  return apiRequest<ResearchPlan>(
+    researchPath(partnerId, `/plans/${encodeURIComponent(planId)}/stop`),
+    { method: 'POST', csrfToken },
+  )
 }
 
 // --- Jobs --------------------------------------------------------------

@@ -7,8 +7,11 @@
 
 pub mod health;
 pub mod jobs;
+pub mod knowledge;
 pub mod materials;
+pub mod pages;
 pub mod partners;
+pub mod research;
 pub mod session;
 
 use axum::extract::DefaultBodyLimit;
@@ -52,12 +55,74 @@ pub fn router(state: AppState) -> Router {
             get(materials::list).post(materials::upload),
         )
         .route(
+            "/partners/{partner_id}/materials/{material_id}",
+            get(materials::show),
+        )
+        .route(
             "/partners/{partner_id}/materials/{material_id}/original",
             get(materials::download),
         )
         .route(
             "/partners/{partner_id}/materials/{material_id}/retry",
             post(materials::retry),
+        )
+        // Phase 1B: the per-page evidence of a material.
+        .route(
+            "/partners/{partner_id}/materials/{material_id}/pages",
+            get(pages::list),
+        )
+        .route(
+            "/partners/{partner_id}/materials/{material_id}/pages/{page_number}",
+            get(pages::show),
+        )
+        .route(
+            "/partners/{partner_id}/materials/{material_id}/pages/{page_number}/retry",
+            post(pages::retry),
+        )
+        // Phase 1C: the product draft and the state of the model adapter.
+        .route("/knowledge/provider", get(knowledge::provider))
+        .route("/partners/{partner_id}/knowledge", get(knowledge::overview))
+        .route(
+            "/partners/{partner_id}/knowledge/products",
+            get(knowledge::products),
+        )
+        .route(
+            "/partners/{partner_id}/knowledge/glossary",
+            get(knowledge::glossary),
+        )
+        .route("/partners/{partner_id}/knowledge/qa", get(knowledge::qa))
+        .route(
+            "/partners/{partner_id}/knowledge/gaps",
+            get(knowledge::gaps),
+        )
+        .route(
+            "/partners/{partner_id}/materials/{material_id}/understand",
+            post(knowledge::understand),
+        )
+        // Phase 1D: bounded industry research, its money and its sources. No handler
+        // here reaches the network — approving a question queues a job.
+        .route("/research/provider", get(research::provider))
+        .route("/research/budget", get(research::budget))
+        .route("/partners/{partner_id}/research", get(research::overview))
+        .route(
+            "/partners/{partner_id}/research/findings",
+            get(research::findings),
+        )
+        .route(
+            "/partners/{partner_id}/research/plans/{plan_id}/sources",
+            get(research::sources),
+        )
+        .route(
+            "/partners/{partner_id}/research/plans/{plan_id}/queries",
+            get(research::queries),
+        )
+        .route(
+            "/partners/{partner_id}/research/plans/{plan_id}/stop",
+            post(research::stop),
+        )
+        .route(
+            "/partners/{partner_id}/research/questions/{question_id}/plan",
+            post(research::approve),
         )
         .route("/partners/{partner_id}/jobs", get(jobs::list))
         .layer(DefaultBodyLimit::max(upload_limit));

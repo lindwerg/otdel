@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "OTDEL maintenance worker binary (phase 1A: recovery only, no document extraction)."
+description = "OTDEL background worker binary: document extraction (1B), product understanding (1C), bounded industry research (1D) and recovery maintenance."
 
 [[bin]]
 name = "otdel-worker"
@@ -15,6 +15,9 @@ path = "src/main.rs"
 otdel-api.workspace = true
 otdel-core.workspace = true
 otdel-db.workspace = true
+otdel-extract.workspace = true
+otdel-llm.workspace = true
+otdel-search.workspace = true
 otdel-storage.workspace = true
 otdel-worker.workspace = true
 
@@ -22,3 +25,4 @@ anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true

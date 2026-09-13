@@ -1,28 +1,144 @@
-//! Maintenance worker.
+//! The OTDEL background worker.
 //!
-//! **This worker does not extract documents.** Reading PDFs and images is phase 1B; a
-//! process that pretended to process the queue would make `queued` materials look
-//! handled when nothing read them. What it does do is the recovery work that phase 1A
-//! genuinely needs and that must not require a human:
+//! Two halves, deliberately separate:
 //!
-//! * delete expired and idle-timed-out sessions;
-//! * return jobs whose worker lease expired to the queue (or fail them once the attempt
-//!   limit is reached), so an interrupted run resumes instead of hanging;
-//! * remove staging files left by uploads that were cut off;
-//! * compare stored objects with the material rows and *report* orphans.
+//! * **extraction** ([`extraction`]) — the phase 1B pipeline that turns a queued
+//!   material into per-page records, source regions and tables. This is the half that
+//!   actually reads documents;
+//! * **understanding** ([`knowledge`]) — the phase 1C pipeline that turns those pages
+//!   into a structured product draft, every fact tied to a verbatim source. It runs
+//!   only when the model adapter is configured; otherwise the run is recorded as
+//!   `needs_provider` and nothing is stored;
+//! * **research** ([`research`]) — the phase 1D pipeline that turns an approved industry
+//!   question into bounded external work. It is the only half that opens a socket to
+//!   somebody else's machine and the only one that spends money, which is why it claims
+//!   its own job kind and refuses to start until a search endpoint, a host allowlist and
+//!   a model are all configured;
+//! * **maintenance** ([`Maintenance`]) — the recovery work that must not require a
+//!   human: expired sessions, jobs whose lease died with their worker, runs and plans
+//!   whose worker is gone, money reserved for calls that will never happen, staging files
+//!   of interrupted uploads, and orphan objects.
 //!
 //! Orphans are reported, never deleted: an object without a row can also be a request
 //! that is committing right now, and silently deleting an original is worse than a log
 //! line an operator can act on.
+
+pub mod error;
+pub mod extraction;
+pub mod knowledge;
+pub mod pagemap;
+pub mod research;
+pub mod workspace;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use otdel_core::config::Config;
 use otdel_db::{jobs, materials, Database};
+use otdel_extract::{
+    Disabled, OcrEngine, PageProcessor, PageRasteriser, PopplerRasteriser, TesseractEngine,
+};
+use otdel_llm::LlmProvider;
+use otdel_search::{DocumentFetcher, SearchProvider};
 use otdel_storage::ObjectStore;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+pub use error::WorkerError;
+pub use extraction::{ExtractionReport, Extractor, ToolReport};
+pub use knowledge::{KnowledgeReport, KnowledgeWorker};
+pub use research::{ResearchReport, ResearchWorker};
+
+/// Build the page processor from configuration.
+///
+/// When recognition is switched off the adapters are [`Disabled`] — not "the real ones
+/// that we promise not to call". There is then no code path that could produce
+/// recognised text, which is the property the acceptance checks depend on.
+pub fn build_processor(config: &Config) -> PageProcessor {
+    let ocr = &config.extraction.ocr;
+    if !ocr.enabled {
+        let reason = "распознавание отключено настройкой OTDEL_OCR_ENABLED".to_owned();
+        return PageProcessor::new(
+            Arc::new(Disabled::new("tesseract", reason.clone())),
+            Arc::new(Disabled::new("pdftoppm", reason)),
+        );
+    }
+
+    PageProcessor::new(
+        Arc::new(TesseractEngine::new(
+            &ocr.engine_bin,
+            &ocr.languages,
+            ocr.timeout,
+        )),
+        Arc::new(PopplerRasteriser::new(
+            &ocr.renderer_bin,
+            ocr.dpi,
+            ocr.timeout,
+        )),
+    )
+}
+
+/// Probe the external tools once, so the reason for `needs_ocr` is the same on every
+/// page of a run and the operator sees it in the startup log.
+pub async fn probe_tools(processor: &PageProcessor) -> ToolReport {
+    ToolReport {
+        engine: processor.engine_availability().await,
+        rasteriser: processor.rasteriser_availability().await,
+    }
+}
+
+/// Assemble the understanding half from configuration.
+///
+/// The provider comes from [`otdel_llm::build_provider`], which returns an adapter with
+/// no HTTP client at all when there is no key. The worker is therefore built and
+/// started in either case — it has to be, so it can record "нужен ключ" on the run
+/// instead of leaving the material silently unprocessed.
+pub fn build_knowledge_worker(
+    config: Arc<Config>,
+    db: Database,
+    provider: Arc<dyn LlmProvider>,
+) -> KnowledgeWorker {
+    KnowledgeWorker::new(config, db, provider)
+}
+
+/// The model adapter described by the configuration.
+pub fn build_llm_provider(config: &Config) -> Arc<dyn LlmProvider> {
+    otdel_llm::build_provider(&config.llm)
+}
+
+/// The phase 1D adapters described by the configuration.
+///
+/// Both come from builders that return a *client-less* object when the configuration is
+/// incomplete, so the research worker is built and started in either case — it has to be,
+/// so it can record "нужен поисковый провайдер" on the plan instead of leaving an approved
+/// question silently unprocessed. Returned as a pair because the binary also reports their
+/// state at startup, and building them twice would be two different objects.
+pub fn build_research_adapters(
+    config: &Config,
+) -> (Arc<dyn SearchProvider>, Arc<dyn DocumentFetcher>) {
+    (
+        otdel_search::build_search_provider(&config.research),
+        otdel_search::build_fetcher(&config.research),
+    )
+}
+
+/// Assemble the extraction half from configuration.
+pub fn build_extractor(
+    config: Arc<Config>,
+    db: Database,
+    store: Arc<dyn ObjectStore>,
+    processor: Arc<PageProcessor>,
+    tools: ToolReport,
+) -> Extractor {
+    Extractor::new(config, db, store, processor, tools)
+}
+
+/// Compile-time reminder that both adapter traits stay object-safe: the worker holds
+/// them behind `Arc<dyn _>` so a different engine can be swapped in without touching it.
+const _: fn() = || {
+    fn accepts(_engine: &dyn OcrEngine, _rasteriser: &dyn PageRasteriser) {}
+    let _ = accepts;
+};
 
 /// Tunables for one maintenance pass.
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +166,13 @@ impl Default for MaintenanceSettings {
 pub struct MaintenanceReport {
     pub sessions_purged: i64,
     pub leases_reclaimed: u64,
+    /// Understanding runs that said `running` with no job behind them.
+    pub stalled_runs_settled: u64,
+    /// Research plans in the same situation.
+    pub stalled_plans_settled: u64,
+    /// Reservations of plans that are no longer running — money a dead worker was
+    /// holding, given back to the budget.
+    pub reservations_released: u64,
     pub staging_files_removed: u64,
     pub objects_scanned: usize,
     pub orphan_objects: usize,
@@ -66,6 +189,10 @@ pub enum MaintenanceError {
     #[error("bureau `{0}` is not provisioned")]
     BureauMissing(String),
 }
+
+/// Maintenance describes itself as phase 1A recovery; the extraction half lives in
+/// [`extraction`] and is driven by the binary in `apps/worker`.
+pub const MAINTENANCE_SCOPE: &str = "sessions, job leases, upload staging, orphan objects";
 
 pub struct Maintenance {
     config: Arc<Config>,
@@ -106,6 +233,17 @@ impl Maintenance {
 
         let mut tx = self.db.begin_scoped(bureau_id).await?;
         report.leases_reclaimed = jobs::reclaim_expired_leases(&mut tx).await?;
+        // A run whose worker died is corrected here too: the job queue recovers the
+        // job, and this recovers the record the owner is actually looking at.
+        report.stalled_runs_settled = otdel_db::knowledge::reclaim_stalled_runs(&mut tx).await?;
+        // The same correction for research, and then the money: a worker that died
+        // between reserving and settling would otherwise hold that amount for ever, and
+        // the bureau's research budget would shrink with every crash. The order matters —
+        // plans are settled first, so their reservations become releasable in the same
+        // pass rather than the next one.
+        report.stalled_plans_settled = otdel_db::research::reclaim_stalled_plans(&mut tx).await?;
+        report.reservations_released =
+            otdel_db::research::release_orphan_reservations(&mut tx).await?;
         tx.commit().await?;
 
         let sweep = self
@@ -177,6 +315,9 @@ impl Maintenance {
                         Ok(report) => info!(
                             sessions_purged = report.sessions_purged,
                             leases_reclaimed = report.leases_reclaimed,
+                            stalled_runs_settled = report.stalled_runs_settled,
+                            stalled_plans_settled = report.stalled_plans_settled,
+                            reservations_released = report.reservations_released,
                             staging_files_removed = report.staging_files_removed,
                             objects_scanned = report.objects_scanned,
                             orphan_objects = report.orphan_objects,

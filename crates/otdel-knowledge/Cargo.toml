@@ -1,0 +1,23 @@
+[package]
+name = "otdel-knowledge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Phase 1C product understanding: bounded prompts built from read pages, a strict response schema, and validation that every candidate fact carries a real, verbatim source."
+
+[dependencies]
+otdel-core.workspace = true
+otdel-llm.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+otdel-llm = { workspace = true, features = ["fake"] }
+chrono.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

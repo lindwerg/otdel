@@ -1,0 +1,526 @@
+/*
+  OTDEL — phase 1D: bounded industry research.
+
+  Same tokens as global.css; nothing here redefines a colour or a radius. Two
+  visual ideas, and both of them are about not being believed too much.
+
+  1. An *industry* conclusion must not read as a fact about the partner. The 1C
+     product facts next door sit inside a bordered product card, keyed to a
+     product name. A finding here has no card and no product: it is a flat entry
+     under a gold-dotted rule, headed by a scope badge in the warning colour. The
+     difference should be legible before the badge is read.
+
+  2. Money is shown as a bar of *what happened*, not a forecast. Spent is solid;
+     reserved — money held for a call still in flight — is hatched, because it is
+     not spent yet and might come back.
+*/
+
+/* --- provider state -------------------------------------------------------- */
+
+.research-notice {
+  margin-top: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+
+.research-notice[data-state='ready'] {
+  border-left-color: var(--accent);
+}
+
+.research-notice h4 {
+  margin: 0 0 6px;
+  font-size: 0.9375rem;
+  color: var(--warn);
+}
+
+.research-notice p {
+  font-size: 0.8125rem;
+}
+
+.research-notice__line {
+  color: var(--ink);
+}
+
+.research-notice__missing {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0;
+  padding: 0;
+}
+
+.research-notice__missing code {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  font-size: 0.75rem;
+  color: var(--ink);
+}
+
+.research-notice__footnote {
+  color: var(--muted);
+  font-size: 0.75rem;
+  margin-top: 6px;
+}
+
+/* --- budget ---------------------------------------------------------------- */
+
+.budget {
+  margin-top: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.budget__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.budget__head h4 {
+  margin: 0;
+  font-size: 0.9375rem;
+}
+
+.budget__available {
+  font-size: 0.8125rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.budget__bar {
+  display: flex;
+  height: 6px;
+  margin: 10px 0;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+}
+
+.budget__bar-part {
+  display: block;
+  height: 100%;
+}
+
+.budget__bar-part--spent {
+  background: var(--accent);
+}
+
+/* Held, not spent — and it may still come back. */
+.budget__bar-part--reserved {
+  background: repeating-linear-gradient(
+    135deg,
+    var(--warn) 0 3px,
+    transparent 3px 6px
+  );
+}
+
+.budget__figures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin: 10px 0 0;
+}
+
+.budget__figures dt {
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.budget__figures dd {
+  margin: 2px 0 0;
+  font-size: 0.875rem;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.budget__unknown {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--warn-strong);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--surface-2);
+  font-size: 0.8125rem;
+  color: var(--ink);
+}
+
+.budget__footnote {
+  margin-top: 8px;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+/* --- which engine searches, and what it is forecast to cost ------------------ */
+
+.engine {
+  margin-top: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.engine__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.engine__head h4 {
+  margin: 0;
+  font-size: 0.9375rem;
+}
+
+/* The engine is the thing the price depends on, so it reads as a label rather
+   than as one more number in a row. */
+.engine__badge {
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.engine__figures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin: 10px 0 0;
+}
+
+.engine__figures dt {
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.engine__figures dd {
+  margin: 2px 0 0;
+  font-size: 0.875rem;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.engine__fallback {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--line-strong, var(--line));
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--surface-2);
+  font-size: 0.8125rem;
+  color: var(--ink);
+}
+
+.engine__footnote {
+  margin-top: 8px;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+/* --- the approval queue ----------------------------------------------------- */
+
+.question-list,
+.plan-list,
+.finding-list,
+.journal__queries,
+.journal__sources {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.question {
+  padding: 12px 14px;
+  margin-bottom: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.question__text {
+  font-size: 0.9375rem;
+  font-weight: 600;
+}
+
+.question__origin {
+  margin-top: 4px;
+  font-size: 0.8125rem;
+  color: var(--muted);
+}
+
+.question .button {
+  margin-top: 10px;
+}
+
+/* --- plans ------------------------------------------------------------------ */
+
+.plan {
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  border-left: 3px solid transparent;
+  margin-bottom: 6px;
+}
+
+.plan[data-state='needs_provider'],
+.plan[data-state='partial'],
+.plan[data-state='budget_exhausted'] {
+  border-left-color: var(--warn);
+}
+
+.plan[data-state='failed'] {
+  border-left-color: var(--warn-strong);
+}
+
+.plan[data-state='completed'] {
+  border-left-color: var(--success);
+}
+
+.plan__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.plan__question {
+  font-size: 0.9375rem;
+}
+
+.plan__status {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.plan__status[data-tone='warn'] {
+  color: var(--warn);
+}
+
+.plan__status[data-tone='error'] {
+  color: var(--warn-strong);
+}
+
+.plan__status[data-tone='success'] {
+  color: var(--success);
+}
+
+.plan__hint,
+.plan__counts {
+  font-size: 0.8125rem;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.plan__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+/* --- the journal ------------------------------------------------------------ */
+
+.journal {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.journal__heading {
+  margin: 0 0 8px;
+  font-size: 0.8125rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.journal__heading + * + .journal__heading {
+  margin-top: 16px;
+}
+
+.journal__query {
+  padding: 6px 0;
+  border-top: 1px solid var(--line);
+}
+
+.journal__query:first-child {
+  border-top: 0;
+}
+
+.journal__query-text {
+  display: block;
+  font-size: 0.8125rem;
+  color: var(--ink);
+  word-break: break-word;
+}
+
+.journal__query-meta,
+.journal__query-reason {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.journal__query[data-outcome='unknown'] .journal__query-meta {
+  color: var(--warn-strong);
+}
+
+.journal__source {
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+}
+
+.journal__source:first-child {
+  border-top: 0;
+}
+
+.journal__source-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.journal__source-url {
+  font-size: 0.8125rem;
+  color: var(--accent);
+  word-break: break-all;
+}
+
+.journal__source-url:hover {
+  color: var(--accent-hover);
+}
+
+.journal__source-status {
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.journal__source-status[data-tone='warn'] {
+  color: var(--warn);
+}
+
+.journal__source-status[data-tone='error'] {
+  color: var(--warn-strong);
+}
+
+.journal__source-status[data-tone='success'] {
+  color: var(--success);
+}
+
+.journal__source-reason,
+.journal__source-meta,
+.journal__source-license {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 3px;
+}
+
+.journal__source-snippet {
+  margin-top: 6px;
+  padding: 6px 8px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-sm);
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.journal__snippet-badge {
+  display: inline-block;
+  margin-right: 6px;
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--warn);
+}
+
+/* --- findings: an industry statement is not a partner's characteristic ------- */
+
+.finding {
+  padding: 14px 0;
+  border-top: 1px dotted var(--accent);
+}
+
+.finding:first-child {
+  border-top: 0;
+}
+
+.finding__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.finding__scope {
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--warn);
+  padding: 1px 8px;
+  border: 1px solid var(--warn);
+  border-radius: 999px;
+}
+
+.finding__topic {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.finding__statement {
+  margin-top: 8px;
+}
+
+.finding__attribute {
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.finding__value {
+  font-size: 1.0625rem;
+  font-weight: 600;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.finding__conditions {
+  font-size: 0.8125rem;
+  color: var(--ink);
+  margin-top: 4px;
+}
+
+.finding__status {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.evidence__meta {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 3px;
+}

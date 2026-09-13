@@ -35,9 +35,12 @@
  *      than silently skipped, so large/unreadable files can't bypass this
  *      scan unnoticed.
  *   5. Unresolved merge-conflict markers in tracked text files.
- *   6. JSON syntax for every tracked *.json file.
- *   7. JavaScript syntax for every tracked *.js/*.mjs/*.cjs file, via
- *      `node --check`.
+ *   6. JSON syntax for every tracked *.json file that passed check 4's
+ *      symlink/size/readability/NUL validation (rejected files are never
+ *      read here).
+ *   7. JavaScript syntax for every tracked *.js/*.mjs/*.cjs file that passed
+ *      the same validation, via `node --check` (rejected files are never
+ *      subprocessed here).
  *   8. `git diff --check` (working tree and index) for whitespace errors,
  *      best-effort — only meaningful when there is a local diff to check.
  *   9. Presence and minimal shape (non-empty, starts with a top-level
@@ -162,6 +165,14 @@ const conflictMarkerRe = /^(<{7} |={7}$|>{7} )/;
 // skipped — see the file-loop comment below.
 const MAX_SCAN_BYTES = 2 * 1024 * 1024;
 
+// Files that made it through every guard below (not a symlink, a regular
+// file, within the size limit, readable as UTF-8 text, no NUL bytes). Later
+// steps (JSON/JS syntax checks) must read/subprocess ONLY files in this set —
+// never re-derive a file list from `trackedFiles` directly, or a rejected
+// symlink/oversized/unreadable file could be followed/read/subprocessed
+// after all.
+const safeTextFiles = new Set();
+
 for (const file of trackedFiles) {
   // Symlinks are rejected everywhere, regardless of extension: a tracked
   // symlink could point outside the intended directory (e.g. outside
@@ -209,6 +220,8 @@ for (const file of trackedFiles) {
     continue;
   }
 
+  safeTextFiles.add(file);
+
   const lines = content.split('\n');
   lines.forEach((line, idx) => {
     if (conflictMarkerRe.test(line)) {
@@ -223,25 +236,34 @@ for (const file of trackedFiles) {
 }
 
 // --- 5. JSON syntax ---
-const jsonFiles = trackedFiles.filter((f) => f.toLowerCase().endsWith('.json'));
+// Only files already validated by the loop above (safeTextFiles) are parsed:
+// a rejected symlink/oversized/unreadable file is never read here, even if
+// it happens to end in .json — it was already reported as a failure above.
+const jsonFiles = trackedFiles.filter((f) => f.toLowerCase().endsWith('.json') && safeTextFiles.has(f));
 for (const file of jsonFiles) {
   try {
     JSON.parse(readFileSync(file, 'utf8'));
-  } catch (err) {
-    fail(`Invalid JSON in ${file}: ${err.message}`);
+  } catch {
+    // Deliberately no err.message/excerpt: a JSON parse error can quote the
+    // offending file content verbatim, which may include secrets.
+    fail(`Invalid JSON: ${file}`);
   }
 }
-note(`${jsonFiles.length} JSON file(s) parsed.`);
+note(`${jsonFiles.length} JSON file(s) parsed (validated text files only).`);
 
 // --- 6. JavaScript syntax via node --check ---
-const jsFiles = trackedFiles.filter((f) => /\.(mjs|cjs|js)$/i.test(f));
+// Same restriction: only files in safeTextFiles are ever passed to a
+// subprocess here.
+const jsFiles = trackedFiles.filter((f) => /\.(mjs|cjs|js)$/i.test(f) && safeTextFiles.has(f));
 for (const file of jsFiles) {
   const result = spawnSync(process.execPath, ['--check', file], { cwd: repoRoot, encoding: 'utf8' });
   if (result.status !== 0) {
-    fail(`node --check failed for ${file}:\n${result.stderr.trim()}`);
+    // Deliberately no stderr excerpt: node's syntax-error output quotes the
+    // offending source line verbatim, which may include secrets.
+    fail(`Invalid JavaScript syntax: ${file}`);
   }
 }
-note(`${jsFiles.length} JavaScript file(s) syntax-checked via node --check.`);
+note(`${jsFiles.length} JavaScript file(s) syntax-checked via node --check (validated text files only).`);
 
 // --- 7. git diff --check (best-effort, local diff only) ---
 try {

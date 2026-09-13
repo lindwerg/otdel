@@ -5,6 +5,8 @@ members = [
     "crates/otdel-storage",
     "crates/otdel-db",
     "crates/otdel-extract",
+    "crates/otdel-llm",
+    "crates/otdel-knowledge",
     "crates/otdel-api",
     "crates/otdel-worker",
     "apps/api",
@@ -23,6 +25,8 @@ otdel-core = { path = "crates/otdel-core" }
 otdel-storage = { path = "crates/otdel-storage" }
 otdel-db = { path = "crates/otdel-db" }
 otdel-extract = { path = "crates/otdel-extract" }
+otdel-llm = { path = "crates/otdel-llm" }
+otdel-knowledge = { path = "crates/otdel-knowledge" }
 otdel-api = { path = "crates/otdel-api" }
 otdel-worker = { path = "crates/otdel-worker" }
 
@@ -49,6 +53,16 @@ http-body-util = "0.1"
 # inventory (media box, rotation, image XObjects) is read — using the re-export instead of
 # a second direct dependency guarantees both halves speak about the same `Document` type.
 pdf-extract = "0.12"
+# HTTP client of the phase 1C model adapter. `rustls-tls` keeps TLS in Rust (no system
+# OpenSSL); `default-features = false` drops the default TLS stack and the cookie/proxy
+# machinery a server-to-server JSON call has no use for. The client is only ever
+# constructed when a key *and* a model are configured — see `otdel_llm::build_provider`.
+reqwest = { version = "0.12", default-features = false, features = [
+    "charset",
+    "http2",
+    "json",
+    "rustls-tls",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

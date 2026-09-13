@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use crate::error::AppError;
 use crate::extraction_config::ExtractionSettings;
+use crate::llm_config::LlmSettings;
 use crate::secret;
 
 /// Lower bound shared by the session TTL and the idle timeout.
@@ -87,6 +88,10 @@ pub struct Config {
     pub log_filter: String,
     /// Phase 1B: how the worker reads documents, and whether OCR is available at all.
     pub extraction: ExtractionSettings,
+    /// Phase 1C: which model adapter the product role uses, and whether it is
+    /// configured at all. Without a key this stays in the "needs configuration" state
+    /// and no request is ever made.
+    pub llm: LlmSettings,
 }
 
 impl fmt::Debug for Config {
@@ -115,6 +120,9 @@ impl fmt::Debug for Config {
             .field("login_throttle", &self.login_throttle)
             .field("log_filter", &self.log_filter)
             .field("extraction", &self.extraction)
+            // LlmSettings has its own redacting Debug: the key is never printed, the
+            // endpoint host is (the owner needs to see which service would be called).
+            .field("llm", &self.llm)
             .finish()
     }
 }
@@ -280,6 +288,7 @@ impl Config {
         let log_filter = string_or(source, "OTDEL_LOG", "info,otdel_api=info,sqlx=warn");
 
         let extraction = ExtractionSettings::load(source)?;
+        let llm = LlmSettings::load(source)?;
 
         Ok(Self {
             env,
@@ -299,6 +308,7 @@ impl Config {
             login_throttle,
             log_filter,
             extraction,
+            llm,
         })
     }
 
@@ -497,10 +507,36 @@ mod tests {
 
     #[test]
     fn debug_output_never_contains_secrets() {
-        let config = Config::load(&base_env()).unwrap();
+        let mut env = base_env();
+        env.insert(
+            "OTDEL_LLM_API_KEY".to_owned(),
+            "sk-or-v1-notinalog".to_owned(),
+        );
+        env.insert(
+            "OTDEL_LLM_MODEL".to_owned(),
+            "openai/gpt-4o-mini".to_owned(),
+        );
+
+        let config = Config::load(&env).unwrap();
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("s3cr3t"));
         assert!(!rendered.contains(&config.owner_password_hash));
+        assert!(!rendered.contains("notinalog"), "{rendered}");
         assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn the_product_role_defaults_to_waiting_for_a_key() {
+        use crate::llm_config::LlmAvailability;
+
+        let config = Config::load(&base_env()).unwrap();
+        assert_eq!(
+            config.llm.availability(),
+            LlmAvailability::NeedsConfiguration {
+                missing: vec!["OTDEL_LLM_API_KEY", "OTDEL_LLM_MODEL"],
+            },
+            "with no key configured the product role must report what is missing \
+             instead of pretending to be ready"
+        );
     }
 }

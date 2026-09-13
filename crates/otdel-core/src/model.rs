@@ -132,12 +132,14 @@ impl MaterialStatus {
 ///
 /// 1A enqueued whole-document extraction; 1B adds the single-page repeat, which exists
 /// so a problem page can be retried without re-reading the other 31
-/// (`docs/block-01-plan.md`, 1B §2).
+/// (`docs/block-01-plan.md`, 1B §2); 1C adds the understanding run that drafts product
+/// knowledge from the pages a material already has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
     ExtractDocument,
     ExtractPage,
+    UnderstandMaterial,
 }
 
 impl JobKind {
@@ -145,6 +147,7 @@ impl JobKind {
         match self {
             Self::ExtractDocument => "extract_document",
             Self::ExtractPage => "extract_page",
+            Self::UnderstandMaterial => "understand_material",
         }
     }
 
@@ -152,13 +155,25 @@ impl JobKind {
         match value {
             "extract_document" => Some(Self::ExtractDocument),
             "extract_page" => Some(Self::ExtractPage),
+            "understand_material" => Some(Self::UnderstandMaterial),
             _ => None,
         }
     }
 
-    /// A page job carries a page number; a document job never does.
+    /// A page job carries a page number; every other kind never does.
     pub const fn needs_page_number(self) -> bool {
         matches!(self, Self::ExtractPage)
+    }
+
+    /// Kinds the document-reading worker half claims. The understanding half claims
+    /// its own, so neither can pick up work it does not know how to run.
+    pub const fn extraction_kinds() -> [Self; 2] {
+        [Self::ExtractDocument, Self::ExtractPage]
+    }
+
+    /// Kinds the phase 1C worker half claims.
+    pub const fn knowledge_kinds() -> [Self; 1] {
+        [Self::UnderstandMaterial]
     }
 }
 
@@ -304,12 +319,30 @@ mod tests {
 
     #[test]
     fn job_kinds_round_trip_and_only_page_jobs_carry_a_page() {
-        for kind in [JobKind::ExtractDocument, JobKind::ExtractPage] {
+        for kind in [
+            JobKind::ExtractDocument,
+            JobKind::ExtractPage,
+            JobKind::UnderstandMaterial,
+        ] {
             assert_eq!(JobKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(JobKind::parse("publish"), None);
         assert!(JobKind::ExtractPage.needs_page_number());
         assert!(!JobKind::ExtractDocument.needs_page_number());
+        assert!(!JobKind::UnderstandMaterial.needs_page_number());
+    }
+
+    #[test]
+    fn the_two_worker_halves_claim_disjoint_kinds() {
+        let extraction = JobKind::extraction_kinds();
+        let knowledge = JobKind::knowledge_kinds();
+        for kind in knowledge {
+            assert!(
+                !extraction.contains(&kind),
+                "{kind:?} must not be claimable by both halves: the reader would try to \
+                 open a knowledge job as a document"
+            );
+        }
     }
 
     #[test]

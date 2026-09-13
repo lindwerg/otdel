@@ -1,14 +1,19 @@
 import { describe, expect, it } from 'vitest'
-import type { ExtractionSummary } from '../../api/types'
+import type { ExtractionSummary, KnowledgeFact } from '../../api/types'
 import {
+  evidenceSourceLine,
   extractionCountsLine,
   extractionToolsLine,
+  factKindLabel,
+  factValueLine,
   formatBytes,
   materialStatusPresentation,
   pageStatusPresentation,
   pagesNeedingAttention,
+  questionAudienceLabel,
   RETRYABLE_MATERIAL_STATUSES,
   RETRYABLE_PAGE_STATUSES,
+  runStatusPresentation,
 } from '../format'
 
 describe('formatBytes', () => {
@@ -123,5 +128,62 @@ describe('extractionCountsLine', () => {
         summary({ pages_needs_ocr: 2, pages_failed: 1, pages_partial: 1, pages_extracted: 28 }),
       ),
     ).toBe(4)
+  })
+})
+
+describe('knowledge labels (phase 1C)', () => {
+  function fact(overrides: Partial<KnowledgeFact>): KnowledgeFact {
+    return {
+      id: 'fact-1',
+      partner_id: 'p',
+      material_id: 'm',
+      run_id: 'r',
+      product_id: null,
+      product_name: null,
+      kind: 'characteristic',
+      status: 'candidate',
+      attribute: 'нагрузка',
+      value_text: '3.5',
+      unit: null,
+      conditions: null,
+      model_context: null,
+      evidence: [],
+      created_at: '2026-01-01T10:00:00Z',
+      ...overrides,
+    }
+  }
+
+  it('appends a unit only when the server recorded one', () => {
+    expect(factValueLine(fact({ unit: 'kN' }))).toBe('3.5 kN')
+    // The server stores a unit only when the source writes it; a bare value
+    // must stay bare rather than acquire a plausible unit here.
+    expect(factValueLine(fact({ unit: null }))).toBe('3.5')
+    // A range or a designation is passed through exactly as stored.
+    expect(factValueLine(fact({ value_text: '40…60', unit: null }))).toBe('40…60')
+    expect(factValueLine(fact({ value_text: '– / 2074 / 2345', unit: null }))).toBe(
+      '– / 2074 / 2345',
+    )
+  })
+
+  it('does not call a missing key a failure', () => {
+    const waiting = runStatusPresentation('needs_provider')
+    expect(waiting.label).toBe('Ожидает настройки модели')
+    expect(waiting.tone).toBe('warn')
+    expect(waiting.label).not.toMatch(/ошибка/i)
+
+    expect(runStatusPresentation('failed').tone).toBe('error')
+    expect(runStatusPresentation('completed').tone).toBe('success')
+    expect(runStatusPresentation('partial').label).toBe('Разобран частично')
+  })
+
+  it('names the kind of statement and the addressee of a question', () => {
+    expect(factKindLabel('commercial')).toBe('коммерческое условие')
+    expect(factKindLabel('limitation')).toBe('ограничение')
+    expect(questionAudienceLabel('partner')).toBe('вопрос партнёру')
+    expect(questionAudienceLabel('industry')).toContain('отраслевого исследования')
+  })
+
+  it('states a source as file and page', () => {
+    expect(evidenceSourceLine('каталог.pdf', 7)).toBe('каталог.pdf, стр. 7')
   })
 })

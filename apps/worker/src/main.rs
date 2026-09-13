@@ -10,8 +10,14 @@
 //! availability is probed once at startup and printed, so "why is page 7 waiting for
 //! OCR" is answerable from the log rather than by guessing.
 //!
-//! `probe` reports the state of those external tools and exits — useful before a long
-//! run, and honest about a machine where they are not installed.
+//! Since phase 1C it also drafts product knowledge: it leases `understand_material`
+//! jobs, sends bounded prompts built from the pages that were read, and stores only the
+//! candidates whose quotes were found in those pages. Without a configured model key it
+//! calls nothing and records each run as `needs_provider`.
+//!
+//! `probe` reports the state of the external tools and of the model adapter, then exits
+//! — useful before a long run, and honest about a machine where nothing is installed
+//! and no key is set.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -22,12 +28,15 @@ use otdel_core::config::Config;
 use otdel_db::Database;
 use otdel_extract::ToolAvailability;
 use otdel_storage::{FilesystemObjectStore, ObjectStore};
-use otdel_worker::{Maintenance, MaintenanceSettings};
+use otdel_worker::{KnowledgeWorker, Maintenance, MaintenanceSettings};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Jobs taken in one extraction pass before maintenance gets a turn.
 const MAX_JOBS_PER_PASS: u32 = 8;
+/// Understanding runs taken in one pass. Lower than the extraction budget: each one
+/// can make several model calls, and a pass should stay short enough to be stopped.
+const MAX_KNOWLEDGE_JOBS_PER_PASS: u32 = 4;
 /// How often the recovery half runs while the worker is up.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
 
@@ -42,12 +51,15 @@ async fn main() -> ExitCode {
         "-h" | "--help" | "help" => {
             eprintln!(
                 "usage: otdel-worker [run|once|probe]\n\n\
-                 run   — extraction + maintenance until SIGINT/SIGTERM (default)\n\
-                 once  — one extraction pass and one maintenance pass, then exit\n\
-                 probe — report OCR/rasteriser availability and exit\n\n\
+                 run   — extraction + understanding + maintenance until SIGINT/SIGTERM (default)\n\
+                 once  — one pass of each, then exit\n\
+                 probe — report OCR/rasteriser and model adapter availability, then exit\n\n\
                  Extraction reads queued materials page by page. Pages without a usable\n\
                  text layer are recognised when an engine is installed, and recorded as\n\
-                 `needs_ocr` with the reason when it is not."
+                 `needs_ocr` with the reason when it is not.\n\
+                 Understanding drafts product knowledge from the pages that were read.\n\
+                 Without a configured model key nothing is called: each run is recorded\n\
+                 as `needs_provider` and no knowledge is stored."
             );
             Ok(())
         }
@@ -87,6 +99,12 @@ async fn run(mode: Mode) -> Result<()> {
     let tools = otdel_worker::probe_tools(&processor).await;
     report_tools(&tools);
 
+    // The model adapter is described before anything else runs. With no key this is
+    // the whole story of phase 1C on this machine, and the operator should not have to
+    // wait for a failed run to learn it.
+    let provider = otdel_worker::build_llm_provider(&config);
+    report_provider(&provider.describe());
+
     if mode == Mode::Probe {
         return Ok(());
     }
@@ -124,6 +142,7 @@ async fn run(mode: Mode) -> Result<()> {
         Arc::clone(&processor),
         tools,
     );
+    let knowledge = KnowledgeWorker::new(Arc::clone(&config), db.clone(), Arc::clone(&provider));
     let maintenance = Maintenance::new(
         Arc::clone(&config),
         db.clone(),
@@ -136,11 +155,18 @@ async fn run(mode: Mode) -> Result<()> {
             .run_pass(bureau_id, MAX_JOBS_PER_PASS)
             .await
             .context("extraction pass")?;
+        let understanding = knowledge
+            .run_pass(bureau_id, MAX_KNOWLEDGE_JOBS_PER_PASS)
+            .await
+            .context("understanding pass")?;
         let recovery = maintenance.run_once().await.context("maintenance pass")?;
         println!(
             "jobs_claimed={} jobs_completed={} jobs_failed={} pages_read={} \
              pages_recognised={} pages_needing_recognition={} pages_failed={} \
-             sessions_purged={} leases_reclaimed={} staging_files_removed={} \
+             knowledge_jobs_claimed={} knowledge_jobs_completed={} knowledge_jobs_failed={} \
+             facts_stored={} candidates_rejected={} runs_awaiting_provider={} \
+             sessions_purged={} leases_reclaimed={} stalled_runs_settled={} \
+             staging_files_removed={} \
              objects_scanned={} orphan_objects={} scan_truncated={}",
             extraction.jobs_claimed,
             extraction.jobs_completed,
@@ -149,8 +175,15 @@ async fn run(mode: Mode) -> Result<()> {
             extraction.pages_recognised,
             extraction.pages_needing_recognition,
             extraction.pages_failed,
+            understanding.jobs_claimed,
+            understanding.jobs_completed,
+            understanding.jobs_failed,
+            understanding.facts_stored,
+            understanding.candidates_rejected,
+            understanding.runs_awaiting_provider,
             recovery.sessions_purged,
             recovery.leases_reclaimed,
+            recovery.stalled_runs_settled,
             recovery.staging_files_removed,
             recovery.objects_scanned,
             recovery.orphan_objects,
@@ -167,6 +200,7 @@ async fn run(mode: Mode) -> Result<()> {
     );
     serve(
         extractor,
+        knowledge,
         maintenance,
         bureau_id,
         config.extraction.poll_interval,
@@ -175,9 +209,10 @@ async fn run(mode: Mode) -> Result<()> {
     Ok(())
 }
 
-/// Alternate between draining the queue and the periodic recovery pass until stopped.
+/// Alternate between draining the queues and the periodic recovery pass until stopped.
 async fn serve(
     extractor: otdel_worker::Extractor,
+    knowledge: KnowledgeWorker,
     maintenance: Maintenance,
     bureau_id: uuid::Uuid,
     poll_interval: Duration,
@@ -213,12 +248,27 @@ async fn serve(
                     Err(error) => warn!(error = %error, "extraction pass failed"),
                 }
 
+                match knowledge.run_pass(bureau_id, MAX_KNOWLEDGE_JOBS_PER_PASS).await {
+                    Ok(report) if report.jobs_claimed > 0 => info!(
+                        jobs_claimed = report.jobs_claimed,
+                        jobs_completed = report.jobs_completed,
+                        jobs_failed = report.jobs_failed,
+                        facts_stored = report.facts_stored,
+                        candidates_rejected = report.candidates_rejected,
+                        runs_awaiting_provider = report.runs_awaiting_provider,
+                        "understanding pass finished"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => warn!(error = %error, "understanding pass failed"),
+                }
+
                 if last_maintenance.elapsed() >= MAINTENANCE_INTERVAL {
                     last_maintenance = Instant::now();
                     match maintenance.run_once().await {
                         Ok(report) => info!(
                             sessions_purged = report.sessions_purged,
                             leases_reclaimed = report.leases_reclaimed,
+                            stalled_runs_settled = report.stalled_runs_settled,
                             staging_files_removed = report.staging_files_removed,
                             objects_scanned = report.objects_scanned,
                             orphan_objects = report.orphan_objects,
@@ -254,4 +304,25 @@ fn report_tools(tools: &otdel_worker::ToolReport) {
             "page rasteriser unavailable: PDF pages cannot be rendered for recognition"
         ),
     }
+}
+
+/// Say plainly whether the product role can run on this machine.
+fn report_provider(description: &otdel_llm::ProviderDescription) {
+    if description.is_ready() {
+        info!(
+            provider = %description.provider,
+            model = %description.model,
+            endpoint_host = description.endpoint_host.clone().unwrap_or_default(),
+            "model adapter ready: materials will be drafted into product knowledge"
+        );
+        return;
+    }
+
+    warn!(
+        state = description.state,
+        missing = ?description.missing,
+        "model adapter not configured: materials are read as usual, and each \
+         understanding run is recorded as `needs_provider` without calling anything \
+         and without storing invented knowledge"
+    );
 }

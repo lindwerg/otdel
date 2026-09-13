@@ -16,6 +16,7 @@ otdel-api.workspace = true
 otdel-core.workspace = true
 otdel-db.workspace = true
 otdel-extract.workspace = true
+otdel-llm.workspace = true
 otdel-storage.workspace = true
 otdel-worker.workspace = true
 

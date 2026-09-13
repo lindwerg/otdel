@@ -11,6 +11,8 @@ description = "OTDEL background worker: document extraction (phase 1B) plus sess
 otdel-core.workspace = true
 otdel-db.workspace = true
 otdel-extract.workspace = true
+otdel-knowledge.workspace = true
+otdel-llm.workspace = true
 otdel-storage.workspace = true
 
 futures-util.workspace = true

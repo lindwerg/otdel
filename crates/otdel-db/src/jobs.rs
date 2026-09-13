@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use otdel_core::extraction::page_extraction_idempotency_key;
+use otdel_core::knowledge::understanding_idempotency_key;
 use otdel_core::model::{extraction_idempotency_key, Job, JobKind, JobStatus};
 use sqlx::postgres::PgRow;
 use sqlx::Row;
@@ -219,17 +220,121 @@ pub async fn enqueue_page_extraction(
     job_from_row(&row)
 }
 
+// --- phase 1C: understanding jobs ------------------------------------------------------
+
+/// Enqueue (or re-arm) the understanding run of a material.
+///
+/// Keyed by the material, so pressing "разобрать" twice, or the extraction worker
+/// finishing twice, reuses one row. A settled row is reset to `queued` — that is what
+/// the owner asked for when a material has already been drafted once and needs
+/// drafting again (a new model, a re-read page, a key that has finally been
+/// configured).
+///
+/// A row that is **currently running** is left exactly as it is, and the running job is
+/// returned instead. Resetting it would hand the same material to a second worker while
+/// the first still holds the lease, and both would write the same draft. The
+/// `WHERE` clause on `DO UPDATE` is what makes that impossible rather than unlikely:
+/// the decision is taken inside the statement, not between a read and a write.
+pub async fn enqueue_understanding(
+    tx: &mut ScopedTx,
+    partner_id: Uuid,
+    material_id: Uuid,
+) -> DbResult<Job> {
+    let bureau_id = tx.bureau_id();
+    let key = understanding_idempotency_key(material_id);
+
+    let updated = sqlx::query(&format!(
+        "INSERT INTO otdel.jobs \
+             (bureau_id, partner_id, material_id, kind, status, idempotency_key) \
+         VALUES ($1, $2, $3, 'understand_material', 'queued', $4) \
+         ON CONFLICT (bureau_id, idempotency_key) DO UPDATE \
+            SET status = 'queued', \
+                stage = NULL, \
+                error = NULL, \
+                error_kind = NULL, \
+                run_after = now(), \
+                lease_owner = NULL, \
+                lease_expires_at = NULL, \
+                max_attempts = GREATEST(otdel.jobs.max_attempts, otdel.jobs.attempts + 1), \
+                updated_at = now() \
+          WHERE otdel.jobs.status <> 'running' \
+         RETURNING {COLUMNS}"
+    ))
+    .bind(bureau_id)
+    .bind(partner_id)
+    .bind(material_id)
+    .bind(&key)
+    .fetch_optional(tx.conn())
+    .await?;
+
+    if let Some(row) = updated {
+        return job_from_row(&row);
+    }
+
+    // The `WHERE` refused the update: the job is running right now.
+    let row = sqlx::query(&format!(
+        "SELECT {COLUMNS} FROM otdel.jobs WHERE bureau_id = $1 AND idempotency_key = $2"
+    ))
+    .bind(bureau_id)
+    .bind(&key)
+    .fetch_optional(tx.conn())
+    .await?
+    .ok_or_else(|| {
+        DbError::Decode(
+            "understanding job conflicted but the existing job is not visible".to_owned(),
+        )
+    })?;
+
+    job_from_row(&row)
+}
+
+/// Is there already an unfinished understanding job for this material?
+///
+/// Used by the extraction worker so finishing a re-read does not re-arm a run that is
+/// about to happen anyway.
+pub async fn understanding_pending(tx: &mut ScopedTx, material_id: Uuid) -> DbResult<bool> {
+    let bureau_id = tx.bureau_id();
+    let row = sqlx::query(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM otdel.jobs \
+              WHERE bureau_id = $1 AND material_id = $2 \
+                AND kind = 'understand_material' AND status IN ('queued', 'running') \
+         ) AS pending",
+    )
+    .bind(bureau_id)
+    .bind(material_id)
+    .fetch_one(tx.conn())
+    .await?;
+
+    Ok(row.try_get::<bool, _>("pending")?)
+}
+
 // --- phase 1B: leasing ---------------------------------------------------------------
 
-/// Take the next runnable job for this bureau, or `None` when the queue is empty.
+/// Take the next runnable job **of one of the given kinds**, or `None` when there is
+/// none.
+///
+/// The kind filter is what keeps the two worker halves apart: the document reader must
+/// never claim an `understand_material` row (it would try to open a knowledge job as a
+/// PDF), and the product role must never claim an extraction job. Passing the kinds
+/// explicitly makes that a property of the query rather than of a later `match`.
 ///
 /// `SKIP LOCKED` means two workers never fight over the same row and never block each
 /// other. The attempt counter is incremented *here*, at claim time, so a worker that
 /// dies mid-run still burns an attempt and a permanently poisonous document cannot be
 /// retried forever.
-pub async fn claim_next(tx: &mut ScopedTx, owner: &str, lease: Duration) -> DbResult<Option<Job>> {
+pub async fn claim_next(
+    tx: &mut ScopedTx,
+    owner: &str,
+    lease: Duration,
+    kinds: &[JobKind],
+) -> DbResult<Option<Job>> {
+    if kinds.is_empty() {
+        return Ok(None);
+    }
     let bureau_id = tx.bureau_id();
     let lease_seconds = i32::try_from(lease.as_secs()).unwrap_or(i32::MAX);
+    let kinds: Vec<String> = kinds.iter().map(|kind| kind.as_str().to_owned()).collect();
 
     let row = sqlx::query(&format!(
         "UPDATE otdel.jobs SET \
@@ -242,6 +347,7 @@ pub async fn claim_next(tx: &mut ScopedTx, owner: &str, lease: Duration) -> DbRe
           WHERE id = ( \
               SELECT j.id FROM otdel.jobs j \
                WHERE j.bureau_id = $1 AND j.status = 'queued' AND j.run_after <= now() \
+                 AND j.kind = ANY($4) \
                ORDER BY j.run_after, j.created_at, j.id \
                FOR UPDATE SKIP LOCKED \
                LIMIT 1 \
@@ -251,6 +357,7 @@ pub async fn claim_next(tx: &mut ScopedTx, owner: &str, lease: Duration) -> DbRe
     .bind(bureau_id)
     .bind(owner)
     .bind(f64::from(lease_seconds))
+    .bind(&kinds)
     .fetch_optional(tx.conn())
     .await?;
 

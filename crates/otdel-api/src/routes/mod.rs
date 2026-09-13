@@ -7,6 +7,7 @@
 
 pub mod health;
 pub mod jobs;
+pub mod knowledge;
 pub mod materials;
 pub mod pages;
 pub mod partners;
@@ -76,6 +77,26 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/partners/{partner_id}/materials/{material_id}/pages/{page_number}/retry",
             post(pages::retry),
+        )
+        // Phase 1C: the product draft and the state of the model adapter.
+        .route("/knowledge/provider", get(knowledge::provider))
+        .route("/partners/{partner_id}/knowledge", get(knowledge::overview))
+        .route(
+            "/partners/{partner_id}/knowledge/products",
+            get(knowledge::products),
+        )
+        .route(
+            "/partners/{partner_id}/knowledge/glossary",
+            get(knowledge::glossary),
+        )
+        .route("/partners/{partner_id}/knowledge/qa", get(knowledge::qa))
+        .route(
+            "/partners/{partner_id}/knowledge/gaps",
+            get(knowledge::gaps),
+        )
+        .route(
+            "/partners/{partner_id}/materials/{material_id}/understand",
+            post(knowledge::understand),
         )
         .route("/partners/{partner_id}/jobs", get(jobs::list))
         .layer(DefaultBodyLimit::max(upload_limit));

@@ -5,6 +5,10 @@
 //! * **extraction** ([`extraction`]) — the phase 1B pipeline that turns a queued
 //!   material into per-page records, source regions and tables. This is the half that
 //!   actually reads documents;
+//! * **understanding** ([`knowledge`]) — the phase 1C pipeline that turns those pages
+//!   into a structured product draft, every fact tied to a verbatim source. It runs
+//!   only when the model adapter is configured; otherwise the run is recorded as
+//!   `needs_provider` and nothing is stored;
 //! * **maintenance** ([`Maintenance`]) — the recovery work that must not require a
 //!   human: expired sessions, jobs whose lease died with their worker, staging files of
 //!   interrupted uploads, and orphan objects.
@@ -15,6 +19,7 @@
 
 pub mod error;
 pub mod extraction;
+pub mod knowledge;
 pub mod pagemap;
 pub mod workspace;
 
@@ -26,12 +31,14 @@ use otdel_db::{jobs, materials, Database};
 use otdel_extract::{
     Disabled, OcrEngine, PageProcessor, PageRasteriser, PopplerRasteriser, TesseractEngine,
 };
+use otdel_llm::LlmProvider;
 use otdel_storage::ObjectStore;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 pub use error::WorkerError;
 pub use extraction::{ExtractionReport, Extractor, ToolReport};
+pub use knowledge::{KnowledgeReport, KnowledgeWorker};
 
 /// Build the page processor from configuration.
 ///
@@ -69,6 +76,25 @@ pub async fn probe_tools(processor: &PageProcessor) -> ToolReport {
         engine: processor.engine_availability().await,
         rasteriser: processor.rasteriser_availability().await,
     }
+}
+
+/// Assemble the understanding half from configuration.
+///
+/// The provider comes from [`otdel_llm::build_provider`], which returns an adapter with
+/// no HTTP client at all when there is no key. The worker is therefore built and
+/// started in either case — it has to be, so it can record "нужен ключ" on the run
+/// instead of leaving the material silently unprocessed.
+pub fn build_knowledge_worker(
+    config: Arc<Config>,
+    db: Database,
+    provider: Arc<dyn LlmProvider>,
+) -> KnowledgeWorker {
+    KnowledgeWorker::new(config, db, provider)
+}
+
+/// The model adapter described by the configuration.
+pub fn build_llm_provider(config: &Config) -> Arc<dyn LlmProvider> {
+    otdel_llm::build_provider(&config.llm)
 }
 
 /// Assemble the extraction half from configuration.
@@ -115,6 +141,8 @@ impl Default for MaintenanceSettings {
 pub struct MaintenanceReport {
     pub sessions_purged: i64,
     pub leases_reclaimed: u64,
+    /// Understanding runs that said `running` with no job behind them.
+    pub stalled_runs_settled: u64,
     pub staging_files_removed: u64,
     pub objects_scanned: usize,
     pub orphan_objects: usize,
@@ -175,6 +203,9 @@ impl Maintenance {
 
         let mut tx = self.db.begin_scoped(bureau_id).await?;
         report.leases_reclaimed = jobs::reclaim_expired_leases(&mut tx).await?;
+        // A run whose worker died is corrected here too: the job queue recovers the
+        // job, and this recovers the record the owner is actually looking at.
+        report.stalled_runs_settled = otdel_db::knowledge::reclaim_stalled_runs(&mut tx).await?;
         tx.commit().await?;
 
         let sweep = self
@@ -246,6 +277,7 @@ impl Maintenance {
                         Ok(report) => info!(
                             sessions_purged = report.sessions_purged,
                             leases_reclaimed = report.leases_reclaimed,
+                            stalled_runs_settled = report.stalled_runs_settled,
                             staging_files_removed = report.staging_files_removed,
                             objects_scanned = report.objects_scanned,
                             orphan_objects = report.orphan_objects,

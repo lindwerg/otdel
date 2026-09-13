@@ -1,4 +1,13 @@
-import type { ExtractionSummary, MaterialStatus, PageStatus, TextSource } from '../api/types'
+import type {
+  ExtractionSummary,
+  FactKind,
+  KnowledgeFact,
+  KnowledgeRunStatus,
+  MaterialStatus,
+  PageStatus,
+  QuestionAudience,
+  TextSource,
+} from '../api/types'
 
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return '—'
@@ -187,6 +196,88 @@ export function extractionToolsLine(summary: ExtractionSummary): string | null {
     parts.push(`распознавание: ${summary.ocr_version ?? summary.ocr_engine}`)
   }
   return parts.length > 0 ? parts.join(' · ') : null
+}
+
+// --- Phase 1C: the product draft -------------------------------------------
+
+/**
+ * Labels for an understanding run.
+ *
+ * `needs_provider` is deliberately not an error: nothing failed, the model
+ * adapter simply has not been configured yet. Calling it "ошибка" would send
+ * the owner looking for a problem in the material.
+ */
+const RUN_STATUS: Record<KnowledgeRunStatus, StatusPresentation> = {
+  queued: {
+    label: 'В очереди на разбор',
+    defaultHint: 'Материал прочитан и ждёт продуктолога.',
+    tone: 'neutral',
+  },
+  running: {
+    label: 'Разбирается',
+    defaultHint: 'Продуктолог читает страницы материала.',
+    tone: 'progress',
+  },
+  completed: {
+    label: 'Разобран',
+    defaultHint: 'Все предложения модели подтверждены источником.',
+    tone: 'success',
+  },
+  partial: {
+    label: 'Разобран частично',
+    defaultHint: 'Часть предложений модели отклонена — причины ниже.',
+    tone: 'warn',
+  },
+  failed: {
+    label: 'Разбор не выполнен',
+    defaultHint: 'Черновик не создан.',
+    tone: 'error',
+  },
+  needs_provider: {
+    label: 'Ожидает настройки модели',
+    defaultHint: 'Ключ провайдера не задан: обращений к модели не было.',
+    tone: 'warn',
+  },
+}
+
+export function runStatusPresentation(status: KnowledgeRunStatus): StatusPresentation {
+  return RUN_STATUS[status] ?? { label: status, defaultHint: '', tone: 'neutral' }
+}
+
+const FACT_KIND_LABEL: Record<FactKind, string> = {
+  characteristic: 'характеристика',
+  limitation: 'ограничение',
+  application: 'применение',
+  commercial: 'коммерческое условие',
+}
+
+export function factKindLabel(kind: FactKind): string {
+  return FACT_KIND_LABEL[kind] ?? kind
+}
+
+const AUDIENCE_LABEL: Record<QuestionAudience, string> = {
+  partner: 'вопрос партнёру',
+  industry: 'вопрос для отраслевого исследования',
+}
+
+export function questionAudienceLabel(audience: QuestionAudience): string {
+  return AUDIENCE_LABEL[audience] ?? audience
+}
+
+/**
+ * The value with its unit, exactly as recorded.
+ *
+ * The unit is appended only when the server stored one — it does that only when
+ * the unit is literally written in the source — so a bare number stays a bare
+ * number instead of acquiring a plausible unit here.
+ */
+export function factValueLine(fact: KnowledgeFact): string {
+  return fact.unit ? `${fact.value_text} ${fact.unit}` : fact.value_text
+}
+
+/** Where a quotation comes from, as a sentence: «каталог.pdf, стр. 3». */
+export function evidenceSourceLine(filename: string, pageNumber: number): string {
+  return `${filename}, стр. ${pageNumber}`
 }
 
 /** Pages whose outcome the owner may still be able to change. */

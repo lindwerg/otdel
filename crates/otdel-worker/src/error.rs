@@ -37,13 +37,33 @@ pub enum WorkerError {
 
     #[error("обработка прервана")]
     Cancelled,
+
+    // --- phase 1C ---------------------------------------------------------------
+    /// The model adapter has no key/model/endpoint. Permanent on purpose: repeating
+    /// the job cannot configure it, and a queue that kept retrying would hide the one
+    /// thing the owner has to do.
+    #[error("{0}")]
+    ProviderNotConfigured(String),
+
+    /// The model was called and the call failed. The provider's own classification of
+    /// the failure decides whether this is worth repeating.
+    #[error("{diagnostic}")]
+    ModelCallFailed { diagnostic: String, retryable: bool },
+
+    /// The material has no page with usable text yet.
+    #[error("в материале нет ни одной прочитанной страницы с текстом")]
+    NothingToUnderstand,
 }
 
 impl WorkerError {
     pub fn is_permanent(&self) -> bool {
         match self {
             Self::Extract(error) => error.is_permanent(),
-            Self::MaterialMissing | Self::UnsupportedMediaType(_) => true,
+            Self::MaterialMissing
+            | Self::UnsupportedMediaType(_)
+            | Self::ProviderNotConfigured(_)
+            | Self::NothingToUnderstand => true,
+            Self::ModelCallFailed { retryable, .. } => !*retryable,
             Self::Db(_)
             | Self::Storage(_)
             | Self::Workspace(_)
@@ -79,6 +99,25 @@ mod tests {
     #[test]
     fn a_lost_lease_is_transient_the_job_belongs_to_someone_else_now() {
         assert!(!WorkerError::LeaseLost.is_permanent());
+    }
+
+    #[test]
+    fn a_missing_model_key_stops_instead_of_retrying_against_a_configuration_problem() {
+        let error = WorkerError::ProviderNotConfigured("не задан OTDEL_LLM_API_KEY".to_owned());
+        assert!(error.is_permanent());
+        assert!(error.diagnostic().contains("OTDEL_LLM_API_KEY"));
+
+        // A rate-limited provider, on the other hand, is worth another attempt.
+        assert!(!WorkerError::ModelCallFailed {
+            diagnostic: "превышен лимит запросов провайдера".to_owned(),
+            retryable: true,
+        }
+        .is_permanent());
+        assert!(WorkerError::ModelCallFailed {
+            diagnostic: "ответ модели оборван лимитом длины".to_owned(),
+            retryable: false,
+        }
+        .is_permanent());
     }
 
     #[test]

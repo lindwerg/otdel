@@ -307,6 +307,39 @@ pub async fn list_for_material(
     rows.iter().map(page_from_row).collect()
 }
 
+/// Pages of a material together with their stored text, in page order.
+///
+/// Phase 1C builds its prompt from this: only pages that really carry text are
+/// returned, so a page awaiting recognition can never become a source to quote from.
+/// The filter lives in SQL rather than in the caller because "readable" is a property
+/// of the stored row, and every caller must agree on it.
+pub async fn readable_with_text(
+    tx: &mut ScopedTx,
+    material_id: Uuid,
+) -> DbResult<Vec<(MaterialPage, String)>> {
+    let bureau_id = tx.bureau_id();
+    let rows = sqlx::query(&format!(
+        "SELECT {PAGE_COLUMNS}, {PAGE_COUNTS}, p.text_content \
+           FROM otdel.material_pages p {PAGE_COUNT_JOIN} \
+          WHERE p.bureau_id = $1 AND p.material_id = $2 \
+            AND p.status IN ('extracted', 'partial') \
+            AND btrim(coalesce(p.text_content, '')) <> '' \
+          ORDER BY p.page_number"
+    ))
+    .bind(bureau_id)
+    .bind(material_id)
+    .fetch_all(tx.conn())
+    .await?;
+
+    rows.iter()
+        .map(|row| {
+            let page = page_from_row(row)?;
+            let text: String = row.try_get("text_content")?;
+            Ok((page, text))
+        })
+        .collect()
+}
+
 /// One page with its text and evidence regions.
 pub async fn page_detail(
     tx: &mut ScopedTx,

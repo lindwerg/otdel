@@ -6,12 +6,16 @@
 //! document-reading adapters in `otdel-extract`.
 //!
 //! Phase 1A covers intake ([`model`]); phase 1B adds per-page reading of the stored
-//! originals ([`extraction`]).
+//! originals ([`extraction`]); phase 1C adds the structured product knowledge drafted
+//! from those pages ([`knowledge`]) and the configuration of the model adapter that
+//! drafts it ([`llm_config`]).
 
 pub mod config;
 pub mod error;
 pub mod extraction;
 pub mod extraction_config;
+pub mod knowledge;
+pub mod llm_config;
 pub mod media;
 pub mod model;
 pub mod secret;

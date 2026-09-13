@@ -28,8 +28,9 @@ use otdel_core::config::Config;
 use otdel_core::secret;
 use otdel_db::Database;
 use otdel_extract::{OcrEngine, PageProcessor, PageRasteriser, ToolAvailability};
+use otdel_llm::LlmProvider;
 use otdel_storage::{FilesystemObjectStore, ObjectStore};
-use otdel_worker::{Extractor, ToolReport};
+use otdel_worker::{Extractor, KnowledgeWorker, ToolReport};
 use serde_json::Value;
 use sqlx::{Executor, PgPool};
 use tower::ServiceExt;
@@ -606,5 +607,43 @@ impl TestApp {
             .run_pass(self.bureau_id, 16)
             .await
             .expect("the extraction pass must not fail as a whole")
+    }
+}
+
+// --- phase 1C: driving the product role -----------------------------------------------
+
+impl TestApp {
+    /// An application whose model adapter is the supplied one.
+    ///
+    /// The configuration of a test has no key, so the adapter built from it refuses
+    /// every call — which is exactly what the "no key" checks want, and exactly what
+    /// the positive checks cannot use. Those pass a scripted provider here; no test
+    /// ever reaches a network.
+    pub async fn start_with_provider(provider: Arc<dyn LlmProvider>) -> Self {
+        let app = Self::start().await;
+        let state = app.state.clone().with_provider(provider);
+        let router = otdel_api::app(state.clone());
+        Self {
+            router,
+            state,
+            ..app
+        }
+    }
+
+    /// The phase 1C worker, with the supplied provider.
+    pub fn knowledge_worker(&self, provider: Arc<dyn LlmProvider>) -> KnowledgeWorker {
+        KnowledgeWorker::new(
+            Arc::clone(&self.state.config),
+            self.state.db.clone(),
+            provider,
+        )
+    }
+
+    /// One understanding pass, the way `otdel-worker once` does it.
+    pub async fn run_knowledge(&self, worker: &KnowledgeWorker) -> otdel_worker::KnowledgeReport {
+        worker
+            .run_pass(self.bureau_id, 8)
+            .await
+            .expect("the understanding pass must not fail as a whole")
     }
 }

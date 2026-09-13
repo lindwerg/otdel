@@ -40,7 +40,7 @@ async fn a_claimed_job_is_not_offered_to_a_second_worker() {
     let (_partner, material_id) = queued_material(&app, &client).await;
 
     let mut tx = app.state.db.begin_scoped(app.bureau_id).await.unwrap();
-    let first = jobs::claim_next(&mut tx, "worker-a", LEASE)
+    let first = jobs::claim_next(&mut tx, "worker-a", LEASE, &JobKind::extraction_kinds())
         .await
         .unwrap()
         .expect("the queued job must be claimable");
@@ -53,7 +53,9 @@ async fn a_claimed_job_is_not_offered_to_a_second_worker() {
     assert_eq!(first.attempts, 1);
 
     let mut tx = app.state.db.begin_scoped(app.bureau_id).await.unwrap();
-    let second = jobs::claim_next(&mut tx, "worker-b", LEASE).await.unwrap();
+    let second = jobs::claim_next(&mut tx, "worker-b", LEASE, &JobKind::extraction_kinds())
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     assert!(
         second.is_none(),
@@ -70,7 +72,7 @@ async fn a_worker_that_lost_its_lease_cannot_settle_the_job() {
     let (_partner, _material_id) = queued_material(&app, &client).await;
 
     let mut tx = app.state.db.begin_scoped(app.bureau_id).await.unwrap();
-    let job = jobs::claim_next(&mut tx, "worker-a", LEASE)
+    let job = jobs::claim_next(&mut tx, "worker-a", LEASE, &JobKind::extraction_kinds())
         .await
         .unwrap()
         .unwrap();
@@ -111,7 +113,7 @@ async fn a_permanent_failure_stops_and_a_transient_one_is_scheduled_again() {
 
     // Transient: back to the queue, but not before the backoff has passed.
     let mut tx = app.state.db.begin_scoped(app.bureau_id).await.unwrap();
-    let job = jobs::claim_next(&mut tx, "worker-a", LEASE)
+    let job = jobs::claim_next(&mut tx, "worker-a", LEASE, &JobKind::extraction_kinds())
         .await
         .unwrap()
         .unwrap();
@@ -130,10 +132,12 @@ async fn a_permanent_failure_stops_and_a_transient_one_is_scheduled_again() {
     assert_eq!(listed[0].error.as_deref(), Some("хранилище недоступно"));
 
     // Not runnable yet: the backoff is real, not cosmetic.
-    assert!(jobs::claim_next(&mut tx, "worker-b", LEASE)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        jobs::claim_next(&mut tx, "worker-b", LEASE, &JobKind::extraction_kinds())
+            .await
+            .unwrap()
+            .is_none()
+    );
     tx.commit().await.unwrap();
 
     // Permanent: failed, and never handed out again.
@@ -143,7 +147,7 @@ async fn a_permanent_failure_stops_and_a_transient_one_is_scheduled_again() {
         .execute(tx.conn())
         .await
         .unwrap();
-    let job = jobs::claim_next(&mut tx, "worker-a", LEASE)
+    let job = jobs::claim_next(&mut tx, "worker-a", LEASE, &JobKind::extraction_kinds())
         .await
         .unwrap()
         .expect("runnable again once the backoff passed");
@@ -160,10 +164,12 @@ async fn a_permanent_failure_stops_and_a_transient_one_is_scheduled_again() {
     .unwrap());
     let listed = jobs::list_for_partner(&mut tx, partner).await.unwrap();
     assert_eq!(listed[0].status, JobStatus::Failed);
-    assert!(jobs::claim_next(&mut tx, "worker-b", LEASE)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        jobs::claim_next(&mut tx, "worker-b", LEASE, &JobKind::extraction_kinds())
+            .await
+            .unwrap()
+            .is_none()
+    );
     tx.commit().await.unwrap();
 
     app.cleanup().await;
@@ -176,7 +182,7 @@ async fn an_expired_lease_returns_the_job_to_the_queue() {
     let (_partner, _material_id) = queued_material(&app, &client).await;
 
     let mut tx = app.state.db.begin_scoped(app.bureau_id).await.unwrap();
-    let job = jobs::claim_next(&mut tx, "worker-a", LEASE)
+    let job = jobs::claim_next(&mut tx, "worker-a", LEASE, &JobKind::extraction_kinds())
         .await
         .unwrap()
         .unwrap();
@@ -193,7 +199,7 @@ async fn an_expired_lease_returns_the_job_to_the_queue() {
     let mut tx = app.state.db.begin_scoped(app.bureau_id).await.unwrap();
     let reclaimed = jobs::reclaim_expired_leases(&mut tx).await.unwrap();
     assert_eq!(reclaimed, 1);
-    let taken = jobs::claim_next(&mut tx, "worker-b", LEASE)
+    let taken = jobs::claim_next(&mut tx, "worker-b", LEASE, &JobKind::extraction_kinds())
         .await
         .unwrap()
         .expect("the interrupted job must become runnable again");

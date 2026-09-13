@@ -156,7 +156,15 @@ impl Extractor {
 
     async fn claim(&self, bureau_id: Uuid) -> Result<Option<Job>, WorkerError> {
         let mut tx = self.db.begin_scoped(bureau_id).await?;
-        let job = jobs::claim_next(&mut tx, &self.owner, self.settings().lease_duration).await?;
+        // Only the reading kinds: an `understand_material` row belongs to the phase 1C
+        // half, which knows what to do with it.
+        let job = jobs::claim_next(
+            &mut tx,
+            &self.owner,
+            self.settings().lease_duration,
+            &JobKind::extraction_kinds(),
+        )
+        .await?;
         tx.commit().await?;
         Ok(job)
     }
@@ -496,6 +504,36 @@ impl Extractor {
             version,
         )
         .await?;
+
+        // A material that now has readable pages is handed to the product role
+        // (phase 1C). Queueing is idempotent and is skipped while a run is already
+        // queued or running, so finishing a single-page retry cannot start a second
+        // draft of the same material.
+        let readable = summary.pages_extracted + summary.pages_partial > 0;
+        if failure.is_none() && readable {
+            if jobs::understanding_pending(&mut tx, job.material_id).await? {
+                info!(
+                    material_id = %job.material_id,
+                    "understanding of this material is already queued; not queueing again"
+                );
+            } else {
+                let queued =
+                    jobs::enqueue_understanding(&mut tx, job.partner_id, job.material_id).await?;
+                otdel_db::knowledge::enqueue_run(
+                    &mut tx,
+                    job.partner_id,
+                    job.material_id,
+                    otdel_knowledge::PROMPT_PROFILE,
+                )
+                .await?;
+                info!(
+                    material_id = %job.material_id,
+                    job_id = %queued.id,
+                    "material queued for product understanding"
+                );
+            }
+        }
+
         tx.commit().await?;
 
         info!(

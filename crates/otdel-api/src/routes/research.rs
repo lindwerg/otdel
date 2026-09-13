@@ -21,6 +21,7 @@ use otdel_core::research::{
     IndustryQuestion, ResearchBudget, ResearchFinding, ResearchPlan, ResearchQueryRecord,
     ResearchSource, ResearchSummary,
 };
+use otdel_core::research_config::SearchProviderKind;
 use otdel_core::{AppError, ErrorCode};
 use otdel_db::research::NewPlan;
 use otdel_db::{jobs, partners, research, research_read};
@@ -58,6 +59,36 @@ pub struct ResearchLimitsView {
     pub request_timeout_seconds: u64,
     pub plan_time_budget_seconds: u64,
     pub max_passes_per_plan: u32,
+    /// Results one plan may accumulate in total. Only the OpenRouter adapter meters
+    /// results, so only it sets this.
+    pub max_total_results_per_plan: Option<u32>,
+}
+
+/// Which engine will run the search, and what it is expected to cost.
+///
+/// Present only for the OpenRouter adapter — it is the one whose price depends on a
+/// choice. Everything here is a *declared tariff*: the number the ledger finally records
+/// is whatever the provider reports having charged.
+#[derive(Debug, Serialize)]
+pub struct SearchEngineView {
+    /// As configured: `auto`, `exa`, `parallel` or `native`.
+    pub configured: String,
+    /// What `auto` resolves to. For a model without built-in search this is `exa`.
+    pub effective: String,
+    /// `true` when `auto` had to fall back to Exa because the model cannot search itself.
+    pub exa_fallback: bool,
+    /// Model that runs the tool. Its tokens are part of the bill.
+    pub model: String,
+    pub max_results: u32,
+    pub max_total_results_per_plan: u32,
+    /// Forecast for one search call: the engine tariff plus the token allowance.
+    pub forecast_micros: u64,
+    pub search_base_micros: u64,
+    pub included_results: u32,
+    pub extra_result_micros: u64,
+    pub token_allowance_micros: u64,
+    /// The key came from `OTDEL_LLM_API_KEY` rather than one of the researcher's own.
+    pub api_key_inherited: bool,
 }
 
 /// Whether the researcher can run at all, and what is missing when it cannot.
@@ -75,6 +106,8 @@ pub struct ResearchProviderResponse {
     /// Hosts the researcher is allowed to read, exactly as declared.
     pub allowed_hosts: Vec<String>,
     pub limits: ResearchLimitsView,
+    /// Present when the configured adapter is OpenRouter's `openrouter:web_search`.
+    pub engine: Option<SearchEngineView>,
     pub message: String,
 }
 
@@ -412,6 +445,26 @@ fn describe_research(state: &AppState) -> ResearchProviderResponse {
     };
 
     let limits = &state.config.research.limits;
+    let research = &state.config.research;
+    let uses_openrouter = research.provider == SearchProviderKind::OpenRouterWebSearch;
+    let engine = uses_openrouter.then(|| {
+        let openrouter = &research.openrouter;
+        SearchEngineView {
+            configured: openrouter.engine.as_str().to_owned(),
+            effective: openrouter.effective_engine().as_str().to_owned(),
+            exa_fallback: openrouter.is_exa_fallback(),
+            model: openrouter.model.clone(),
+            max_results: openrouter.max_results,
+            max_total_results_per_plan: openrouter.max_total_results_per_plan,
+            forecast_micros: openrouter.forecast_micros(),
+            search_base_micros: openrouter.base_micros,
+            included_results: openrouter.included_results,
+            extra_result_micros: openrouter.extra_result_micros,
+            token_allowance_micros: openrouter.token_allowance_micros,
+            api_key_inherited: openrouter.api_key_inherited,
+        }
+    });
+
     ResearchProviderResponse {
         state: state_label.to_owned(),
         search: AdapterView {
@@ -446,7 +499,10 @@ fn describe_research(state: &AppState) -> ResearchProviderResponse {
             request_timeout_seconds: limits.request_timeout.as_secs(),
             plan_time_budget_seconds: limits.plan_time_budget.as_secs(),
             max_passes_per_plan: limits.max_passes_per_plan,
+            max_total_results_per_plan: uses_openrouter
+                .then_some(research.openrouter.max_total_results_per_plan),
         },
+        engine,
         message,
     }
 }
@@ -474,6 +530,7 @@ mod tests {
             request_timeout_seconds: limits.request_timeout.as_secs(),
             plan_time_budget_seconds: limits.plan_time_budget.as_secs(),
             max_passes_per_plan: limits.max_passes_per_plan,
+            max_total_results_per_plan: None,
         };
         let rendered = serde_json::to_value(&view).unwrap();
         assert_eq!(

@@ -13,6 +13,7 @@ import {
   pagesNeedingAttention,
   planStatusPresentation,
   queryOutcomeLabel,
+  searchProviderLabel,
   questionAudienceLabel,
   RETRYABLE_MATERIAL_STATUSES,
   RETRYABLE_PAGE_STATUSES,
@@ -246,5 +247,16 @@ describe('research (phase 1D)', () => {
     expect(queryOutcomeLabel('unknown')).toMatch(/сверка расхода/)
     expect(queryOutcomeLabel('refused')).toBe('не отправлялся')
     expect(queryOutcomeLabel('ok')).toBe('выполнен')
+  })
+
+  it('keeps the engine visible next to the adapter that used it', () => {
+    // With `auto` the adapter and the engine are different answers, and the price
+    // follows the engine — so the journal shows both rather than folding them.
+    expect(searchProviderLabel('openrouter_web_search/exa')).toBe('OpenRouter web search · exa')
+    expect(searchProviderLabel('openrouter_web_search/native')).toMatch(/· native$/)
+    // No engine ran, so none is named.
+    expect(searchProviderLabel('openrouter_web_search')).toBe('OpenRouter web search')
+    // An adapter nobody has taught this interface about is shown as it is, not hidden.
+    expect(searchProviderLabel('some_future_adapter')).toBe('some_future_adapter')
   })
 })

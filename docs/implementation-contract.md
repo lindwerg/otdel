@@ -176,19 +176,40 @@ quote, char_start, char_end}`. `quote` — дословный фрагмент �
 
 Те же правила конверта, авторизации и CSRF. Дополнения строго аддитивные.
 
-**Состояние адаптеров.** Поисковый провайдер для OTDEL не выбран (`block-01-spec.md` §3),
-поэтому нормальное состояние — `needs_configuration`. Готовность требует всех трёх
-половин: поискового endpoint, списка разрешённых хостов и модели. Исследователь, который
-умеет искать, но не имеет права ничего прочитать (или прочитал бы, но не может
-истолковать), израсходовал бы бюджет и не дал ответа.
+**Состояние адаптеров.** Поисковый провайдер выбран владельцем: официальный серверный
+инструмент OpenRouter `openrouter:web_search`, вызываемый через тот же
+`/chat/completions`, что и продуктовые роли (`OTDEL_RESEARCH_PROVIDER=openrouter`).
+Собственного endpoint ему не нужно; при пустом `OTDEL_RESEARCH_API_KEY` он использует
+`OTDEL_LLM_API_KEY` — тот же счёт и тот же сервис. Прежний адаптер `http_json` (произвольный
+endpoint документированной формы) сохранён без изменений.
+
+Готовность требует всех трёх половин: поискового адаптера, списка разрешённых хостов и
+модели. Исследователь, который умеет искать, но не имеет права ничего прочитать (или
+прочитал бы, но не может истолковать), израсходовал бы бюджет и не дал ответа.
+
+Ссылки, которые возвращает поиск, **не становятся источниками**: каждая проходит тот же
+путь, что и любая другая — `NormalisedUrl`, список разрешённых хостов, защищённый
+резолвер, `robots.txt`, лимиты размера, снимок с SHA-256 и проверка цитаты по этому снимку.
+Проза модели, выполнявшей поиск, отбрасывается целиком; используются только аннотации
+`url_citation`.
 
 - `GET /api/research/provider` → `{state, search, fetcher, model, missing[], allowed_hosts[],
-  limits, message}`. `state`: `ready` | `needs_configuration` | `disabled`.
+  limits, engine, message}`. `state`: `ready` | `needs_configuration` | `disabled`.
   `search`/`fetcher`/`model` — `AdapterView` = `{state, provider, endpoint_host, model,
   message}`. Ключ не возвращается никогда и ни в каком виде; `endpoint_host` — только хост.
   `limits` = `{max_queries_per_plan, max_results_per_query, max_sources_per_plan,
   max_page_bytes, max_page_chars, request_timeout_seconds, plan_time_budget_seconds,
-  max_passes_per_plan}` — границы объявляются интерфейсу до запуска, а не после.
+  max_passes_per_plan, max_total_results_per_plan}` — границы объявляются интерфейсу до
+  запуска, а не после; `max_total_results_per_plan` — `null` для провайдера, который не
+  тарифицирует результаты.
+  `engine` — `null`, кроме адаптера OpenRouter, где это
+  `{configured, effective, exa_fallback, model, max_results, max_total_results_per_plan,
+  forecast_micros, search_base_micros, included_results, extra_result_micros,
+  token_allowance_micros, api_key_inherited}`. `configured` — что задал владелец
+  (`auto` | `exa` | `parallel` | `native`, список закрытый); `effective` — что выполнится
+  на самом деле: `auto` превращается в `native` для модели со встроенным поиском и в `exa`
+  для остальных, и тогда `exa_fallback = true`. `forecast_micros` — прогноз одного поиска
+  по объявленному тарифу, а не счёт.
 
 **Бюджет.** Суммы — целые, в миллионных долях валютной единицы; пересчёта между валютами
 нет. Потолки — это настройка (`OTDEL_RESEARCH_BUDGET_MICROS`), балансы — данные.
@@ -248,6 +269,13 @@ outcome, diagnostic, created_at}`. `query_text` — дословно то, чт�
 `outcome`: `ok` | `failed` | `unknown` | `refused`. `refused` — запрос не отправлялся
 (например, вопрос называет партнёра) и стоил ноль; `unknown` — запрос ушёл, ответ не
 получен: расход засчитан и помечен к сверке.
+
+`provider` — `адаптер` либо `адаптер/движок` (`openrouter_web_search/exa`), когда известно,
+какой движок действительно выполнил запрос: при `auto` это разные ответы, и цена следует за
+движком. `cost_micros` — сумма, **фактически** списанная за этот вызов: если провайдер
+сообщил свою стоимость (`usage.cost` у OpenRouter), записывается она, иначе — объявленный
+тариф, посчитанный по реально вернувшимся результатам. Прогноз показывается отдельно
+(`ResearchBudget.cost_per_search_micros`), и интерфейс не выдаёт одно за другое.
 
 `ResearchSource`: `{id, plan_id, query_id, url, host, title, snippet, status, http_status,
 content_type, content_bytes, content_chars, content_hash, license, license_note,

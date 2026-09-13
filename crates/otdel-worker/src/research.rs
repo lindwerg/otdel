@@ -31,16 +31,19 @@ use otdel_core::model::{Job, JobKind};
 use otdel_core::research::{
     QueryOutcome, ResearchPlan, ResearchPlanStatus, SourceStatus, SpendKind, SpendState,
 };
+use otdel_core::research_config::SearchProviderKind;
 use otdel_db::research::{
     self, NewFinding, NewFindingEvidence, NewSource, PlanOutcome, Reservation, ReserveOutcome,
     SourceOutcome,
 };
 use otdel_db::{jobs, partners, research_read, Database};
 use otdel_research::{
-    interpret_sources, CostModel, ExternalCatalog, ExternalSource, FindingLimits, ResearchContext,
-    ResearchError,
+    format_micros, interpret_sources, CostModel, ExternalCatalog, ExternalSource, FindingLimits,
+    ResearchContext, ResearchError,
 };
-use otdel_search::{DocumentFetcher, FetchRefusal, NormalisedUrl, SearchProvider, SearchRequest};
+use otdel_search::{
+    DocumentFetcher, FetchRefusal, NormalisedUrl, SearchBilling, SearchProvider, SearchRequest,
+};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -422,6 +425,19 @@ impl ResearchWorker {
             if pass.stopped_for_budget || self.should_stop(bureau_id, plan_id, &mut pass).await? {
                 break;
             }
+            // A plan-wide ceiling on *results*, not just on pages. With a provider that
+            // charges per result, a query that keeps finding new links is a query that
+            // keeps spending, and `max_sources_per_plan` alone would not bound it: results
+            // outside the allowlist cost money and are never read.
+            if let Some(limit) = self.max_total_results() {
+                if pass.results_seen >= limit {
+                    pass.note(format!(
+                        "поиск остановлен: достигнут предел в {limit} результатов на одно \
+                         исследование"
+                    ));
+                    break;
+                }
+            }
             self.heartbeat(bureau_id, job, "searching").await?;
             self.run_one_query(bureau_id, &plan, plan_id, index + 1, query, &mut pass)
                 .await?;
@@ -744,6 +760,32 @@ impl ResearchWorker {
         Ok(pass.job_outcome(status, u32::try_from(stored).unwrap_or(0)))
     }
 
+    /// The plan-wide ceiling on results, when the configured provider has one.
+    fn max_total_results(&self) -> Option<u32> {
+        (self.config.research.provider == SearchProviderKind::OpenRouterWebSearch)
+            .then_some(self.config.research.openrouter.max_total_results_per_plan)
+    }
+
+    /// What one finished search call is charged.
+    ///
+    /// A provider that reports its own cost has the last word: that number is the invoice,
+    /// and preferring a declared tariff over it would be preferring a guess to a fact. When
+    /// nothing is reported the tariff stands, computed from the results that really came
+    /// back rather than from the count that was asked for.
+    fn charge_for_search(&self, billing: &SearchBilling, hits: usize) -> i64 {
+        let micros = if let Some(reported) = billing.reported_micros {
+            reported
+        } else if self.config.research.provider == SearchProviderKind::OpenRouterWebSearch {
+            let openrouter = &self.config.research.openrouter;
+            openrouter
+                .search_cost_micros(u32::try_from(hits).unwrap_or(u32::MAX))
+                .saturating_add(openrouter.token_allowance_micros)
+        } else {
+            self.config.research.costs.search_micros
+        };
+        i64::try_from(micros).unwrap_or(i64::MAX)
+    }
+
     /// One search request, with its reservation, its settlement and its journal entry.
     async fn run_one_query(
         &self,
@@ -770,13 +812,14 @@ impl ResearchWorker {
             })
             .await;
 
-        let (state, note, outcome, hits, diagnostic) = match answer {
+        let (state, note, outcome, hits, diagnostic, billing) = match answer {
             Ok(answer) => (
                 SpendState::Settled,
                 None,
                 QueryOutcome::Ok,
                 answer.hits,
                 None,
+                answer.billing,
             ),
             Err(error) => {
                 let diagnostic = error.diagnostic();
@@ -794,21 +837,53 @@ impl ResearchWorker {
                     outcome,
                     Vec::new(),
                     Some(diagnostic),
+                    SearchBilling::default(),
                 )
             }
         };
 
         let charged = matches!(state, SpendState::Settled | SpendState::Unknown);
+        // Reserved at the forecast, settled at what it really cost. A failed call that was
+        // nevertheless sent is charged the forecast: the provider billed *something* and
+        // said nothing about how much.
+        let amount = if charged && outcome == QueryOutcome::Ok {
+            self.charge_for_search(&billing, hits.len())
+        } else {
+            cost
+        };
+
         let mut tx = self.db.begin_scoped(bureau_id).await?;
-        research::settle(&mut tx, &reservation, state, note.as_deref()).await?;
+        let mut settle_note = note.clone();
+        if charged && amount != cost {
+            let currency = &self.config.research.costs.currency;
+            let line = format!(
+                "по факту {} вместо прогноза {}",
+                format_micros(amount, currency),
+                format_micros(cost, currency)
+            );
+            settle_note = Some(match settle_note {
+                Some(existing) => format!("{existing}; {line}"),
+                None => line,
+            });
+        }
+        research::settle_amount(&mut tx, &reservation, amount, state, settle_note.as_deref())
+            .await?;
+
+        // The journal records which engine really served the query, not just which adapter
+        // was configured: with `auto` those are different answers, and the cost follows the
+        // engine.
+        let provider_label = match &billing.engine {
+            Some(engine) => format!("{}/{engine}", self.search.describe().provider),
+            None => self.search.describe().provider,
+        };
         let query_id = research::record_query(
             &mut tx,
             plan_id,
             i32::try_from(ordinal).unwrap_or(i32::MAX),
             query,
-            &self.search.describe().provider,
+            &provider_label,
             i32::try_from(hits.len()).unwrap_or(i32::MAX),
-            if charged { cost } else { 0 },
+            if charged { amount } else { 0 },
             outcome,
             diagnostic.as_deref(),
         )
@@ -817,7 +892,7 @@ impl ResearchWorker {
         pass.queries_made += 1;
         pass.results_seen += u32::try_from(hits.len()).unwrap_or(0);
         if charged {
-            pass.micros_spent = pass.micros_spent.saturating_add(cost);
+            pass.micros_spent = pass.micros_spent.saturating_add(amount);
         }
         if let Some(diagnostic) = &diagnostic {
             pass.note(format!("поиск: {diagnostic}"));

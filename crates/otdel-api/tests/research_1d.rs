@@ -29,7 +29,7 @@ use axum::http::{Method, Request, StatusCode};
 use otdel_llm::fake::{FakeProvider, FakeReply};
 use otdel_llm::{LlmProvider, UnconfiguredProvider};
 use otdel_search::fake::{
-    FakeFetchReply, FakeFetcher, FakePage, FakeSearchProvider, FakeSearchReply,
+    FakeChatTransport, FakeFetchReply, FakeFetcher, FakePage, FakeSearchProvider, FakeSearchReply,
 };
 use otdel_search::{DocumentFetcher, SearchError, SearchProvider};
 use serde_json::{json, Value};
@@ -1715,6 +1715,408 @@ async fn a_conclusion_cannot_be_stored_without_an_external_source() {
         Some("23000"),
         "expected an integrity violation, got: {error}"
     );
+
+    app.cleanup().await;
+}
+
+// --- the OpenRouter researcher ------------------------------------------------------------
+//
+// These drive the **real** `openrouter:web_search` adapter with only its socket replaced
+// (`FakeChatTransport`), so what is under test is the production request body, the
+// production citation parser and the production cost arithmetic. No key exists in the test
+// environment and nothing reaches a network.
+
+/// The answer shape OpenRouter really returns, priced at `cost` US dollars.
+fn openrouter_citing(urls: &[&str], cost: f64) -> Arc<FakeChatTransport> {
+    Arc::new(FakeChatTransport::citing(urls, cost))
+}
+
+#[tokio::test]
+async fn an_openrouter_search_finds_sources_and_is_charged_what_the_provider_reported() {
+    let transport = openrouter_citing(&[STANDARD_URL], 0.0081);
+    let fetcher = serving_standard("docs.example.org");
+    let model = interpreting_llm("E1", STANDARD_QUOTE, "55");
+
+    let (app, search) = TestApp::start_with_openrouter(
+        Arc::clone(&transport) as Arc<dyn otdel_search::ChatTransport>,
+        Arc::clone(&fetcher) as Arc<dyn DocumentFetcher>,
+        Arc::clone(&model) as Arc<dyn LlmProvider>,
+        ResearchOverrides::ready()
+            .with_openrouter("auto")
+            .with_max_queries(1),
+    )
+    .await;
+    let client = app.sign_in().await;
+    let partner = app.create_partner(&client, "BASIS").await;
+    let question = industry_question(&app, &client, partner).await;
+
+    // The interface states the engine and the price *before* anything runs.
+    let provider = get(&app, &client, "/api/research/provider").await;
+    assert_eq!(provider["state"], "ready", "{provider}");
+    assert_eq!(provider["search"]["provider"], "openrouter_web_search");
+    assert_eq!(provider["engine"]["configured"], "auto");
+    assert_eq!(
+        provider["engine"]["effective"], "exa",
+        "gpt-4o-mini cannot search by itself, so `auto` is Exa"
+    );
+    assert_eq!(provider["engine"]["exa_fallback"], true);
+    assert_eq!(provider["engine"]["max_results"], 5);
+    // $0.007 for the request, plus the declared token allowance.
+    assert_eq!(provider["engine"]["search_base_micros"], 7_000);
+    assert_eq!(provider["engine"]["forecast_micros"], 10_000);
+    assert_eq!(
+        provider["engine"]["api_key_inherited"], true,
+        "the owner must be able to see which key is being spent"
+    );
+
+    let approved = approve(&app, &client, partner, question).await;
+    assert_eq!(approved.status, StatusCode::OK, "{}", approved.text());
+    let plan_id = Uuid::parse_str(approved.json()["id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        transport.call_count(),
+        0,
+        "approval queues, it does not search"
+    );
+
+    let worker = app.research_worker(
+        Arc::clone(&search) as Arc<dyn SearchProvider>,
+        Arc::clone(&fetcher) as Arc<dyn DocumentFetcher>,
+        Arc::clone(&model) as Arc<dyn LlmProvider>,
+    );
+    let report = app.run_research(&worker).await;
+    assert_eq!(report.jobs_completed, 1, "{report:?}");
+    assert_eq!(report.findings_stored, 1, "{report:?}");
+
+    // What really left the machine: the official server tool, the vetted query, no key.
+    assert_eq!(transport.call_count(), 1);
+    let request = &transport.requests()[0];
+    assert_eq!(request["tools"][0]["type"], "openrouter:web_search");
+    assert_eq!(request["tools"][0]["parameters"]["max_results"], 5);
+    assert_eq!(request["model"], "openai/gpt-4o-mini");
+    let sent = serde_json::to_string(request).unwrap();
+    assert!(
+        !sent.contains("sk-or-v1-"),
+        "the key travels in a header only"
+    );
+    assert!(
+        !sent.to_lowercase().contains("basis"),
+        "the partner's name must never reach a search engine: {sent}"
+    );
+
+    // The citation became a source through the ordinary pipeline — allowlist, fetch,
+    // snapshot, hash — and the model's prose was not stored as anything.
+    let sources = get(
+        &app,
+        &client,
+        &format!("/api/partners/{partner}/research/plans/{plan_id}/sources"),
+    )
+    .await;
+    let sources = sources["items"].as_array().unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["url"], STANDARD_URL);
+    assert_eq!(sources[0]["status"], "fetched");
+    assert_eq!(sources[0]["content_hash"].as_str().unwrap().len(), 64);
+
+    // The journal names the engine that really served the query, not just the adapter.
+    let queries = get(
+        &app,
+        &client,
+        &format!("/api/partners/{partner}/research/plans/{plan_id}/queries"),
+    )
+    .await;
+    let queries = queries["items"].as_array().unwrap();
+    assert_eq!(queries[0]["outcome"], "ok");
+    assert_eq!(queries[0]["provider"], "openrouter_web_search/exa");
+
+    // Money: reserved at the 10 000 forecast, settled at the 8 100 the provider reported.
+    // The reported number wins, because it is an invoice and the forecast is a guess.
+    assert_eq!(
+        queries[0]["cost_micros"], 8_100,
+        "the journal records the charge, not the forecast: {queries:?}"
+    );
+    let budget = get(&app, &client, "/api/research/budget").await;
+    assert_eq!(budget["reserved_micros"], 0, "nothing is left held");
+    assert_eq!(budget["spent_micros"], 8_100, "{budget}");
+    assert_eq!(
+        budget["cost_per_search_micros"], 10_000,
+        "the forecast is still stated"
+    );
+    assert_eq!(budget["unknown_micros"], 0);
+
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_openrouter_answer_with_no_citations_is_a_failure_not_an_empty_result() {
+    // A model that answers from memory instead of searching must not look like "ничего не
+    // опубликовано по этому вопросу". It was sent, so it is charged — at the forecast,
+    // because nothing came back to correct it.
+    let transport = Arc::new(FakeChatTransport::new(vec![Ok(json!({
+        "choices": [{"message": {"role": "assistant", "content": "Обычно 55 мкм."}}],
+        "usage": {"prompt_tokens": 40, "completion_tokens": 12},
+    }))]));
+    let fetcher = serving_standard("docs.example.org");
+    let model = interpreting_llm("E1", STANDARD_QUOTE, "55");
+
+    let (app, search) = TestApp::start_with_openrouter(
+        Arc::clone(&transport) as Arc<dyn otdel_search::ChatTransport>,
+        Arc::clone(&fetcher) as Arc<dyn DocumentFetcher>,
+        Arc::clone(&model) as Arc<dyn LlmProvider>,
+        ResearchOverrides::ready()
+            .with_openrouter("exa")
+            .with_max_queries(1),
+    )
+    .await;
+    let client = app.sign_in().await;
+    let partner = app.create_partner(&client, "BASIS").await;
+    let question = industry_question(&app, &client, partner).await;
+    approve(&app, &client, partner, question).await;
+
+    let worker = app.research_worker(
+        Arc::clone(&search) as Arc<dyn SearchProvider>,
+        Arc::clone(&fetcher) as Arc<dyn DocumentFetcher>,
+        Arc::clone(&model) as Arc<dyn LlmProvider>,
+    );
+    app.run_research(&worker).await;
+
+    let plan = plan_of(&app, &client, partner).await;
+    let plan_id = Uuid::parse_str(plan["id"].as_str().unwrap()).unwrap();
+    let queries = get(
+        &app,
+        &client,
+        &format!("/api/partners/{partner}/research/plans/{plan_id}/queries"),
+    )
+    .await;
+    let queries = queries["items"].as_array().unwrap();
+    assert_eq!(queries[0]["outcome"], "failed", "{queries:?}");
+    assert_eq!(queries[0]["results_count"], 0);
+    assert!(
+        queries[0]["diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("не выполнила веб-поиск"),
+        "the reason must say the search did not happen: {queries:?}"
+    );
+    assert_eq!(
+        queries[0]["provider"], "openrouter_web_search",
+        "no engine ran, so none is named: {queries:?}"
+    );
+
+    // Nothing was read, so nothing was concluded.
+    assert_eq!(plan["sources_fetched"], 0);
+    assert_ne!(plan["status"], "completed");
+    assert_eq!(
+        get(&app, &client, "/api/research/budget").await["spent_micros"],
+        10_000,
+        "a request that reached the provider is charged even when it answers uselessly"
+    );
+
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_link_from_the_search_tool_is_still_bound_by_the_allowlist() {
+    // The whole point of keeping our own fetch pipeline: OpenRouter can cite anything, and
+    // what may be *read* is still only what the owner declared.
+    let transport = openrouter_citing(&["https://blog.example.net/opinion", STANDARD_URL], 0.0072);
+    let fetcher = serving_standard("docs.example.org");
+    let model = interpreting_llm("E1", STANDARD_QUOTE, "55");
+
+    let (app, search) = TestApp::start_with_openrouter(
+        Arc::clone(&transport) as Arc<dyn otdel_search::ChatTransport>,
+        Arc::clone(&fetcher) as Arc<dyn DocumentFetcher>,
+        Arc::clone(&model) as Arc<dyn LlmProvider>,
+        ResearchOverrides::ready()
+            .with_openrouter("exa")
+            .with_max_queries(1),
+    )
+    .await;
+    let client = app.sign_in().await;
+    let partner = app.create_partner(&client, "BASIS").await;
+    let question = industry_question(&app, &client, partner).await;
+    approve(&app, &client, partner, question).await;
+
+    let worker = app.research_worker(
+        Arc::clone(&search) as Arc<dyn SearchProvider>,
+        Arc::clone(&fetcher) as Arc<dyn DocumentFetcher>,
+        Arc::clone(&model) as Arc<dyn LlmProvider>,
+    );
+    app.run_research(&worker).await;
+
+    let plan = plan_of(&app, &client, partner).await;
+    let plan_id = Uuid::parse_str(plan["id"].as_str().unwrap()).unwrap();
+    let sources = get(
+        &app,
+        &client,
+        &format!("/api/partners/{partner}/research/plans/{plan_id}/sources"),
+    )
+    .await;
+    let sources = sources["items"].as_array().unwrap();
+    assert_eq!(sources.len(), 2, "both links are journalled: {sources:?}");
+
+    let refused = sources
+        .iter()
+        .find(|source| source["host"] == "blog.example.net")
+        .expect("the undeclared host is in the journal");
+    assert_eq!(refused["status"], "skipped_host");
+    assert!(refused["content_hash"].is_null(), "it was never opened");
+    assert!(refused["retrieved_at"].is_null());
+
+    let read = sources
+        .iter()
+        .find(|source| source["host"] == "docs.example.org")
+        .expect("the declared host was read");
+    assert_eq!(read["status"], "fetched");
+
+    // And only the page that was really read can support a conclusion.
+    let findings = get(
+        &app,
+        &client,
+        &format!("/api/partners/{partner}/research/findings"),
+    )
+    .await;
+    for finding in findings["items"].as_array().unwrap() {
+        for evidence in finding["evidence"].as_array().unwrap() {
+            assert_eq!(evidence["host"], "docs.example.org", "{finding}");
+        }
+    }
+
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_plan_wide_result_ceiling_stops_searching_before_the_query_list_runs_out() {
+    // With a per-result tariff, every extra result is money. `max_sources_per_plan` bounds
+    // what is *read*; this bounds what is paid for, including the links that will be
+    // refused by the allowlist and never opened.
+    let transport = Arc::new(FakeChatTransport::new(vec![
+        Ok(json!({
+            "choices": [{"message": {"annotations": (0..3)
+                .map(|index| json!({
+                    "type": "url_citation",
+                    "url_citation": {"url": format!("https://docs.example.org/a{index}")},
+                }))
+                .collect::<Vec<_>>()}}],
+            "usage": {"cost": 0.007},
+        })),
+        Ok(json!({
+            "choices": [{"message": {"annotations": [{
+                "type": "url_citation",
+                "url_citation": {"url": "https://docs.example.org/second"},
+            }]}}],
+            "usage": {"cost": 0.007},
+        })),
+    ]));
+    let fetcher = Arc::new(
+        FakeFetcher::serving(STANDARD_URL, FakePage::text(STANDARD_PAGE)).with_allowlist(
+            otdel_core::research_config::HostAllowlist::parse("docs.example.org").unwrap(),
+        ),
+    );
+
+    let model = interpreting_llm("E1", STANDARD_QUOTE, "55");
+
+    let (app, search) = TestApp::start_with_openrouter(
+        Arc::clone(&transport) as Arc<dyn otdel_search::ChatTransport>,
+        Arc::clone(&fetcher) as Arc<dyn DocumentFetcher>,
+        Arc::clone(&model) as Arc<dyn LlmProvider>,
+        ResearchOverrides::ready()
+            .with_openrouter("exa")
+            // Three results per query, three allowed per plan: the first search fills the
+            // allowance and the second must never be made.
+            .with_openrouter_results(3, 3)
+            .with_max_queries(3)
+            .with_max_sources(10),
+    )
+    .await;
+    let client = app.sign_in().await;
+    let partner = app.create_partner(&client, "BASIS").await;
+    let question = industry_question(&app, &client, partner).await;
+    approve(&app, &client, partner, question).await;
+
+    let worker = app.research_worker(
+        Arc::clone(&search) as Arc<dyn SearchProvider>,
+        Arc::clone(&fetcher) as Arc<dyn DocumentFetcher>,
+        Arc::clone(&model) as Arc<dyn LlmProvider>,
+    );
+    app.run_research(&worker).await;
+
+    assert_eq!(
+        transport.call_count(),
+        1,
+        "the second search would have paid for results the plan may not accumulate"
+    );
+    let plan = plan_of(&app, &client, partner).await;
+    assert_eq!(plan["results_seen"], 3);
+    assert_eq!(plan["queries_made"], 1);
+    assert!(
+        plan["stop_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("результатов")
+            || plan["status"] == "partial",
+        "the plan says why it stopped: {plan}"
+    );
+
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_search_that_cost_more_than_its_reservation_is_recorded_at_what_it_cost() {
+    // The money is already gone. Trimming the number to the reservation would make the
+    // ledger disagree with the account it exists to track, and would hide exactly the case
+    // the owner needs to see. The ceiling still does its work: the next reservation sees
+    // the larger balance and refuses, so the plan stops instead of running away.
+    let transport = openrouter_citing(&[STANDARD_URL], 0.05);
+    let fetcher = serving_standard("docs.example.org");
+    let model = interpreting_llm("E1", STANDARD_QUOTE, "55");
+
+    let (app, search) = TestApp::start_with_openrouter(
+        Arc::clone(&transport) as Arc<dyn otdel_search::ChatTransport>,
+        Arc::clone(&fetcher) as Arc<dyn DocumentFetcher>,
+        Arc::clone(&model) as Arc<dyn LlmProvider>,
+        ResearchOverrides::ready()
+            .with_openrouter("exa")
+            // Three queries are allowed and the plan can afford four forecasts of 10 000 —
+            // but the first call really costs 50 000, which leaves room for no more.
+            .with_max_queries(3)
+            .with_plan_budget(45_000)
+            .with_bureau_budget(45_000),
+    )
+    .await;
+    let client = app.sign_in().await;
+    let partner = app.create_partner(&client, "BASIS").await;
+    let question = industry_question(&app, &client, partner).await;
+    approve(&app, &client, partner, question).await;
+
+    let worker = app.research_worker(
+        Arc::clone(&search) as Arc<dyn SearchProvider>,
+        Arc::clone(&fetcher) as Arc<dyn DocumentFetcher>,
+        Arc::clone(&model) as Arc<dyn LlmProvider>,
+    );
+    app.run_research(&worker).await;
+
+    assert_eq!(
+        transport.call_count(),
+        1,
+        "the overrun must stop the plan, not be absorbed silently"
+    );
+    let budget = get(&app, &client, "/api/research/budget").await;
+    assert_eq!(
+        budget["spent_micros"], 50_000,
+        "the ledger records the invoice, not the reservation: {budget}"
+    );
+    assert_eq!(
+        budget["reserved_micros"], 0,
+        "nothing is left held: {budget}"
+    );
+    assert_eq!(
+        budget["available_micros"], 0,
+        "an overspent budget reports nothing available rather than a negative number"
+    );
+
+    let plan = plan_of(&app, &client, partner).await;
+    assert_eq!(plan["queries_made"], 1);
+    assert_eq!(plan["spent_micros"], 50_000);
 
     app.cleanup().await;
 }

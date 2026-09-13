@@ -6,6 +6,7 @@ import { useResearch } from '../../hooks/useResearch'
 import { formatMicros, planStatusPresentation } from '../../lib/format'
 import { StatusMessage } from '../StatusMessage'
 import { BudgetMeter } from './BudgetMeter'
+import { EngineNotice } from './EngineNotice'
 import { FindingList } from './FindingList'
 import { ResearchNotice } from './ResearchNotice'
 import { SourceJournal } from './SourceJournal'
@@ -112,6 +113,9 @@ export function ResearchPanel({ partnerId }: ResearchPanelProps) {
       ) : null}
 
       <ResearchNotice provider={overview.provider} />
+      {overview.provider.engine ? (
+        <EngineNotice engine={overview.provider.engine} currency={currency} />
+      ) : null}
       <BudgetMeter budget={overview.budget} />
 
       <p className="knowledge-summary">{summaryLine(overview.summary, currency)}</p>

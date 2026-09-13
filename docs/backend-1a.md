@@ -47,7 +47,7 @@ regenerates them, which invalidates the database roles already created.
 | `crates/otdel-extract` | Phase 1B: PDF text layer (pure Rust), layout/tables, OCR adapters. |
 | `crates/otdel-llm` | Phase 1C: the single model adapter — bounded calls, redacted logs, an honest "not configured". |
 | `crates/otdel-knowledge` | Phase 1C as a pure pipeline: source catalogue, prompt, quotation matching, validation. |
-| `crates/otdel-search` | Phase 1D: the outward-facing adapters — configured search endpoint, SSRF-hardened fetcher. |
+| `crates/otdel-search` | Phase 1D: the outward-facing adapters — OpenRouter's `openrouter:web_search` server tool, a generic JSON search endpoint, and the SSRF-hardened fetcher every found link goes through. |
 | `crates/otdel-research` | Phase 1D as a pure pipeline: query building, external catalogue, budget arithmetic, validation. |
 | `crates/otdel-api` | Axum router, session/CSRF, upload/download handlers, integration tests. |
 | `crates/otdel-worker` | Extraction (1B), understanding (1C) and research (1D) + recovery maintenance. |

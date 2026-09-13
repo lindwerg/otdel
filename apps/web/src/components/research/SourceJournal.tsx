@@ -7,6 +7,7 @@ import {
   formatDateTime,
   formatMicros,
   queryOutcomeLabel,
+  searchProviderLabel,
   sourceStatusPresentation,
 } from '../../lib/format'
 import { StatusMessage } from '../StatusMessage'
@@ -97,7 +98,8 @@ export function SourceJournal({ partnerId, planId, currency }: SourceJournalProp
             <li key={query.id} className="journal__query" data-outcome={query.outcome}>
               <code className="journal__query-text">{query.query_text}</code>
               <span className="journal__query-meta">
-                {queryOutcomeLabel(query.outcome)} · результатов: {query.results_count} ·{' '}
+                {searchProviderLabel(query.provider)} · {queryOutcomeLabel(query.outcome)} ·
+                результатов: {query.results_count} ·{' '}
                 {formatMicros(query.cost_micros, currency)}
               </span>
               {query.diagnostic ? (

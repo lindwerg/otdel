@@ -163,6 +163,79 @@
   color: var(--muted);
 }
 
+/* --- which engine searches, and what it is forecast to cost ------------------ */
+
+.engine {
+  margin-top: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.engine__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.engine__head h4 {
+  margin: 0;
+  font-size: 0.9375rem;
+}
+
+/* The engine is the thing the price depends on, so it reads as a label rather
+   than as one more number in a row. */
+.engine__badge {
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.engine__figures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin: 10px 0 0;
+}
+
+.engine__figures dt {
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.engine__figures dd {
+  margin: 2px 0 0;
+  font-size: 0.875rem;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.engine__fallback {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--line-strong, var(--line));
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--surface-2);
+  font-size: 0.8125rem;
+  color: var(--ink);
+}
+
+.engine__footnote {
+  margin-top: 8px;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
 /* --- the approval queue ----------------------------------------------------- */
 
 .question-list,

@@ -241,7 +241,14 @@ impl SearchProvider for HttpSearchProvider {
             "search call finished"
         );
 
-        Ok(SearchAnswer { hits, duration })
+        // This adapter is a plain search endpoint: it reports no cost of its own, so the
+        // declared tariff is the only number there is, and the caller is told as much by
+        // the absence of `reported_micros`.
+        Ok(SearchAnswer {
+            hits,
+            duration,
+            billing: crate::provider::SearchBilling::default(),
+        })
     }
 }
 

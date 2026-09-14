@@ -1,0 +1,606 @@
+/*
+  OTDEL — R05: the product base.
+
+  Same tokens as global.css; nothing here defines a colour, a radius or a face of
+  its own. Two visual ideas carry the whole surface, and both are arguments
+  rather than decoration.
+
+  **An unknown is not a muted fact.** A gap, an uncertainty and an unmet
+  requirement are rendered on their own surface with a warm rule — the same
+  weight as a fact, never lighter. The temptation is to grey them out so the page
+  looks calm; that is precisely how the audited run came to be read as a success.
+
+  **A verdict that means "nobody checked" never looks like one that means
+  "checked and fine".** `--warn-strong` is used for `unknown` states, not
+  `--muted`: an unjudged run is a problem, and grey is how a problem stops being
+  seen.
+
+  Layout follows the same rhythm as knowledge.css: a card is a raised surface
+  with a hairline, sections inside it are separated by space rather than by more
+  lines, and nothing animates a layout-bound property.
+*/
+
+.passports {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.passports__section > h3 {
+  font-size: 0.9375rem;
+  margin: 0 0 10px;
+}
+
+.passports__gate {
+  font-size: 0.8125rem;
+  color: var(--warn-strong);
+  margin: 0 0 12px;
+}
+
+.passports__gate--open {
+  color: var(--success);
+}
+
+.passports__coverage,
+.passports__list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* --- the page account ---------------------------------------------------- */
+
+.coverage {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 14px 16px;
+}
+
+.coverage__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.coverage__title {
+  font-size: 0.9375rem;
+  margin: 0;
+}
+
+/* The denominator is the loudest thing on the card, on purpose. */
+.coverage__count {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--ink);
+  margin: 0;
+}
+
+.coverage__verdicts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.coverage__badge {
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid currentcolor;
+}
+
+.coverage__badge--good {
+  color: var(--success);
+}
+
+.coverage__badge--warn {
+  color: var(--warn);
+}
+
+.coverage__badge--bad {
+  color: var(--warn-strong);
+}
+
+.coverage__gate {
+  font-size: 0.8125rem;
+  margin: 0 0 10px;
+}
+
+.coverage__gate--open {
+  color: var(--success);
+}
+
+.coverage__gate--shut {
+  color: var(--warn-strong);
+}
+
+.coverage__missing,
+.coverage__declared,
+.coverage__notes {
+  margin-top: 12px;
+}
+
+.coverage__missing h5,
+.coverage__declared h5,
+.coverage__notes h5 {
+  font-size: 0.8125rem;
+  color: var(--muted);
+  margin: 0 0 6px;
+  font-weight: 600;
+}
+
+.coverage__missing ul,
+.coverage__declared ul,
+.coverage__notes ul {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 0.8125rem;
+  color: var(--ink);
+}
+
+.coverage__missing li,
+.coverage__declared li {
+  margin-bottom: 4px;
+}
+
+.coverage__name,
+.coverage__topic {
+  font-size: 0.75rem;
+  color: var(--accent);
+  margin-right: 8px;
+}
+
+.coverage__stated {
+  color: var(--ink);
+}
+
+.coverage__passes {
+  margin-top: 12px;
+}
+
+.coverage__passes h5 {
+  font-size: 0.8125rem;
+  color: var(--muted);
+  margin: 0 0 6px;
+  font-weight: 600;
+}
+
+.coverage__passes ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 0.8125rem;
+}
+
+.coverage__pass {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+/* A pass that did not finish is the reason an empty section is an open question.
+   Marked, never greyed: greying it is how it stops being noticed. */
+.coverage__pass--unfinished {
+  color: var(--warn-strong);
+  border-left: 2px solid var(--warn-strong);
+}
+
+.coverage__pass-name {
+  min-width: 12em;
+  font-weight: 600;
+}
+
+.coverage__pass-requests {
+  font-variant-numeric: tabular-nums;
+}
+
+.coverage__pages {
+  margin-top: 12px;
+  font-size: 0.8125rem;
+}
+
+.coverage__pages summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.coverage__pages summary:hover {
+  color: var(--ink);
+}
+
+.coverage__pages ul {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.coverage__page {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.coverage__page--processed {
+  color: var(--muted);
+}
+
+.coverage__page--deferred_budget,
+.coverage__page--excluded_by_request {
+  color: var(--warn);
+}
+
+.coverage__page--unreadable_needs_ocr,
+.coverage__page--unreadable_failed,
+.coverage__page--unreadable_empty,
+.coverage__page--not_read_yet,
+.coverage__page--not_offered_no_text {
+  color: var(--warn-strong);
+}
+
+.coverage__page-number {
+  font-variant-numeric: tabular-nums;
+  min-width: 3.5em;
+}
+
+.coverage__foot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.coverage__resumable {
+  color: var(--warn);
+}
+
+/* --- one product ---------------------------------------------------------- */
+
+.passport {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  padding: 18px 20px;
+}
+
+.passport__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.passport__name {
+  font-size: 1.0625rem;
+  margin: 0;
+}
+
+.passport__source {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.passport__summary {
+  font-size: 0.875rem;
+  margin: 8px 0 0;
+}
+
+/* A product row with a name and nothing else says so, in words. */
+.passport__thin {
+  font-size: 0.8125rem;
+  color: var(--warn-strong);
+  border-left: 2px solid var(--warn-strong);
+  padding-left: 10px;
+  margin: 12px 0 0;
+}
+
+.passport__section {
+  margin-top: 20px;
+}
+
+.passport__section > h4 {
+  font-size: 0.8125rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 0 0 8px;
+  font-weight: 700;
+}
+
+/* --- surface forms -------------------------------------------------------- */
+
+.aliases,
+.identity,
+.uncertainties,
+.applications {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.alias {
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  font-size: 0.8125rem;
+}
+
+/* An unconfirmed resemblance is marked, never presented as another name. */
+.alias--unclear {
+  border-left: 2px solid var(--warn-strong);
+}
+
+.alias__surface {
+  font-weight: 600;
+  margin-right: 10px;
+}
+
+.alias__relation {
+  font-size: 0.75rem;
+  color: var(--warn);
+}
+
+.alias--unclear .alias__relation {
+  color: var(--warn-strong);
+}
+
+.alias__note {
+  display: block;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.alias__quote {
+  margin: 6px 0 2px;
+  padding-left: 10px;
+  border-left: 1px solid var(--accent);
+  color: var(--ink);
+}
+
+.alias__page {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+/* --- the application map --------------------------------------------------- */
+
+.application {
+  background: var(--surface-2);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+}
+
+.application__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.application__task {
+  font-size: 0.9375rem;
+  margin: 0;
+}
+
+.application__product {
+  font-size: 0.75rem;
+  color: var(--accent);
+}
+
+.application__summary {
+  font-size: 0.8125rem;
+  margin: 6px 0;
+}
+
+.application__quote {
+  margin: 8px 0 4px;
+  padding-left: 12px;
+  border-left: 2px solid var(--accent);
+  font-size: 0.875rem;
+}
+
+.application__details {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.application__detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-size: 0.8125rem;
+}
+
+.application__kind {
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  min-width: 10em;
+}
+
+/* A question is not a lesser parameter: it is the thing somebody has to be
+   asked, and it is marked as an open item rather than as missing data. */
+.application__detail--question {
+  border-left: 2px solid var(--warn);
+}
+
+.application__detail--constraint {
+  border-left: 2px solid var(--warn-strong);
+}
+
+.application__label {
+  font-weight: 600;
+}
+
+.application__value {
+  color: var(--accent);
+}
+
+.application__audience {
+  font-size: 0.75rem;
+  color: var(--warn);
+}
+
+.application__detail-quote {
+  flex-basis: 100%;
+  margin: 4px 0 0;
+  padding-left: 10px;
+  border-left: 1px solid var(--accent);
+  color: var(--muted);
+}
+
+/* --- what cannot be read --------------------------------------------------- */
+
+.uncertainty {
+  background: var(--surface-2);
+  border-left: 2px solid var(--warn-strong);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-size: 0.8125rem;
+}
+
+.uncertainty__head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.uncertainty__kind {
+  font-weight: 600;
+  color: var(--warn-strong);
+}
+
+.uncertainty__page {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.uncertainty__subject {
+  margin: 6px 0 2px;
+  font-weight: 600;
+}
+
+.uncertainty__detail {
+  margin: 0;
+  color: var(--muted);
+}
+
+/* Shown flat and badged, never on the quotation surface: the point of this text
+   is that it may not be read as a value. */
+.uncertainty__quote {
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+
+.uncertainty__reasons {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding: 0;
+  font-size: 0.6875rem;
+  color: var(--muted);
+}
+
+/* --- identity across materials ---------------------------------------------- */
+
+.identity__item {
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-size: 0.8125rem;
+}
+
+.identity__item--unclear {
+  border-left: 2px solid var(--warn-strong);
+}
+
+.identity__item--linked {
+  border-left: 2px solid var(--warn);
+}
+
+.identity__state {
+  font-weight: 600;
+  margin-right: 10px;
+}
+
+.identity__basis {
+  color: var(--muted);
+}
+
+.identity__note {
+  margin: 6px 0 0;
+}
+
+.identity__caution {
+  margin: 6px 0 0;
+  font-size: 0.75rem;
+  color: var(--warn);
+}
+
+/* --- a fact's second kind of provenance -------------------------------------- */
+
+.fact__origin {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 6px 0;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.fact__origin-label {
+  color: var(--accent);
+}
+
+.gap__nature {
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--warn);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .coverage,
+  .passport,
+  .application {
+    transition: none;
+  }
+}

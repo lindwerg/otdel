@@ -1,0 +1,46 @@
+# OTDEL R05 — the *live* productologist UAT environment, isolated from everything else.
+#
+# This file exists because the R05 acceptance run uses a real partner's catalogues and a
+# real paid model. Neither may touch the pilot database (`otdel`, compose project
+# `otdel-block1`, port 58432) nor the integration database (`otdel_test`), so this stack
+# is separate along every axis at once:
+#
+#   * compose project `otdel-r05-live` — `docker compose -p` never collides with the pilot;
+#   * port 127.0.0.1:58433 — a different published port, loopback only;
+#   * volume `otdel-r05-live-pgdata` — its own storage, so bringing this up cannot
+#     initialise, migrate or overwrite the pilot's data directory;
+#   * database `otdel_r05_live` — created by the init script beside this file.
+#
+# Bringing this stack down (`docker compose -f infra/r05-live/compose.yaml down`) removes
+# only this project's container. No existing database is dropped by anything here.
+
+name: otdel-r05-live
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: otdel-r05-live-postgres
+    restart: unless-stopped
+    env_file:
+      - ../../.local/r05-live/db.env
+    environment:
+      # The bootstrap database of the container itself. The live database is
+      # `otdel_r05_live`, created by initdb/10-roles.sh; the application never connects
+      # to this one.
+      POSTGRES_DB: postgres
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      - "127.0.0.1:58433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d otdel_r05_live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  pgdata:
+    name: otdel-r05-live-pgdata

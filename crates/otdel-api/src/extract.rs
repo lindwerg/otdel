@@ -6,7 +6,7 @@
 
 use axum::extract::multipart::MultipartRejection;
 use axum::extract::rejection::{JsonRejection, PathRejection};
-use axum::extract::{FromRequest, FromRequestParts, Multipart, Path, Request};
+use axum::extract::{FromRequest, FromRequestParts, Multipart, Path, Query, Request};
 use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::Json;
@@ -60,6 +60,31 @@ where
         match Path::<T>::from_request_parts(parts, state).await {
             Ok(Path(value)) => Ok(Self(value)),
             Err(rejection) => Err(path_rejection(&rejection)),
+        }
+    }
+}
+
+/// Query parameters with contract-shaped rejections.
+///
+/// The bare `Query` extractor answers `text/plain` with serde's own wording, which for
+/// a filter like `?product_id=…` would be the one place a client sees something other
+/// than the agreed JSON envelope.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ApiQuery<T>(pub T);
+
+impl<S, T> FromRequestParts<S> for ApiQuery<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(Self(value)),
+            Err(_) => Err(ApiError::new(AppError::validation(
+                "query parameters of this endpoint could not be parsed",
+            ))),
         }
     }
 }

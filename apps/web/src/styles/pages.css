@@ -1,0 +1,462 @@
+/*
+  OTDEL — phase 1B: pages, source regions and tables.
+
+  Split out of global.css because it is one coherent surface with its own rules,
+  not because of size. It uses the same tokens declared in global.css (:root) and
+  is imported after it, so nothing here redefines a colour or a radius.
+*/
+
+.material-pages-line {
+  display: block;
+  font-size: 0.8125rem;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.page-panel {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+
+.page-summary {
+  font-size: 0.8125rem;
+  color: var(--ink);
+  margin-bottom: 10px;
+}
+
+.page-summary__tools {
+  display: block;
+  color: var(--muted);
+  font-size: 0.75rem;
+  margin-top: 2px;
+}
+
+.page-note {
+  font-size: 0.8125rem;
+  color: var(--muted);
+  margin: 8px 0;
+}
+
+.page-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.page-item {
+  padding: 12px 12px 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  border-left: 3px solid transparent;
+}
+
+.page-item[data-state='needs_ocr'],
+.page-item[data-state='partial'] {
+  border-left-color: var(--warn);
+}
+
+.page-item[data-state='failed'] {
+  border-left-color: var(--warn-strong);
+}
+
+.page-item[data-state='extracted'] {
+  border-left-color: var(--success);
+}
+
+.page-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.page-number {
+  flex-shrink: 0;
+  min-width: 2ch;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.page-status {
+  font-size: 0.8125rem;
+  font-weight: 650;
+}
+
+.page-status[data-tone='warn'] {
+  color: var(--warn);
+}
+
+.page-status[data-tone='error'] {
+  color: var(--warn-strong);
+}
+
+.page-status[data-tone='success'] {
+  color: var(--success);
+}
+
+.page-facts {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.page-diagnostic {
+  font-size: 0.8125rem;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.page-actions {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.page-detail {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.page-text summary {
+  cursor: pointer;
+  font-size: 0.8125rem;
+  font-weight: 650;
+}
+
+.page-text pre {
+  margin: 8px 0 0;
+  padding: 10px;
+  max-height: 320px;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font: 0.75rem/1.6 ui-monospace, 'SFMono-Regular', Menlo, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.region-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.region-item {
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+}
+
+.region-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 0.75rem;
+}
+
+.region-kind {
+  font-weight: 700;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.region-place {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.region-text {
+  margin-top: 6px;
+  font-size: 0.8125rem;
+  white-space: pre-wrap;
+}
+
+.region-item[data-kind='heading'] .region-text {
+  font-size: 0.9375rem;
+  font-weight: 650;
+}
+
+.region-item[data-kind='footnote'] .region-text {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.page-table-wrap {
+  margin-top: 8px;
+  overflow-x: auto;
+}
+
+.page-table {
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+  min-width: 100%;
+}
+
+.page-table th,
+.page-table td {
+  border: 1px solid var(--line);
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.page-table th {
+  background: var(--surface-2);
+  font-weight: 650;
+}
+
+.page-table td[data-kind='number'] {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.cell-unit {
+  color: var(--muted);
+}
+
+/* A cell the source left blank stays visibly blank. It is not a dash and not a
+   zero: the catalogue did not print a value there. */
+.cell-empty {
+  display: inline-block;
+  width: 1.5em;
+  border-bottom: 1px dotted var(--field-line);
+}
+
+/* ---------- R03: structural evidence of a cell ---------- */
+
+.cell-line {
+  display: block;
+  font-weight: 650;
+}
+
+/* A header cell is a label. It is never styled like a measurement, so nothing
+   in the grid invites reading it as one. */
+.page-table th[data-role='column_header'],
+.page-table th[data-role='row_header'] {
+  font-weight: 700;
+}
+
+/* The verdict is words first. The tone only repeats what the sentence already
+   says, so a reader who sees no colour loses nothing. */
+.cell-verdict {
+  margin-top: 4px;
+  font-size: 0.6875rem;
+  line-height: 1.45;
+  color: var(--muted);
+  font-weight: 400;
+  text-align: left;
+}
+
+.cell-verdict__label {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.cell-verdict[data-tone='warn'] .cell-verdict__label {
+  color: var(--warn);
+}
+
+.page-table td[data-usability='unusable'],
+.page-table th[data-usability='unusable'] {
+  /* Marked on the edge as well as in words — a striped left border survives
+     both a greyscale print and a colour-blind reader. */
+  border-left: 3px double var(--warn);
+}
+
+.page-table td[data-usability='ambiguous'],
+.page-table th[data-usability='ambiguous'] {
+  border-left: 3px dashed var(--warn);
+}
+
+.cell-context {
+  margin: 6px 0 0;
+  font-size: 0.6875rem;
+  line-height: 1.5;
+  color: var(--muted);
+  font-weight: 400;
+  text-align: left;
+}
+
+.cell-context__pair {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.cell-context__term {
+  flex-shrink: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--field-line);
+}
+
+.cell-context__value {
+  margin: 0;
+}
+
+.cell-context__text {
+  color: var(--ink);
+}
+
+.cell-context__origin {
+  font-style: italic;
+}
+
+/* Context carried across a merged cell is an inference, and it is marked as one
+   by a dotted underline *and* by the words next to it. */
+.cell-context__value[data-inferred='true'] .cell-context__text {
+  border-bottom: 1px dotted var(--warn);
+}
+
+.cell-context__inferred {
+  color: var(--warn);
+}
+
+.cell-context__marker {
+  font-weight: 700;
+  color: var(--accent);
+}
+
+/* ---------- R03: the region map ---------- */
+
+/*
+  A schematic of where regions sit — not a picture of the page. There is no page
+  image in this phase, so the frame is deliberately empty behind the rectangles
+  and reads as a diagram rather than as a document.
+*/
+.page-map {
+  margin: 12px 0 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+}
+
+.page-map__caption {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.page-map__frame {
+  position: relative;
+  width: 100%;
+  max-width: 320px;
+  margin: 0 auto;
+  border: 1px solid var(--field-line);
+  border-radius: 2px;
+  background: var(--surface);
+  /* The empty sheet is visibly a schematic grid, never a blank document. */
+  background-image: linear-gradient(var(--line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line) 1px, transparent 1px);
+  background-size: 10% 10%;
+}
+
+.page-map__blank {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px;
+  text-align: center;
+  font-size: 0.6875rem;
+  color: var(--muted);
+}
+
+.page-map__regions {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.page-map__region {
+  position: absolute;
+  overflow: hidden;
+  border: 1px solid var(--accent);
+  background: color-mix(in oklab, var(--accent) 14%, transparent);
+}
+
+/* Kind is carried by the border pattern as well as by the label inside, so the
+   map never depends on colour alone to say what a rectangle is. */
+.page-map__region[data-kind='table'] {
+  border-style: solid;
+}
+
+.page-map__region[data-kind='heading'] {
+  border-style: double;
+  border-width: 3px;
+}
+
+.page-map__region[data-kind='paragraph'] {
+  border-style: dashed;
+}
+
+.page-map__region[data-kind='footnote'] {
+  border-style: dotted;
+}
+
+.page-map__region[data-highlighted='true'] {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+  background: color-mix(in oklab, var(--focus) 26%, transparent);
+  z-index: 1;
+}
+
+.page-map__region-label {
+  display: block;
+  padding: 1px 3px;
+  font-size: 0.5625rem;
+  line-height: 1.2;
+  color: var(--ink);
+}
+
+.page-map__region[data-highlighted='true'] .page-map__region-label {
+  font-weight: 700;
+}
+
+.page-map__facts,
+.page-map__original {
+  margin-top: 8px;
+  font-size: 0.6875rem;
+  color: var(--muted);
+}
+
+.page-map__unplaced {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+}
+
+.page-map__unplaced-title {
+  font-size: 0.6875rem;
+  color: var(--muted);
+}
+
+.page-map__unplaced-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 0.6875rem;
+  color: var(--muted);
+}
+
+.page-map__unplaced-kind {
+  font-weight: 700;
+  color: var(--ink);
+}

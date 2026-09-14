@@ -3,15 +3,54 @@ import { useSearchParams } from 'react-router-dom'
 import { ApiError, createPartner, getPartner, listPartners, updatePartner } from '../api/client'
 import type { Partner } from '../api/types'
 import { useAuth } from '../auth/AuthContext'
+import { KnowledgePanel } from '../components/knowledge/KnowledgePanel'
 import { MaterialsPanel } from '../components/MaterialsPanel'
 import { PartnerFormDialog } from '../components/PartnerFormDialog'
 import { PartnerSidebar } from '../components/PartnerSidebar'
+import { PassportPanel } from '../components/passport/PassportPanel'
+import { PublicationPanel } from '../components/publication/PublicationPanel'
+import { ResearchPanel } from '../components/research/ResearchPanel'
 import { StatusMessage } from '../components/StatusMessage'
+import { UpdatesPanel } from '../components/updates/UpdatesPanel'
+
+/** Sections of the partner card that exist today. Knowledge is phase 1C,
+ *  research 1D, published versions 1E, and the cycle around them — what is out
+ *  of date, what changed, what happened and what is kept — is 1F. */
+const TABS = [
+  { id: 'materials', label: 'Материалы' },
+  { id: 'knowledge', label: 'Знания' },
+  // R05. A separate section rather than another list inside «Знания»: the draft
+  // answers "what did the model produce", and this answers "what does the
+  // product base say, and out of how much of the document" — which is a
+  // different question and was the one nobody could ask.
+  { id: 'passports', label: 'Продуктовая база' },
+  { id: 'research', label: 'Исследование' },
+  { id: 'published', label: 'Версии и поиск' },
+  { id: 'updates', label: 'Обновления' },
+] as const
+
+type TabId = (typeof TABS)[number]['id']
 
 export function WorkspacePage() {
   const { logout, runMutation, runRead } = useAuth()
   const [searchParams, setSearchParams] = useSearchParams()
   const partnerId = searchParams.get('partner_id')
+  // The open section lives in the URL next to the partner, so a reload — or a
+  // link someone pasted — reopens what they were looking at.
+  const tabParam = searchParams.get('tab')
+  const activeTab: TabId = TABS.some((tab) => tab.id === tabParam)
+    ? (tabParam as TabId)
+    : 'materials'
+
+  function selectTab(tab: TabId) {
+    const next = new URLSearchParams(searchParams)
+    if (tab === 'materials') {
+      next.delete('tab')
+    } else {
+      next.set('tab', tab)
+    }
+    setSearchParams(next)
+  }
 
   const [partners, setPartners] = useState<Partner[] | null>(null)
   const [partnersError, setPartnersError] = useState<string | null>(null)
@@ -183,11 +222,37 @@ export function WorkspacePage() {
                 </div>
               </header>
 
+              <nav className="tabs" aria-label="Разделы карточки партнёра">
+                {TABS.map((tab) => (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    className="tab"
+                    aria-current={activeTab === tab.id ? 'page' : undefined}
+                    onClick={() => selectTab(tab.id)}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </nav>
+
               {/* key=partner id: forces a full remount (fresh polling hook,
                   fresh retry/upload-dialog state) on every partner switch,
                   so no in-flight request/timer from the previous partner can
                   ever land on the new one. */}
-              <MaterialsPanel key={selectedPartner.id} partnerId={selectedPartner.id} partnerName={selectedPartner.name} />
+              {activeTab === 'materials' ? (
+                <MaterialsPanel key={selectedPartner.id} partnerId={selectedPartner.id} partnerName={selectedPartner.name} />
+              ) : activeTab === 'knowledge' ? (
+                <KnowledgePanel key={selectedPartner.id} partnerId={selectedPartner.id} />
+              ) : activeTab === 'passports' ? (
+                <PassportPanel key={selectedPartner.id} partnerId={selectedPartner.id} />
+              ) : activeTab === 'research' ? (
+                <ResearchPanel key={selectedPartner.id} partnerId={selectedPartner.id} />
+              ) : activeTab === 'published' ? (
+                <PublicationPanel key={selectedPartner.id} partnerId={selectedPartner.id} />
+              ) : (
+                <UpdatesPanel key={selectedPartner.id} partnerId={selectedPartner.id} />
+              )}
             </>
           ) : null}
         </main>

@@ -18,6 +18,8 @@ function makeMaterial(overrides: Partial<Material>): Material {
     page_count: null,
     created_at: '2026-01-01T00:00:00Z',
     error: null,
+    // A queued material has no page summary: nothing has read it yet.
+    extraction: null,
     ...overrides,
   }
 }

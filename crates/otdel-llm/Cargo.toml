@@ -1,0 +1,28 @@
+[package]
+name = "otdel-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Model adapter of OTDEL phase 1C: one OpenAI-compatible/OpenRouter client, strict JSON responses, bounded calls, redacted logs — and an honest 'not configured' state that reaches no network."
+
+[features]
+# A scripted in-process provider for tests. Off by default so nothing test-shaped can
+# end up in a production build and answer as if a model had been called.
+fake = []
+
+[dependencies]
+otdel-core.workspace = true
+
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+otdel-llm = { workspace = true, features = ["fake"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

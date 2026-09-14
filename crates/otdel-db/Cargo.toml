@@ -5,13 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "PostgreSQL access layer for OTDEL: bureau-scoped transactions, partners, materials and the job queue."
+description = "PostgreSQL access layer for OTDEL: bureau-scoped transactions, partners, materials, the job queue and the immutable published knowledge version."
 
 [dependencies]
 otdel-core.workspace = true
+# Phase 1E hands the checker its input and stores what it decided. The candidate and gap
+# shapes, and the folding used for the exact half of the search, are defined once in
+# `otdel-publish` — a second copy here would be a second place where "the same product"
+# could come to mean something slightly different.
+otdel-publish.workspace = true
 
 chrono.workspace = true
 log = "0.4"
+# Phase 1F: an event carries a small structured payload, stored as `jsonb`.
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

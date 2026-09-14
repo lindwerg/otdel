@@ -14,15 +14,29 @@
 //! | the quotation must still be found in that source, literally | a citation that says what the document used to say | `stale` |
 //! | the stored quotation is re-extracted from today's text, at the offsets where it was found | a published citation pointing at the wrong place after a page was re-read | — |
 //! | the value must appear in a surviving quotation, as a whole token | `10 kN` published under a citation that reads 3.5 kN; `5` confirmed by the `5` in `1500` | `hypothesis` |
+//! | the value must not be the property's own name written again | a column heading — «безопасная рабочая нагрузка (Н)» — published as the value of the characteristic of that name | `hypothesis` |
+//! | a number needs a unit, in the unit field or inside the value | `2,0/2,5` published as a load | `hypothesis` |
+//! | the product and its number must be supported by **one** fragment | BP22's table row published as BP21's load | `hypothesis` |
 //! | the unit must appear in a surviving quotation | `3,5` quietly becoming `3,5 мм` between drafting and publication | `hypothesis` |
 //! | conditions must appear in a surviving quotation | an invented "при опирании на две опоры" surviving into a published version | `hypothesis` |
-//! | two supported claims about one product and one property must agree | a confident numeric answer drawn from a document that contradicts another | `conflicted` |
+//! | two supported claims about one product, one property and one context must agree, in comparable units | a confident numeric answer drawn from a document that contradicts another; `3,5 кН` and `3,5 Н` passing as one fact | `conflicted` |
 //! | a claim whose every citation failed, or whose text cannot satisfy the column it goes in, is refused outright | an unsourced published claim, and a whole version aborted by one bad field | refused |
 //!
 //! Refusals and downgrades are never silent: each one adds a sentence the interface
 //! shows verbatim, exactly as 1C and 1D do.
+//!
+//! **The boundary of the three rules added by R01.** They are gates over *text*, not an
+//! understanding of a document's structure. This pipeline stores page text, not the link
+//! between a section heading, a column header and a cell, so a claim whose product is
+//! named only in a heading above the table cannot be **proven** — and is therefore
+//! quarantined as a hypothesis rather than linked by a guess. That is a deliberate
+//! trade: an unsafe technical claim loses its right to an answer, the citation stays
+//! visible, and the link becomes provable when R02/R03 store revisions, regions and table
+//! cells. Requiring the product's name inside every short quotation is *not* a universal
+//! rule and is not claimed as one here.
 
 use otdel_core::publication::ClaimStatus;
+use otdel_knowledge::measure;
 use otdel_knowledge::quote::{self, SearchableText};
 
 use crate::chunk::{clip, normalise, normalised_column};
@@ -181,13 +195,16 @@ fn check_one(candidate: &CandidateClaim, outcome: &mut CheckOutcome) -> Option<C
     }
 
     let mut status = ClaimStatus::SourceSupported;
+    let unit = candidate
+        .unit
+        .as_deref()
+        .and_then(|unit| bounded(unit, MAX_UNIT_CHARS));
 
     // --- the value must be in a surviving quotation, as a whole token -------------
-    let supporting: Vec<&CheckedEvidence> = verified
+    let value_is_quoted = verified
         .iter()
-        .filter(|item| quote::contains_token(&item.quote, &value_text))
-        .collect();
-    if supporting.is_empty() {
+        .any(|item| quote::contains_token(&item.quote, &value_text));
+    if !value_is_quoted {
         status = ClaimStatus::Hypothesis;
         notes.push(format!(
             "значение «{}» не найдено в подтверждённой цитате — утверждение оставлено как \
@@ -196,11 +213,62 @@ fn check_one(candidate: &CandidateClaim, outcome: &mut CheckOutcome) -> Option<C
         ));
     }
 
+    // --- a heading is not a measurement -------------------------------------------
+    //
+    // The audited run published «безопасная рабочая нагрузка (Н)» as the *value* of the
+    // characteristic of the same name, `source_supported`, because the heading really is
+    // on the page. Quoting a label proves the label exists, nothing more.
+    if measure::restates_attribute(&attribute, &value_text) {
+        status = lower(status, ClaimStatus::Hypothesis);
+        notes.push(format!(
+            "значение «{}» повторяет название свойства: это заголовок таблицы, а не \
+             измеренная величина",
+            short(&value_text)
+        ));
+    }
+
+    // --- a number without a unit is an incomplete measurement -----------------------
+    //
+    // `2,0/2,5` is a real fragment of a real page and says nothing on its own. The unit
+    // may stand in the unit column or inside the value itself (`3,5 кН`); what it may not
+    // do is be absent and leave a bare number answering a technical question.
+    let states_a_number = measure::has_number(&value_text);
+    if states_a_number && needs_a_unit(candidate.kind) {
+        let unit_is_known = unit.is_some() || measure::inline_unit(&value_text).is_some();
+        if !unit_is_known {
+            status = lower(status, ClaimStatus::Hypothesis);
+            notes.push(format!(
+                "у величины «{}» не установлена единица измерения — численный ответ по ней не \
+                 даётся",
+                short(&value_text)
+            ));
+        }
+    }
+
+    // --- the product and its number must be supported by one and the same fragment ---
+    //
+    // A quotation that carries the value proves the value is written somewhere on the
+    // page. It does not say *whose* it is — and a load table has a row for every product.
+    if states_a_number && value_is_quoted {
+        if let Some(product) = &product_name {
+            let designation = measure::designation(product);
+            let jointly_supported = verified.iter().any(|item| {
+                quote::contains_token(&item.quote, &value_text)
+                    && quote::contains_token(&item.quote, &designation)
+            });
+            if !jointly_supported {
+                status = lower(status, ClaimStatus::Hypothesis);
+                notes.push(format!(
+                    "изделие «{}» и значение «{}» не подтверждены одной цитатой: связь строки \
+                     таблицы с изделием не доказана и не достраивается догадкой",
+                    short(product),
+                    short(&value_text)
+                ));
+            }
+        }
+    }
+
     // --- the unit may not vouch for itself ----------------------------------------
-    let unit = candidate
-        .unit
-        .as_deref()
-        .and_then(|unit| bounded(unit, MAX_UNIT_CHARS));
     if let Some(unit) = &unit {
         if !verified
             .iter()
@@ -323,74 +391,158 @@ fn carry_over(evidence: &CandidateEvidence) -> CheckedEvidence {
     }
 }
 
-/// Mark every group of supported claims that disagree about one product's one property.
+/// Mark every pair of supported claims that disagree about one product's one property in
+/// one context.
 ///
-/// Scope is narrow on purpose, and the narrowness is the honest part. Two statements
-/// contradict each other only when they are about the **same product** and the **same
-/// property** and their values differ once folded. An industry conclusion names no
-/// product, so it is never used to contradict a partner's own document — a competitor's
-/// standard disagreeing with a catalogue is not evidence that the catalogue is wrong
-/// (`block-01-plan.md`, 1D §4). Values that differ only in spacing, case or dash variant
-/// are the same value and are not a contradiction.
+/// Scope is narrow on purpose, and the narrowness is the honest part. An industry
+/// conclusion names no product, so it is never used to contradict a partner's own
+/// document — a competitor's standard disagreeing with a catalogue is not evidence that
+/// the catalogue is wrong (`block-01-plan.md`, 1D §4).
 ///
-/// What this does **not** catch is stated in the phase documentation: two attributes
-/// that mean the same thing under different names ("нагрузка" and "предельная
-/// нагрузка") are not compared, because deciding that they are the same property is a
-/// judgement, not a rule.
+/// Comparison is by **pairs**, not by one bag of value strings, because three things have
+/// to be true before two written values may be weighed against each other at all
+/// (`R01b`):
+///
+/// * the **product** and the **property** are the same, folded but never merged —
+///   `BP21` and `BP21D` stay two products;
+/// * the **context** is the same. A load under two supports and a load under three are
+///   two facts, and calling them a contradiction blocks answers over nothing. An
+///   *unstated* condition is treated as unknown rather than as a third context, so a bare
+///   number is still compared with a conditioned one;
+/// * the **units** are comparable. This is the rule that flips in both directions: `3,5`
+///   and `3.5` are one value written twice and are no longer a contradiction, while `3,5
+///   кН` and `3,5 Н` are a contradiction that the old string comparison missed entirely.
+///   Nothing is converted here — see [`otdel_knowledge::measure`].
+///
+/// What this still does **not** catch is unchanged: two attributes that mean the same
+/// thing under different names ("нагрузка" and "предельная нагрузка") are not compared,
+/// because deciding that they are the same property is a judgement, not a rule. Periods
+/// of validity are not compared either — nothing stores them until R02.
 fn mark_contradictions(outcome: &mut CheckOutcome) {
-    let mut groups: Vec<((String, String), Vec<usize>)> = Vec::new();
+    let comparable: Vec<usize> = outcome
+        .claims
+        .iter()
+        .enumerate()
+        .filter(|(_, claim)| {
+            claim.status == ClaimStatus::SourceSupported && claim.subject().is_some()
+        })
+        .map(|(index, _)| index)
+        .collect();
 
-    for (index, claim) in outcome.claims.iter().enumerate() {
-        if claim.status != ClaimStatus::SourceSupported {
-            continue;
-        }
-        let Some(subject) = claim.subject() else {
-            continue;
-        };
-        match groups.iter_mut().find(|(key, _)| *key == subject) {
-            Some((_, members)) => members.push(index),
-            None => groups.push((subject, vec![index])),
+    let mut disagreements: Vec<(usize, String)> = Vec::new();
+    let mut summaries: Vec<String> = Vec::new();
+
+    for (position, left_index) in comparable.iter().enumerate() {
+        for right_index in comparable.iter().skip(position + 1) {
+            let left = &outcome.claims[*left_index];
+            let right = &outcome.claims[*right_index];
+            if left.subject() != right.subject() {
+                continue;
+            }
+            let (product, attribute) = left.subject().expect("filtered to claims with a subject");
+
+            if !contexts_comparable(left, right) {
+                if measure::value_key(&left.value_text) != measure::value_key(&right.value_text) {
+                    summaries.push(format!(
+                        "«{}»: значения свойства «{}» различаются вместе с условиями применимости \
+                         — это разные утверждения, а не расхождение",
+                        short(&product),
+                        short(&attribute)
+                    ));
+                }
+                continue;
+            }
+
+            let reason = if !measure::units_comparable(left.unit.as_deref(), right.unit.as_deref())
+            {
+                Some(format!(
+                    "источники расходятся о свойстве «{}»: {} и {} — единицы не сопоставимы без \
+                     явного пересчёта, поэтому численный ответ по этому свойству не даётся",
+                    short(&attribute),
+                    written(left),
+                    written(right)
+                ))
+            } else if measure::value_key(&left.value_text) != measure::value_key(&right.value_text)
+            {
+                Some(format!(
+                    "источники расходятся о свойстве «{}»: {} и {}. Численный ответ по этому \
+                     свойству не даётся, пока расхождение не разрешено",
+                    short(&attribute),
+                    written(left),
+                    written(right)
+                ))
+            } else {
+                None
+            };
+
+            let Some(reason) = reason else {
+                continue;
+            };
+            summaries.push(format!(
+                "«{}»: источники расходятся о свойстве «{}» ({} и {})",
+                short(&product),
+                short(&attribute),
+                written(left),
+                written(right)
+            ));
+            disagreements.push((*left_index, reason.clone()));
+            disagreements.push((*right_index, reason));
         }
     }
 
-    for ((product, attribute), members) in groups {
-        if members.len() < 2 {
+    for (index, reason) in disagreements {
+        let claim = &mut outcome.claims[index];
+        claim.status = ClaimStatus::Conflicted;
+        let already = claim
+            .check_note
+            .as_deref()
+            .is_some_and(|existing| existing.contains(reason.as_str()));
+        if already {
             continue;
         }
-        let mut values: Vec<String> = members
-            .iter()
-            .map(|index| normalise(&outcome.claims[*index].value_text))
-            .collect();
-        values.sort();
-        values.dedup();
-        if values.len() < 2 {
-            continue;
-        }
-
-        let listed = values
-            .iter()
-            .map(|value| format!("«{}»", short(value)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        for index in &members {
-            let claim = &mut outcome.claims[*index];
-            claim.status = ClaimStatus::Conflicted;
-            let note = format!(
-                "источники расходятся о свойстве «{}»: {listed}. Численный ответ по этому \
-                 свойству не даётся, пока расхождение не разрешено",
-                short(&attribute)
-            );
-            claim.check_note = Some(match claim.check_note.take() {
-                Some(existing) => clip(&format!("{existing}; {note}"), MAX_LONG_TEXT_CHARS),
-                None => clip(&note, MAX_LONG_TEXT_CHARS),
-            });
-        }
-        outcome.note(format!(
-            "«{}»: источники расходятся о свойстве «{}» ({listed})",
-            short(&product),
-            short(&attribute)
-        ));
+        claim.check_note = Some(match claim.check_note.take() {
+            Some(existing) => clip(&format!("{existing}; {reason}"), MAX_LONG_TEXT_CHARS),
+            None => clip(&reason, MAX_LONG_TEXT_CHARS),
+        });
     }
+
+    for summary in summaries {
+        outcome.note(summary);
+    }
+}
+
+/// May two claims' values be weighed against each other, or do they describe two
+/// different situations?
+///
+/// Two stated conditions that differ are two situations. A missing condition is *unknown*
+/// — not a third situation — so it is still compared: otherwise a bare number could sit
+/// beside a conditioned one for ever without either being questioned.
+fn contexts_comparable(left: &CheckedClaim, right: &CheckedClaim) -> bool {
+    match (left.conditions.as_deref(), right.conditions.as_deref()) {
+        (Some(left), Some(right)) => normalise(left) == normalise(right),
+        _ => true,
+    }
+}
+
+/// A claim's value as the owner sees it written, with its unit when it has one.
+fn written(claim: &CheckedClaim) -> String {
+    match claim.unit.as_deref() {
+        Some(unit) => format!("«{} {}»", short(&claim.value_text), short(unit)),
+        None => format!("«{}»", short(&claim.value_text)),
+    }
+}
+
+/// Which kinds of statement are incomplete without a unit.
+///
+/// A characteristic, a restriction and a commercial term are all answers to "how much?"
+/// when they state a number, and a number with no unit answers nothing. An application
+/// ("монтаж трубопроводов до 3 этажа") is prose that may happen to contain a number.
+const fn needs_a_unit(kind: otdel_core::knowledge::FactKind) -> bool {
+    use otdel_core::knowledge::FactKind;
+    matches!(
+        kind,
+        FactKind::Characteristic | FactKind::Limitation | FactKind::Commercial
+    )
 }
 
 /// Verdicts only ever move downwards during one check.

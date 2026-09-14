@@ -83,11 +83,24 @@ pub async fn review_claims(
     max_requests: u32,
     notes: &mut Vec<String>,
 ) -> u32 {
+    let candidates = review::reviewable(claims);
+
+    // Silence used to mean two different things here: "there was nothing to review" and
+    // "no reviewing model exists". `R01c` asks for the second one to be visible, because a
+    // deterministic verdict with no second opinion is a different kind of `source_supported`
+    // than one that survived a review — and the interface shows these sentences verbatim.
     if !provider.describe().is_ready() {
+        if !candidates.is_empty() {
+            notes.push(format!(
+                "второе мнение модели не запрашивалось: проверяющая модель не настроена. \
+                 {} утверждение(й) опубликовано со статусом детерминированной проверки, \
+                 смысловая проверка цитаты не выполнялась",
+                candidates.len()
+            ));
+        }
         return 0;
     }
 
-    let candidates = review::reviewable(claims);
     if candidates.is_empty() {
         return 0;
     }
@@ -170,5 +183,7 @@ pub async fn compose_answer(
         .map_err(|error| error.diagnostic())?;
 
     let parsed = answer::AnswerResponse::parse(&response.json)?;
-    Ok(answer::validate(&parsed, &labels, limits))
+    // The claims go in as well as the labels: an answer has to agree with what it cites,
+    // and the labels alone carry no values to agree with (F02).
+    Ok(answer::validate(&parsed, &labels, claims, limits))
 }

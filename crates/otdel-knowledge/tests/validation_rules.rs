@@ -333,6 +333,75 @@ fn an_unconfirmed_unit_is_dropped_and_the_value_is_kept_as_written() {
 }
 
 #[test]
+fn an_unconfirmed_unit_is_recorded_as_uncertainty_rather_than_quietly_disappearing() {
+    // R01 / F01: dropping the unit silently *improved* the fact — a load with an
+    // unconfirmed unit became a load with no unit at all, and by publication time there
+    // was nothing left to say a unit had ever been claimed. A missing qualifier has to
+    // travel as uncertainty, never as a cleaner-looking record.
+    let draft = validate(json!({
+        "products": [base_product()],
+        "facts": [fact(json!({
+            "unit": "кгс",
+            "evidence": [{"source": "S1", "quote": "BP21 1200 3.5 kN при опирании на две опоры"}],
+        }))],
+    }));
+
+    assert_eq!(draft.facts.len(), 1);
+    assert_eq!(
+        draft.facts[0].unit, None,
+        "an unconfirmed unit is not stored"
+    );
+    let context = draft.facts[0]
+        .model_context
+        .as_deref()
+        .expect("the claimed unit is kept as the model's own words");
+    assert!(context.contains("кгс"), "{context}");
+    assert!(context.contains("формулировке модели"), "{context}");
+}
+
+#[test]
+fn a_value_that_only_repeats_the_property_name_is_refused() {
+    // Reproduced from the audited BASIS run: the table heading «безопасная рабочая
+    // нагрузка (Н)» was stored as the *value* of the characteristic of the same name. The
+    // heading is genuinely on the page, so every citation rule passed — and the stored
+    // "fact" stated nothing at all.
+    let page = "Таблица нагрузок\nбезопасная рабочая нагрузка (Н)\nBP21 2,0/2,5";
+    let catalog = SourceCatalog::build(vec![SourcePage {
+        page_id: Uuid::from_u128(7),
+        material_id: Uuid::from_u128(70),
+        material_filename: "catalogue.pdf".to_owned(),
+        page_number: 3,
+        status: PageStatus::Extracted,
+        text_source: TextSource::TextLayer,
+        text: page.to_owned(),
+    }]);
+
+    let response = DraftResponse::parse(&json!({
+        "products": [base_product()],
+        "facts": [fact(json!({
+            "attribute": "безопасная рабочая нагрузка (Н)",
+            "value": "безопасная рабочая нагрузка (Н)",
+            "unit": null,
+            "conditions": null,
+            "evidence": [{"source": "S1", "quote": "безопасная рабочая нагрузка (Н)"}],
+        }))],
+    }))
+    .unwrap();
+    let draft = validate_response(&response, &catalog, &DraftLimits::default(), "b1");
+
+    assert!(draft.facts.is_empty(), "{:?}", draft.facts);
+    assert_eq!(draft.rejected, 1);
+    assert!(
+        draft
+            .rejections
+            .iter()
+            .any(|reason| reason.contains("заголовок")),
+        "{:?}",
+        draft.rejections
+    );
+}
+
+#[test]
 fn invented_conditions_become_model_context_instead_of_a_condition() {
     let draft = validate(json!({
         "products": [base_product()],

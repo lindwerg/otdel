@@ -11,7 +11,9 @@
 //! | a fact with no accepted evidence is refused | a claim nobody can check |
 //! | **the value must appear in the quotation** | "нагрузка 10 kN" under a citation that reads 3.5 kN |
 //! | a unit must appear in a quotation (never in the model's own value) | `3.5` silently becoming `3.5 kN`, or `кгс` vouching for itself |
+//! | an unconfirmed unit or condition is **kept as the model's wording**, never dropped | a record that looks better than its evidence, and a missing qualifier nobody downstream can see |
 //! | conditions must appear in a quote, or they become model context | an invented "при опирании на две опоры" |
+//! | a value that only repeats its property's name refuses the fact | a column heading — «безопасная рабочая нагрузка (Н)» — stored as a value |
 //! | an unknown product reference refuses the fact | a property attached to the wrong product |
 //!
 //! The *attribute* is deliberately not required to be quoted: it is the model's name
@@ -29,6 +31,7 @@ use crate::candidate::{
     normalise_name, CandidateCategory, CandidateDraft, CandidateFact, CandidateGap,
     CandidateProduct, CandidateQa, CandidateQuestion, CandidateTerm, ResolvedEvidence,
 };
+use crate::measure;
 use crate::quote;
 use crate::schema::{DraftEvidence, DraftLimits, DraftResponse};
 use crate::source::SourceCatalog;
@@ -189,6 +192,19 @@ fn validate_facts(
             continue;
         };
 
+        // A column heading is not a measurement. The audited BASIS run stored «безопасная
+        // рабочая нагрузка (Н)» as the value of the characteristic of that name: every
+        // citation rule passed, because the heading really is printed on the page, and the
+        // stored fact said nothing. Refused here rather than downgraded later, because
+        // there is nothing in it to keep.
+        if measure::restates_attribute(&attribute, &value_text) {
+            draft.reject(format!(
+                "факт «{label}» отклонён: значение повторяет название свойства — это заголовок \
+                 таблицы, а не величина"
+            ));
+            continue;
+        }
+
         // The subject must be one the model itself introduced in this response —
         // addressed either by its draft-local `ref` or by its own name.
         let product_ref = match fact.product_ref.as_deref().map(str::trim) {
@@ -271,6 +287,12 @@ fn validate_facts(
         // A unit is only real if the *source* writes it. It is checked against the
         // quotations alone — never against the model's own `value`, which would let
         // the model confirm its own unit by repeating it.
+        //
+        // What is *not* done any more: quietly forgetting it. Dropping the unit and
+        // nothing else made the record look cleaner than the evidence — a load whose unit
+        // was claimed and unproven became a load with no unit claimed at all, and by
+        // publication there was nothing left to be uncertain about (F01). The claim
+        // survives as the model's wording, exactly as an unconfirmed condition does.
         let unit = match optional_text(fact.unit.as_deref(), MAX_UNIT_CHARS) {
             Some(unit) if unit_is_quoted(&unit, &evidence) => Some(unit),
             Some(unit) => {
@@ -278,6 +300,14 @@ fn validate_facts(
                     "у факта «{label}» единица «{}» не найдена в цитате — сохранено без единицы",
                     short(&unit)
                 ));
+                model_context = Some(match model_context {
+                    Some(existing) => {
+                        format!("{existing} Единица по формулировке модели: {unit} (в цитате не найдена).")
+                    }
+                    None => {
+                        format!("Единица по формулировке модели: {unit} (в цитате не найдена).")
+                    }
+                });
                 None
             }
             None => None,

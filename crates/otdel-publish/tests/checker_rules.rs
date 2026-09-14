@@ -189,10 +189,17 @@ fn a_value_that_is_not_in_the_quotation_is_published_as_a_hypothesis_not_as_a_fa
 fn a_value_is_matched_as_a_whole_token_and_not_as_a_substring() {
     // `1200` is on the page; `120` is not, and must not be confirmed by the `120` inside
     // it. This is the rule 1C established, applied again at publication.
+    //
+    // Adjusted for R01: the accepted half quotes a row that states the unit as well,
+    // because a bare `1200` is no longer a verified measurement — which is a different
+    // rule, tested separately.
+    let page = "BP21 длина 1200 мм";
     let mut candidate = candidate(1);
+    candidate.attribute = "длина".to_owned();
     candidate.value_text = "120".to_owned();
-    candidate.unit = None;
+    candidate.unit = Some("мм".to_owned());
     candidate.conditions = None;
+    candidate.evidence = vec![evidence(page, Some(page))];
     assert_eq!(
         only(vec![candidate.clone()]).claims[0].status,
         ClaimStatus::Hypothesis
@@ -244,6 +251,147 @@ fn conditions_that_are_not_in_the_quotation_lower_the_verdict() {
     );
 }
 
+// --- a heading is not a value, a bare number is not a measurement ---------------------
+
+/// The table as the BASIS catalogue really renders it: a heading line naming the quantity
+/// and its unit, and rows of bare numbers underneath.
+const TABLE: &str = "Таблица нагрузок\n\
+                     безопасная рабочая нагрузка (Н)\n\
+                     BP21 2,0/2,5\n\
+                     BP21D 3,0/3,5";
+
+#[test]
+fn a_column_heading_stored_as_its_own_value_is_not_a_verified_characteristic() {
+    // Reproduced from the audited run (F01): «безопасная рабочая нагрузка (Н)» was
+    // published as the *value* of the characteristic of the same name, with
+    // `source_supported`, because the heading really is on the page. It is a label, not a
+    // measurement, and nothing may answer a question about load from it.
+    let mut candidate = candidate(1);
+    candidate.attribute = "безопасная рабочая нагрузка (Н)".to_owned();
+    candidate.value_text = "безопасная рабочая нагрузка (Н)".to_owned();
+    candidate.unit = None;
+    candidate.conditions = None;
+    candidate.evidence = vec![evidence("безопасная рабочая нагрузка (Н)", Some(TABLE))];
+
+    let outcome = only(vec![candidate]);
+    let claim = &outcome.claims[0];
+    assert_ne!(
+        claim.status,
+        ClaimStatus::SourceSupported,
+        "a heading must never be published as a verified value"
+    );
+    assert_eq!(claim.status, ClaimStatus::Hypothesis);
+    assert!(
+        claim.check_note.as_deref().unwrap().contains("заголовок"),
+        "{:?}",
+        claim.check_note
+    );
+}
+
+#[test]
+fn a_bare_number_with_no_unit_is_not_a_verified_measurement() {
+    // The other half of the same published row: `2,0/2,5` with no unit and no condition.
+    // The number really is on the page, which is precisely why quoting it proves nothing.
+    let mut candidate = candidate(1);
+    candidate.value_text = "2,0/2,5".to_owned();
+    candidate.unit = None;
+    candidate.conditions = None;
+    candidate.evidence = vec![evidence("BP21 2,0/2,5", Some(TABLE))];
+
+    let outcome = only(vec![candidate]);
+    let claim = &outcome.claims[0];
+    assert_eq!(claim.status, ClaimStatus::Hypothesis);
+    assert!(
+        claim.check_note.as_deref().unwrap().contains("единиц"),
+        "{:?}",
+        claim.check_note
+    );
+}
+
+#[test]
+fn a_value_that_carries_its_unit_inside_itself_is_a_complete_measurement() {
+    // The rule above must not refuse a real measurement written in one field.
+    let page = "BP21 нагрузка 3,5 кН при опирании на две опоры";
+    let mut candidate = candidate(1);
+    candidate.value_text = "3,5 кН".to_owned();
+    candidate.unit = None;
+    candidate.evidence = vec![evidence(page, Some(page))];
+
+    assert_eq!(
+        only(vec![candidate]).claims[0].status,
+        ClaimStatus::SourceSupported
+    );
+}
+
+// --- the product and the value must be supported together ------------------------------
+
+#[test]
+fn a_value_quoted_from_another_products_row_does_not_support_this_product() {
+    // The counterexample «чужая строка таблицы»: the quotation is genuine, comes from the
+    // right page and contains the value — of the row below.
+    let mut candidate = candidate(1);
+    candidate.value_text = "4.0".to_owned();
+    candidate.evidence = vec![evidence(
+        "BP22 1600 4.0 kN при опирании на две опоры",
+        Some(PAGE),
+    )];
+
+    let outcome = only(vec![candidate]);
+    let claim = &outcome.claims[0];
+    assert_eq!(
+        claim.status,
+        ClaimStatus::Hypothesis,
+        "a number from BP22's row may not be published as BP21's"
+    );
+    assert!(
+        claim.check_note.as_deref().unwrap().contains("изделие"),
+        "{:?}",
+        claim.check_note
+    );
+}
+
+#[test]
+fn a_product_named_only_outside_the_quotation_is_quarantined_rather_than_linked() {
+    // The honest half of the rule. The name may well be in a section heading above the
+    // table — but this pipeline stores no link between a heading and a row, so the link
+    // cannot be proven *and must not be invented*. The claim is kept, visible, and
+    // unusable for an answer until R02/R03 store the structure.
+    let page = "Профиль BP21\nТехнические данные\nнагрузка 3.5 kN при опирании на две опоры";
+    let mut candidate = candidate(1);
+    candidate.evidence = vec![evidence(
+        "нагрузка 3.5 kN при опирании на две опоры",
+        Some(page),
+    )];
+
+    let outcome = only(vec![candidate]);
+    let claim = &outcome.claims[0];
+    assert_eq!(claim.status, ClaimStatus::Hypothesis);
+    assert!(
+        claim.check_note.as_deref().unwrap().contains("изделие"),
+        "{:?}",
+        claim.check_note
+    );
+    assert!(
+        !claim.evidence.is_empty(),
+        "the citation is real and stays under the claim"
+    );
+}
+
+#[test]
+fn a_look_alike_designation_never_vouches_for_a_neighbouring_product() {
+    // `BP21` appearing inside `BP21D` must not link a BP21D row to BP21.
+    let mut candidate = candidate(1);
+    candidate.value_text = "3,0/3,5".to_owned();
+    candidate.unit = None;
+    candidate.conditions = None;
+    candidate.evidence = vec![evidence("BP21D 3,0/3,5", Some(TABLE))];
+
+    assert_eq!(
+        only(vec![candidate]).claims[0].status,
+        ClaimStatus::Hypothesis
+    );
+}
+
 // --- contradiction ------------------------------------------------------------------
 
 #[test]
@@ -282,15 +430,104 @@ fn the_same_value_written_differently_is_not_a_contradiction() {
 
 #[test]
 fn two_different_properties_of_one_product_never_contradict_each_other() {
+    // Adjusted for R01: a length of "1200" with no unit is no longer a verified
+    // characteristic, so the second claim states its unit and quotes a row that carries
+    // it. What the test is about — two properties are not a disagreement — is unchanged.
+    let page = "BP21 длина 1200 мм";
     let mut second = candidate(2);
     second.attribute = "длина".to_owned();
     second.value_text = "1200".to_owned();
-    second.unit = None;
+    second.unit = Some("мм".to_owned());
     second.conditions = None;
+    second.evidence = vec![evidence(page, Some(page))];
 
     let outcome = only(vec![candidate(1), second]);
     for claim in &outcome.claims {
-        assert_eq!(claim.status, ClaimStatus::SourceSupported);
+        assert_eq!(claim.status, ClaimStatus::SourceSupported, "{claim:?}");
+    }
+}
+
+#[test]
+fn the_same_number_in_two_different_units_is_a_disagreement_not_an_agreement() {
+    // The counterexample «одинаковая цифра, разные единицы — пропущенный конфликт».
+    // Comparing the value strings alone made these two look like one fact; 3,5 kN and
+    // 3,5 Н are a thousandfold apart, and no conversion is written down anywhere.
+    let other_page = "BP21 3.5 Н при опирании на две опоры";
+    let mut second = candidate(2);
+    second.unit = Some("Н".to_owned());
+    second.evidence = vec![evidence(other_page, Some(other_page))];
+
+    let outcome = only(vec![candidate(1), second]);
+    assert_eq!(outcome.claims.len(), 2);
+    for claim in &outcome.claims {
+        assert_eq!(claim.status, ClaimStatus::Conflicted, "{claim:?}");
+        assert!(
+            claim.check_note.as_deref().unwrap().contains("единиц"),
+            "{:?}",
+            claim.check_note
+        );
+    }
+}
+
+#[test]
+fn two_values_stated_under_different_conditions_are_not_a_disagreement() {
+    // The counterexample «разные условия — ложный конфликт». A load under two supports
+    // and a load under three are two facts, not two answers to one question.
+    let other_page = "BP21 1800 4.0 kN при опирании на три опоры";
+    let mut second = candidate(2);
+    second.value_text = "4.0".to_owned();
+    second.conditions = Some("при опирании на три опоры".to_owned());
+    second.evidence = vec![evidence(other_page, Some(other_page))];
+
+    let outcome = only(vec![candidate(1), second]);
+    for claim in &outcome.claims {
+        assert_eq!(claim.status, ClaimStatus::SourceSupported, "{claim:?}");
+    }
+}
+
+#[test]
+fn a_value_whose_conditions_are_unstated_is_still_compared() {
+    // The other side of the rule above: an unstated condition is *unknown*, not
+    // "different". Treating it as a separate context would let a naked number sit
+    // beside a conditioned one and never disagree with it.
+    let other_page = "BP21 4.2 kN";
+    let mut second = candidate(2);
+    second.value_text = "4.2".to_owned();
+    second.conditions = None;
+    second.evidence = vec![evidence(other_page, Some(other_page))];
+
+    let outcome = only(vec![candidate(1), second]);
+    for claim in &outcome.claims {
+        assert_eq!(claim.status, ClaimStatus::Conflicted, "{claim:?}");
+    }
+}
+
+#[test]
+fn one_number_written_with_a_comma_and_with_a_dot_is_one_number() {
+    let other_page = "BP21 3,5 kN при опирании на две опоры";
+    let mut second = candidate(2);
+    second.value_text = "3,5".to_owned();
+    second.evidence = vec![evidence(other_page, Some(other_page))];
+
+    let outcome = only(vec![candidate(1), second]);
+    for claim in &outcome.claims {
+        assert_eq!(claim.status, ClaimStatus::SourceSupported, "{claim:?}");
+    }
+}
+
+#[test]
+fn two_products_with_look_alike_designations_are_never_compared_with_each_other() {
+    // BP21 and BP21D are different products. Folding them together would publish one
+    // product's load as the other's disagreement — or, worse, as its value.
+    let other_page = "BP21D 1200 4.2 kN при опирании на две опоры";
+    let mut second = candidate(2);
+    second.product_name = Some("BP21D".to_owned());
+    second.value_text = "4.2".to_owned();
+    second.evidence = vec![evidence(other_page, Some(other_page))];
+
+    let outcome = only(vec![candidate(1), second]);
+    for claim in &outcome.claims {
+        assert_eq!(claim.status, ClaimStatus::SourceSupported, "{claim:?}");
     }
 }
 
@@ -307,7 +544,9 @@ fn an_industry_conclusion_never_contradicts_a_partners_own_document() {
         kind: FactKind::Characteristic,
         attribute: "нагрузка".to_owned(),
         value_text: "9.9".to_owned(),
-        unit: None,
+        // Adjusted for R01: a number with no unit is no longer a verified measurement,
+        // industry conclusion or not. The unit is in the quoted sentence.
+        unit: Some("kN".to_owned()),
         conditions: None,
         model_context: None,
         evidence: vec![evidence(page, Some(page))],

@@ -28,7 +28,6 @@ use otdel_core::config::Config;
 use otdel_core::secret;
 use otdel_db::Database;
 use otdel_extract::{OcrEngine, PageProcessor, PageRasteriser, ToolAvailability};
-use otdel_llm::fake::{FakeProvider, FakeReply};
 use otdel_llm::LlmProvider;
 use otdel_search::{DocumentFetcher, SearchProvider};
 use otdel_storage::{FilesystemObjectStore, ObjectStore};
@@ -1064,59 +1063,186 @@ impl ResearchOverrides {
     }
 }
 
-// --- R05.2: scripting a five-pass run ---------------------------------------------------
+// --- R05.2/R05.3: scripting a multi-pass run ---------------------------------------------
 
-/// Split one omnibus answer into the per-purpose replies a run now asks for.
+/// A provider that answers by **purpose**, not by position in a queue.
 ///
-/// The run is five bounded passes — inventory, facts, glossary, applications, inquiry —
-/// each sent a schema containing only its own sections. A test still wants to describe
-/// "what the model knows about this material" once, so it writes the whole answer and this
-/// slices it the same way [`otdel_knowledge::schema::response_schema_for`] slices the
-/// schema. One source of truth per fixture, and no suite has to know the pass order.
+/// R05.3 made this necessary. A run is five purpose-specific passes, and each purpose now
+/// chooses how many pages it can carry — applications take two, glossary three — so the
+/// number of requests a pass makes depends on the material and on the purpose. A flat
+/// script of replies would have to know both, and would silently mis-align the moment
+/// either changed: the glossary pass would start answering with the applications reply.
 ///
-/// Sections the answer does not mention come through as the empty object, which is what a
-/// model with nothing to say for that pass would return.
-pub fn purpose_replies(answer: &Value) -> Vec<FakeReply> {
-    // An answer mentioning no known section at all is not a draft — it is the "the model
-    // ignored the schema" case. Slicing it would turn it into five empty objects, which
-    // parse cleanly and would quietly convert a refusal into a success. It goes to every
-    // pass verbatim instead, so each one refuses it the way it would in production.
-    let recognised = otdel_knowledge::DraftPurpose::ALL
-        .into_iter()
-        .flat_map(|purpose| purpose.sections().iter())
-        .any(|section| answer.get(*section).is_some());
-    if !recognised {
-        return otdel_knowledge::DraftPurpose::ALL
-            .into_iter()
-            .map(|_| FakeReply::Json(answer.clone()))
-            .collect();
+/// So the reply is chosen from the request itself. The schema a pass is sent contains only
+/// that purpose's sections (`response_schema_for`), which is exactly enough to recognise
+/// it. A test writes one omnibus answer and this hands each pass its own slice.
+///
+/// The full slice goes to a pass's **first** request and an empty one to the rest, so a
+/// material that takes three applications requests does not end up with the same task
+/// three times. That also mirrors reality: later pages usually add nothing new.
+pub struct PurposeProvider {
+    answer: Value,
+    /// Return [`LlmError::Truncated`] for this purpose's first request.
+    truncate_first: Option<otdel_knowledge::DraftPurpose>,
+    seen: std::sync::Mutex<Vec<(String, usize)>>,
+    prompts: std::sync::Mutex<Vec<String>>,
+}
+
+impl PurposeProvider {
+    pub fn new(answer: &Value) -> Self {
+        Self {
+            answer: answer.clone(),
+            truncate_first: None,
+            seen: std::sync::Mutex::new(Vec::new()),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        }
     }
 
-    otdel_knowledge::DraftPurpose::ALL
-        .into_iter()
-        .map(|purpose| {
-            let mut slice = serde_json::Map::new();
-            for section in purpose.sections() {
-                if let Some(value) = answer.get(*section) {
-                    slice.insert((*section).to_owned(), value.clone());
+    /// Cut off this purpose's first answer by the output limit.
+    pub fn truncating(mut self, purpose: otdel_knowledge::DraftPurpose) -> Self {
+        self.truncate_first = Some(purpose);
+        self
+    }
+
+    pub fn call_count(&self) -> usize {
+        self.prompts.lock().expect("provider lock").len()
+    }
+
+    pub fn prompts(&self) -> Vec<String> {
+        self.prompts.lock().expect("provider lock").clone()
+    }
+
+    /// Requests this purpose received.
+    pub fn calls_for(&self, purpose: otdel_knowledge::DraftPurpose) -> usize {
+        self.seen
+            .lock()
+            .expect("provider lock")
+            .iter()
+            .find(|(name, _)| name == purpose.as_str())
+            .map_or(0, |(_, count)| *count)
+    }
+
+    /// Which purpose a request is for, read off the schema it carries.
+    fn purpose_of(schema: &Value) -> Option<otdel_knowledge::DraftPurpose> {
+        let properties = schema.get("properties")?.as_object()?;
+        otdel_knowledge::DraftPurpose::ALL
+            .into_iter()
+            .find(|purpose| {
+                purpose.sections().len() == properties.len()
+                    && purpose
+                        .sections()
+                        .iter()
+                        .all(|section| properties.contains_key(*section))
+            })
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for PurposeProvider {
+    fn describe(&self) -> otdel_llm::ProviderDescription {
+        otdel_llm::ProviderDescription {
+            provider: "fake".to_owned(),
+            model: "fake/model-1".to_owned(),
+            endpoint_host: None,
+            state: "ready",
+            missing: Vec::new(),
+            message: "Тестовый провайдер: сетевые вызовы не выполняются.".to_owned(),
+        }
+    }
+
+    async fn complete_json(
+        &self,
+        request: &otdel_llm::LlmRequest,
+    ) -> Result<otdel_llm::LlmResponse, otdel_llm::LlmError> {
+        self.prompts
+            .lock()
+            .expect("provider lock")
+            .push(request.user_prompt.clone());
+
+        let Some(purpose) = Self::purpose_of(&request.schema) else {
+            return Err(otdel_llm::LlmError::InvalidResponse(
+                "тестовый провайдер: не удалось определить проход по схеме".to_owned(),
+            ));
+        };
+
+        let seen_before = {
+            let mut seen = self.seen.lock().expect("provider lock");
+            match seen.iter_mut().find(|(name, _)| name == purpose.as_str()) {
+                Some((_, count)) => {
+                    let before = *count;
+                    *count += 1;
+                    before
+                }
+                None => {
+                    seen.push((purpose.as_str().to_owned(), 1));
+                    0
                 }
             }
-            FakeReply::Json(Value::Object(slice))
+        };
+
+        if seen_before == 0 && self.truncate_first == Some(purpose) {
+            return Err(otdel_llm::LlmError::Truncated);
+        }
+
+        // An answer mentioning no known section at all is not a draft — it is the "the
+        // model ignored the schema" case, and it is passed through whole. Slicing it would
+        // hand back an empty object per purpose, which parses cleanly and would quietly
+        // turn a refusal into a success.
+        let recognised = otdel_knowledge::DraftPurpose::ALL
+            .into_iter()
+            .flat_map(|p| p.sections())
+            .any(|section| self.answer.get(*section).is_some());
+
+        // The full slice once; empty after that, so repeated batches do not multiply the
+        // same candidate. The truncated attempt does not count as the full answer — the
+        // retry that follows it is still this purpose's first *answer*.
+        let answered = seen_before > 0 && self.truncate_first != Some(purpose)
+            || (self.truncate_first == Some(purpose) && seen_before > 1);
+
+        let json = if recognised {
+            let mut slice = serde_json::Map::new();
+            if !answered {
+                for section in purpose.sections() {
+                    if let Some(value) = self.answer.get(*section) {
+                        slice.insert((*section).to_owned(), value.clone());
+                    }
+                }
+            }
+            Value::Object(slice)
+        } else {
+            self.answer.clone()
+        };
+
+        Ok(otdel_llm::LlmResponse {
+            json,
+            model: "fake/model-1".to_owned(),
+            usage: otdel_llm::Usage::default(),
+            duration: std::time::Duration::from_millis(1),
+            response_chars: 0,
         })
-        .collect()
+    }
 }
 
-/// A scripted provider that answers one whole run: one reply per purpose.
-pub fn scripted_run(answer: &Value) -> Arc<FakeProvider> {
-    Arc::new(FakeProvider::new(purpose_replies(answer)))
+/// A provider that answers one whole run from one omnibus answer.
+pub fn scripted_run(answer: &Value) -> Arc<PurposeProvider> {
+    Arc::new(PurposeProvider::new(answer))
 }
 
-/// The same, for a run over `materials` materials — the replies repeat per material.
-pub fn scripted_runs(answers: &[Value]) -> Arc<FakeProvider> {
-    Arc::new(FakeProvider::new(
-        answers.iter().flat_map(purpose_replies).collect(),
+/// The same, for several materials: each material's run asks every purpose again, and the
+/// provider answers by purpose, so one instance serves them all.
+pub fn scripted_runs(answers: &[Value]) -> Arc<PurposeProvider> {
+    Arc::new(PurposeProvider::new(
+        answers.first().unwrap_or(&Value::Null),
     ))
 }
 
-/// How many model calls one material's run makes when every pass needs one request.
+/// A run whose pass for `purpose` first comes back truncated, then answers.
+pub fn scripted_run_truncating(
+    answer: &Value,
+    purpose: otdel_knowledge::DraftPurpose,
+) -> Arc<PurposeProvider> {
+    Arc::new(PurposeProvider::new(answer).truncating(purpose))
+}
+
+/// How many purposes one material's run asks.
 pub const PASSES_PER_RUN: usize = otdel_knowledge::DraftPurpose::ALL.len();

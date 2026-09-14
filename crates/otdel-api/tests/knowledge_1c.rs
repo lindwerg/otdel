@@ -135,7 +135,7 @@ fn stored_quote_of(fact: &Value) -> String {
 ///
 /// R05.2: a run is five purpose-specific passes, so the omnibus answer a test writes is
 /// sliced into one reply per pass — the same slicing the server applies to the schema.
-fn scripted(value: Value) -> Arc<FakeProvider> {
+fn scripted(value: Value) -> Arc<support::PurposeProvider> {
     support::scripted_run(&value)
 }
 

@@ -33,6 +33,8 @@ pub mod source;
 pub mod tables;
 pub mod validate;
 
+use std::collections::VecDeque;
+
 use otdel_core::llm_config::LlmLimits;
 use otdel_llm::{LlmError, LlmProvider, LlmRequest};
 use tracing::{debug, warn};
@@ -115,6 +117,12 @@ pub struct PurposePass {
     pub processed: Vec<ProcessedPage>,
     /// Pages this pass never reached, for this purpose.
     pub deferred: Vec<uuid::Uuid>,
+    /// R05.3 — extra requests this pass spent recovering from a truncated answer.
+    ///
+    /// Counted apart from `requests_made` (which includes them) so the cost of the
+    /// recovery is visible rather than blended into the pass's normal spend. A pass that
+    /// needed six retries is telling the operator to lower this purpose's page budget.
+    pub truncated_retries: u32,
 }
 
 impl PurposePass {
@@ -127,6 +135,29 @@ impl PurposePass {
         self.deferred.is_empty() && !self.processed.is_empty()
     }
 }
+
+/// One request's worth of pages, waiting to be sent for one purpose.
+///
+/// R05.3. The scheduler works off a queue of these rather than a fixed list of batches,
+/// because a truncated answer has to put *smaller* work back on the queue. A plain `for`
+/// over the plan could not: it had nowhere to put the halves.
+#[derive(Debug, Clone)]
+struct PendingBatch {
+    /// Indices into the catalogue.
+    entries: Vec<usize>,
+    /// Output envelope for this attempt. Raised once before the pages are split, because
+    /// a batch that overran slightly is cheaper to re-ask than to halve.
+    max_output_tokens: u32,
+    /// How many times this work has already come back truncated.
+    attempt: u32,
+}
+
+/// Ceiling on the output envelope a truncation retry may ask for.
+///
+/// Two doublings from a 4 000-token base. Past that the answer is not "the envelope was
+/// small", it is "these pages hold more than one request should carry", and the pages get
+/// split instead.
+const MAX_TRUNCATION_RETRIES: u32 = 2;
 
 /// How many requests each purpose may spend.
 ///
@@ -188,8 +219,16 @@ pub async fn draft_knowledge(
         // The products this pass may cite. Taken from the draft as it stands, so the
         // inventory pass feeds the four that follow and none of them has to re-list.
         let known = KnownProducts::from_draft(&outcome.draft);
-        let (batches, deferred_indices) =
-            prompt::plan_batches_within(catalog, limits, allowed as usize);
+        // R05.3: how many pages this purpose can carry is the purpose's business. An
+        // applications request that takes six pages of a technical catalogue produces
+        // more than the envelope holds — which is exactly how a live pass came back
+        // truncated on its third batch.
+        let (batches, deferred_indices) = prompt::plan_batches_for(
+            catalog,
+            limits,
+            purpose.pages_per_request(limits.max_pages_per_request),
+            allowed as usize,
+        );
 
         let mut pass = PurposePass {
             purpose,
@@ -201,6 +240,7 @@ pub async fn draft_knowledge(
                 .iter()
                 .map(|index| catalog.entries()[*index].page.page_id)
                 .collect(),
+            truncated_retries: 0,
         };
 
         if !pass.deferred.is_empty() {
@@ -213,12 +253,37 @@ pub async fn draft_knowledge(
             ));
         }
 
-        for (index, batch) in batches.iter().enumerate() {
-            let entries: Vec<&source::CatalogEntry> = batch
-                .entry_indices
+        // A queue, not a fixed list: a truncated answer puts *smaller* work back on it.
+        let mut queue: VecDeque<PendingBatch> = batches
+            .iter()
+            .map(|batch| PendingBatch {
+                entries: batch.entry_indices.clone(),
+                max_output_tokens: limits.max_output_tokens,
+                attempt: 0,
+            })
+            .collect();
+        let mut batch_index = 0_i32;
+
+        while let Some(pending) = queue.pop_front() {
+            // The share is a hard stop, retries included. Without this a pathological
+            // page could split its way through the whole run's budget.
+            if pass.requests_made >= allowed || spent >= total_budget {
+                defer_pending(catalog, &pending, &mut pass);
+                outcome.draft.note(format!(
+                    "проход «{}»: страниц не вошло — доля запросов исчерпана, в том числе \
+                     повторами после обрыва: {}",
+                    purpose.as_str(),
+                    pending.entries.len()
+                ));
+                continue;
+            }
+
+            let entries: Vec<&source::CatalogEntry> = pending
+                .entries
                 .iter()
                 .map(|position| &catalog.entries()[*position])
                 .collect();
+            batch_index += 1;
 
             let request = LlmRequest {
                 purpose: "knowledge_draft",
@@ -231,7 +296,7 @@ pub async fn draft_knowledge(
                 // spending an applications pass on products unrepresentable rather than
                 // merely discouraged.
                 schema: schema::response_schema_for(purpose),
-                max_output_tokens: limits.max_output_tokens,
+                max_output_tokens: pending.max_output_tokens,
             };
             let input_chars = request.input_chars();
 
@@ -240,13 +305,55 @@ pub async fn draft_knowledge(
                 Err(LlmError::NotConfigured(message)) => {
                     return Err(KnowledgeError::ProviderNotConfigured(message))
                 }
+                // R05.3 — the answer was cut off by the output limit. This is *not* a run
+                // failure: it says this request asked for more than one answer can hold,
+                // and the fix is to ask for less. Failing the run here is what threw away
+                // three completed passes in a live UAT and left the job permanently
+                // failed with no way back.
+                Err(LlmError::Truncated) => {
+                    spent += 1;
+                    pass.requests_made += 1;
+                    pass.truncated_retries += 1;
+                    pass.input_chars = pass
+                        .input_chars
+                        .saturating_add(u32::try_from(input_chars).unwrap_or(u32::MAX));
+
+                    match recover_from_truncation(&pending, limits) {
+                        Some(smaller) => {
+                            warn!(
+                                purpose = purpose.as_str(),
+                                pages = pending.entries.len(),
+                                attempt = pending.attempt,
+                                "answer truncated; retrying this batch smaller"
+                            );
+                            // Front of the queue: finish recovering this work before
+                            // moving on, so the pages stay together in the account.
+                            for piece in smaller.into_iter().rev() {
+                                queue.push_front(piece);
+                            }
+                        }
+                        None => {
+                            // One page, at the largest envelope, still overran. The page
+                            // is deferred *for this purpose* with the reason stated —
+                            // never silently, and never as a failure of the whole run.
+                            defer_pending(catalog, &pending, &mut pass);
+                            outcome.draft.reject(format!(
+                                "проход «{}»: ответ обрывается лимитом длины даже на одной \
+                                 странице — страниц отложено: {}",
+                                purpose.as_str(),
+                                pending.entries.len()
+                            ));
+                        }
+                    }
+                    continue;
+                }
                 Err(error) => {
-                    // The whole run fails rather than storing half a material's
-                    // knowledge: persistence replaces a material's candidates as one set,
-                    // and a partial set would look like a complete one.
+                    // Everything else still fails the run: persistence replaces a
+                    // material's candidates as one set, and a partial set produced by a
+                    // provider that is down would look like a complete one.
                     warn!(
                         purpose = purpose.as_str(),
-                        batch = index,
+                        batch = batch_index,
                         retryable = error.is_retryable(),
                         error = %error,
                         "model call failed during a knowledge run"
@@ -269,20 +376,28 @@ pub async fn draft_knowledge(
             // front of the model — including when the answer turns out not to match the
             // schema below. That refusal is counted as a refusal; calling the pages unread
             // would be a second, wrong story about the same event.
-            let batch_index = i32::try_from(index + 1).unwrap_or(i32::MAX);
             let page_budget = prompt::per_page_budget(limits);
-            pass.processed.extend(entries.iter().map(|entry| {
-                ProcessedPage {
-                    page_id: entry.page.page_id,
-                    batch_index,
-                    chars_sent: i32::try_from(entry.page.text.chars().count().min(page_budget))
-                        .unwrap_or(i32::MAX),
+            for entry in &entries {
+                // A page recovered after a split was already marked deferred by the
+                // attempt that failed; reaching it now supersedes that.
+                pass.deferred.retain(|page| *page != entry.page.page_id);
+                if !pass
+                    .processed
+                    .iter()
+                    .any(|done| done.page_id == entry.page.page_id)
+                {
+                    pass.processed.push(ProcessedPage {
+                        page_id: entry.page.page_id,
+                        batch_index,
+                        chars_sent: i32::try_from(entry.page.text.chars().count().min(page_budget))
+                            .unwrap_or(i32::MAX),
+                    });
                 }
-            }));
+            }
 
             match DraftResponse::parse(&response.json) {
                 Ok(parsed) => {
-                    let prefix = format!("{}{}", purpose.as_str(), index + 1);
+                    let prefix = format!("{}{batch_index}", purpose.as_str());
                     let validated = validate::validate_response(
                         &parsed,
                         catalog,
@@ -292,7 +407,7 @@ pub async fn draft_knowledge(
                     );
                     debug!(
                         purpose = purpose.as_str(),
-                        batch = index,
+                        batch = batch_index,
                         facts = validated.facts.len(),
                         rejected = validated.rejected,
                         "validated one response"
@@ -339,6 +454,67 @@ pub async fn draft_knowledge(
     Ok(outcome)
 }
 
+/// What to try instead, after an answer came back cut off by the output limit.
+///
+/// Two levers, in order of cost:
+///
+/// 1. **The same pages, a bigger envelope.** A batch that overran slightly is cheaper to
+///    re-ask than to halve, and halving it would double the requests for nothing.
+/// 2. **Half the pages, at the base envelope.** Once the envelope has been doubled twice
+///    and the answer is still cut off, the honest reading is not "the envelope is small",
+///    it is "these pages hold more than one answer should carry".
+///
+/// `None` means neither lever is left: a single page, at the largest envelope, still
+/// overran. The caller defers that page for this purpose with the reason stated — which is
+/// a bounded, recorded outcome rather than a failed run.
+fn recover_from_truncation(
+    pending: &PendingBatch,
+    limits: &LlmLimits,
+) -> Option<Vec<PendingBatch>> {
+    if pending.attempt < MAX_TRUNCATION_RETRIES {
+        return Some(vec![PendingBatch {
+            entries: pending.entries.clone(),
+            max_output_tokens: pending.max_output_tokens.saturating_mul(2),
+            attempt: pending.attempt + 1,
+        }]);
+    }
+
+    if pending.entries.len() <= 1 {
+        return None;
+    }
+
+    // Split, and start each half back at the base envelope: the pages are what was too
+    // much, so a doubled envelope would only make the halves expensive.
+    let middle = pending.entries.len() / 2;
+    Some(vec![
+        PendingBatch {
+            entries: pending.entries[..middle].to_vec(),
+            max_output_tokens: limits.max_output_tokens,
+            attempt: 0,
+        },
+        PendingBatch {
+            entries: pending.entries[middle..].to_vec(),
+            max_output_tokens: limits.max_output_tokens,
+            attempt: 0,
+        },
+    ])
+}
+
+/// Record every page of a batch the pass could not send as deferred for this purpose.
+///
+/// Deferred rather than dropped: the requirement check reads `covered_everything`, so a
+/// page that never got through has to be visible there or the pass would claim to have
+/// examined the material it did not.
+fn defer_pending(catalog: &SourceCatalog, pending: &PendingBatch, pass: &mut PurposePass) {
+    for index in &pending.entries {
+        let page_id = catalog.entries()[*index].page.page_id;
+        let reached = pass.processed.iter().any(|done| done.page_id == page_id);
+        if !reached && !pass.deferred.contains(&page_id) {
+            pass.deferred.push(page_id);
+        }
+    }
+}
+
 /// Every page any pass reached, once, keeping the first pass that carried it.
 fn union_of_processed(passes: &[PurposePass]) -> Vec<ProcessedPage> {
     let mut union: Vec<ProcessedPage> = Vec::new();
@@ -371,6 +547,10 @@ mod tests {
             text_source: TextSource::TextLayer,
             text: text.to_owned(),
         }
+    }
+
+    fn provider_of(replies: Vec<FakeReply>) -> FakeProvider {
+        FakeProvider::new(replies)
     }
 
     fn context() -> PromptContext {
@@ -439,6 +619,176 @@ mod tests {
         // letting the first pass quietly take all of it.
         assert_eq!(share_of_budget(&limits(1, 1), 1, 5), 0);
         assert_eq!(share_of_budget(&limits(1, 1), 1, 1), 1);
+    }
+
+    // --- R05.3: recovering from a truncated answer -------------------------------
+
+    /// The ladder, stated as arithmetic: envelope twice, then split, then defer.
+    #[test]
+    fn a_truncated_batch_is_re_asked_bigger_then_split_then_given_up_on() {
+        let limits = LlmLimits::default();
+        let four = |attempt: u32, tokens: u32| PendingBatch {
+            entries: vec![0, 1, 2, 3],
+            max_output_tokens: tokens,
+            attempt,
+        };
+
+        // 1. Same pages, twice the envelope.
+        let first = recover_from_truncation(&four(0, 4_000), &limits).expect("a first retry");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].entries, vec![0, 1, 2, 3]);
+        assert_eq!(first[0].max_output_tokens, 8_000);
+        assert_eq!(first[0].attempt, 1);
+
+        // 2. Once more.
+        let second = recover_from_truncation(&four(1, 8_000), &limits).expect("a second retry");
+        assert_eq!(second[0].max_output_tokens, 16_000);
+
+        // 3. Out of envelope: split, each half back at the base.
+        let split = recover_from_truncation(&four(2, 16_000), &limits).expect("a split");
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].entries, vec![0, 1]);
+        assert_eq!(split[1].entries, vec![2, 3]);
+        assert!(
+            split
+                .iter()
+                .all(|piece| piece.max_output_tokens == limits.max_output_tokens
+                    && piece.attempt == 0)
+        );
+
+        // 4. One page, nothing left to try.
+        let single = PendingBatch {
+            entries: vec![7],
+            max_output_tokens: 16_000,
+            attempt: MAX_TRUNCATION_RETRIES,
+        };
+        assert!(recover_from_truncation(&single, &limits).is_none());
+    }
+
+    /// The live failure: one purpose's batch comes back truncated, and the run survives.
+    ///
+    /// The applications pass overran on its own request. Before R05.3 that failed the
+    /// whole run — discarding three completed passes and leaving the job permanently
+    /// failed with nothing to resume from. Now the batch is re-asked smaller and the
+    /// applications arrive.
+    #[tokio::test]
+    async fn a_truncated_applications_batch_is_retried_smaller_and_still_produces_tasks() {
+        let catalog = SourceCatalog::build(vec![
+            page(1, "BP21 1200 3.5 kN профиль монтажный"),
+            page(2, "BP21 крепится к бетонному перекрытию"),
+        ]);
+
+        let provider = FakeProvider::new(vec![
+            // inventory, facts, glossary — all fine, and they must survive.
+            FakeReply::Json(inventory_answer("S1", "BP21 1200 3.5 kN")),
+            FakeReply::Json(facts_answer("S1", "BP21 1200 3.5 kN", "3.5")),
+            FakeReply::Json(json!({"glossary": []})),
+            // applications: the answer is cut off by the output limit…
+            FakeReply::Fail(LlmError::Truncated),
+            // …and the retry, with a bigger envelope, comes back whole.
+            FakeReply::Json(json!({
+                "applications": [{
+                    "product_ref": "P1",
+                    "task": "закрепить лоток к перекрытию",
+                    "summary": null, "model_context": null,
+                    "evidence": [{"source": "S1", "quote": "BP21 1200 3.5 kN"}],
+                    "details": [],
+                }],
+            })),
+            FakeReply::Json(json!({"qa": [], "gaps": []})),
+        ]);
+
+        let outcome = draft_knowledge(
+            &provider,
+            &catalog,
+            &context(),
+            &TableContext::default(),
+            &LlmLimits::default(),
+            &DraftLimits::default(),
+        )
+        .await
+        .unwrap();
+
+        // The applications the truncated request would have lost.
+        assert_eq!(outcome.draft.applications.len(), 1);
+        assert_eq!(
+            outcome.draft.applications[0].task,
+            "закрепить лоток к перекрытию"
+        );
+
+        // The passes before it are untouched — this is the checkpoint that used to be
+        // thrown away.
+        assert_eq!(outcome.draft.products.len(), 1);
+        assert_eq!(outcome.draft.facts.len(), 1);
+        assert_eq!(outcome.passes.len(), 5);
+
+        let applications = outcome
+            .passes
+            .iter()
+            .find(|pass| pass.purpose == DraftPurpose::Applications)
+            .expect("the applications pass");
+        // The recovery is counted and visible, not hidden inside the ordinary spend.
+        assert_eq!(applications.truncated_retries, 1);
+        assert_eq!(applications.requests_made, 2);
+        // …and the pages still count as covered: the retry reached them.
+        assert!(
+            applications.covered_everything(),
+            "the retry covered the material: {applications:?}"
+        );
+        // The whole run made one extra call and no more.
+        assert_eq!(outcome.requests_made, 6);
+    }
+
+    /// A page that overruns even alone is deferred for that purpose — never a run failure.
+    #[tokio::test]
+    async fn a_page_that_truncates_at_every_size_is_deferred_for_that_purpose_alone() {
+        let catalog = SourceCatalog::build(vec![page(1, "BP21 1200 3.5 kN профиль монтажный")]);
+
+        let mut replies = vec![
+            FakeReply::Json(inventory_answer("S1", "BP21 1200 3.5 kN")),
+            FakeReply::Json(facts_answer("S1", "BP21 1200 3.5 kN", "3.5")),
+            FakeReply::Json(json!({"glossary": []})),
+        ];
+        // The applications pass never gets a whole answer, however small the ask.
+        for _ in 0..=MAX_TRUNCATION_RETRIES {
+            replies.push(FakeReply::Fail(LlmError::Truncated));
+        }
+        replies.push(FakeReply::Json(json!({"qa": [], "gaps": []})));
+
+        let outcome = draft_knowledge(
+            &provider_of(replies),
+            &catalog,
+            &context(),
+            &TableContext::default(),
+            &LlmLimits::default(),
+            &DraftLimits::default(),
+        )
+        .await
+        .unwrap();
+
+        // The run finished. The earlier passes kept what they found.
+        assert_eq!(outcome.draft.products.len(), 1);
+        assert_eq!(outcome.draft.facts.len(), 1);
+
+        let applications = outcome
+            .passes
+            .iter()
+            .find(|pass| pass.purpose == DraftPurpose::Applications)
+            .expect("the applications pass");
+        assert_eq!(applications.truncated_retries, 3);
+        assert!(applications.processed.is_empty());
+        assert_eq!(applications.deferred.len(), 1);
+        // Which means the topic cannot be cleared by a declaration: nothing examined it.
+        assert!(!applications.covered_everything());
+        assert!(
+            outcome
+                .draft
+                .rejections
+                .iter()
+                .any(|note| note.contains("обрыв") || note.contains("лимитом длины")),
+            "the refusal says what happened: {:?}",
+            outcome.draft.rejections
+        );
     }
 
     #[tokio::test]

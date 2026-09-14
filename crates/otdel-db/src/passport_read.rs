@@ -86,7 +86,7 @@ pub async fn run_passes(tx: &mut ScopedTx, run_id: Uuid) -> DbResult<Vec<RunPass
     let rows = sqlx::query(
         "SELECT id, run_id, material_id, purpose, requests_allowed, requests_made, \
                 pages_total, pages_processed, pages_deferred, covered_everything, \
-                input_chars, created_at \
+                truncated_retries, input_chars, created_at \
            FROM otdel.knowledge_run_passes \
           WHERE bureau_id = $1 AND run_id = $2 \
           ORDER BY created_at, id",
@@ -109,6 +109,7 @@ pub async fn run_passes(tx: &mut ScopedTx, run_id: Uuid) -> DbResult<Vec<RunPass
                 pages_processed: row.try_get("pages_processed")?,
                 pages_deferred: row.try_get("pages_deferred")?,
                 covered_everything: row.try_get("covered_everything")?,
+                truncated_retries: row.try_get("truncated_retries")?,
                 input_chars: row.try_get("input_chars")?,
                 created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
             })

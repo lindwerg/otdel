@@ -337,6 +337,7 @@ pub(crate) fn run_pass_rows(passes: &[PurposePass], offerable_pages: usize) -> V
             pages_processed: i32::try_from(pass.processed.len()).unwrap_or(i32::MAX),
             pages_deferred: i32::try_from(pass.deferred.len()).unwrap_or(i32::MAX),
             covered_everything: pass.covered_everything(),
+            truncated_retries: i32::try_from(pass.truncated_retries).unwrap_or(i32::MAX),
             input_chars: i32::try_from(pass.input_chars).unwrap_or(i32::MAX),
         })
         .collect()

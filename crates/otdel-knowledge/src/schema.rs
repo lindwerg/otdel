@@ -31,7 +31,9 @@ pub const SCHEMA_NAME: &str = "otdel_product_knowledge_draft";
 /// R05.2 raises it again: the run is now five purpose-specific passes instead of one
 /// omnibus request, so a draft made by this profile is not comparable with one made by
 /// the previous.
-pub const PROMPT_PROFILE: &str = "productologist/2026-09-14.r05.2";
+/// R05.3 raises it once more: per-purpose page budgets, a stated response bound, and a
+/// scheduler that recovers from a truncated answer instead of failing the run.
+pub const PROMPT_PROFILE: &str = "productologist/2026-09-14.r05.3";
 
 /// Upper bounds on what one response may contain. Anything beyond is refused (and
 /// counted), never silently truncated into "success".
@@ -62,7 +64,7 @@ impl Default for DraftLimits {
             max_categories: 20,
             max_products: 60,
             max_facts: 200,
-            max_terms: 80,
+            max_terms: 24,
             max_qa: 40,
             max_gaps: 60,
             max_evidence_per_item: 4,
@@ -70,8 +72,11 @@ impl Default for DraftLimits {
             max_short_text_chars: 200,
             // Summaries, definitions, answers, conditions, model context.
             max_long_text_chars: 1_000,
-            max_applications: 40,
-            max_details_per_application: 12,
+            // R05.3 — lowered from 40/12. These are per *response*, and the run now
+            // makes several small applications requests instead of one large one, so the
+            // old ceilings only ever authorised an answer too long to come back whole.
+            max_applications: 12,
+            max_details_per_application: 6,
             max_surface_forms_per_item: 6,
             max_senses_per_term: 4,
         }
@@ -460,6 +465,45 @@ impl DraftPurpose {
     /// on products all over again.
     pub const fn needs_product_context(self) -> bool {
         !matches!(self, Self::Inventory)
+    }
+
+    /// Pages this purpose may put in one request, given the configured base.
+    ///
+    /// R05.3. The passes are not equally verbose per page. An inventory line is a name
+    /// and a summary; one application is a task, a summary, and up to a dozen parameters
+    /// and constraints, each with its own quotation. Six pages of a technical catalogue
+    /// asked for applications is several thousand tokens of output, and a live run had
+    /// exactly that batch come back truncated.
+    ///
+    /// So the verbose purposes get fewer pages per request. This is the cheap half of the
+    /// fix — it makes truncation rare; [`crate::draft_knowledge`] handles the times it
+    /// happens anyway.
+    pub fn pages_per_request(self, base: u32) -> u32 {
+        let ceiling = match self {
+            // The most verbose: every task carries its own details and quotations.
+            Self::Applications => 2,
+            // A term carries senses and synonyms, each quoted.
+            Self::Glossary => 3,
+            Self::Inquiry => 4,
+            Self::Inventory | Self::Facts => base,
+        };
+        base.min(ceiling).max(1)
+    }
+
+    /// How many items of this purpose one response should carry, told to the model.
+    ///
+    /// Strict structured output cannot express counts (see this module's header), so the
+    /// bound is stated in words and enforced afterwards by [`crate::validate`]. Saying it
+    /// is still worth doing: a model asked for "up to 8" writes 8 short entries where one
+    /// asked for nothing in particular writes 40 long ones and runs out of room.
+    pub const fn max_items_per_response(self) -> usize {
+        match self {
+            Self::Inventory => 24,
+            Self::Facts => 40,
+            Self::Glossary => 12,
+            Self::Applications => 8,
+            Self::Inquiry => 16,
+        }
     }
 
     /// The schema name reported to the provider, for its logs and ours.

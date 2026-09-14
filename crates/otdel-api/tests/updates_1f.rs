@@ -153,7 +153,7 @@ fn fact(attribute: &str, value: &str, quote: &str) -> Value {
 
 /// Draft one material with a scripted reply, and run the understanding worker.
 async fn draft_material(app: &TestApp, reply: Value) -> otdel_worker::KnowledgeReport {
-    let provider: Arc<FakeProvider> = support::scripted_run(&reply);
+    let provider: Arc<support::PurposeProvider> = support::scripted_run(&reply);
     app.run_knowledge(&app.knowledge_worker(provider)).await
 }
 

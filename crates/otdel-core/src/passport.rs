@@ -145,6 +145,10 @@ pub struct RunPass {
     /// Whether this pass saw the whole material. The input to the requirement check,
     /// stored rather than derived so a reader sees the value the check saw.
     pub covered_everything: bool,
+    /// R05.3 — extra requests spent recovering from a truncated answer. Included in
+    /// `requests_made`, reported apart so the cost of the recovery stays visible.
+    #[serde(default)]
+    pub truncated_retries: i32,
     pub input_chars: i32,
     pub created_at: DateTime<Utc>,
 }

@@ -154,7 +154,7 @@ async fn prepare(app: &TestApp, client: &TestClient, partner: Uuid) -> (Uuid, St
     let quote = quotable(&text);
     let value = value_from(&quote);
 
-    let provider: Arc<FakeProvider> =
+    let provider: Arc<support::PurposeProvider> =
         support::scripted_run(&draft(vec![fact("обозначение", &value, &quote, None)]));
     let report = app
         .run_knowledge(&app.knowledge_worker(provider.clone()))
@@ -459,7 +459,7 @@ async fn two_documents_disagreeing_about_one_property_give_no_confident_answer()
         .find(|word| word.chars().count() >= 4 && *word != first)
         .expect("a second, different value");
 
-    let provider: Arc<FakeProvider> = support::scripted_run(&draft(vec![
+    let provider: Arc<support::PurposeProvider> = support::scripted_run(&draft(vec![
         fact("обозначение", first, &quote, None),
         fact("обозначение", second, &quote, None),
     ]));
@@ -642,7 +642,7 @@ async fn a_new_version_supersedes_the_old_one_and_leaves_it_exactly_as_published
         .expect("a line carrying it")
         .to_owned();
 
-    let provider: Arc<FakeProvider> =
+    let provider: Arc<support::PurposeProvider> =
         support::scripted_run(&draft(vec![fact("обозначение", &other, &line, None)]));
     post(
         &app,
@@ -1083,7 +1083,7 @@ async fn an_instruction_written_inside_a_document_changes_no_verdict_and_no_answ
     tx.commit().await.expect("commit");
 
     // The product role quotes the hostile line honestly, claiming the value it contains.
-    let provider: Arc<FakeProvider> =
+    let provider: Arc<support::PurposeProvider> =
         support::scripted_run(&draft(vec![fact("значение", "999 единиц", HOSTILE, None)]));
     post(
         &app,

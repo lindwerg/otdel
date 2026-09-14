@@ -387,7 +387,7 @@ fn rich_answer(quote: &str) -> Value {
 /// R05.2: a run is five purpose-specific passes. A test still writes "what the model knows
 /// about this material" once and this slices it per pass, the same way the server slices
 /// the schema — so the fixtures stay readable and no test has to know the pass order.
-fn scripted(answers: Vec<Value>) -> Arc<FakeProvider> {
+fn scripted(answers: Vec<Value>) -> Arc<support::PurposeProvider> {
     support::scripted_runs(&answers)
 }
 
@@ -951,32 +951,30 @@ async fn a_material_with_terms_and_applications_produces_both_sections_and_may_p
         .run_knowledge(&app.knowledge_worker(provider.clone()))
         .await;
     assert_eq!(report.jobs_completed, 1);
-    // One request per purpose: the material fits a single batch each way.
-    assert_eq!(provider.call_count(), support::PASSES_PER_RUN);
 
-    // Each pass was asked for its own thing, and only its own thing.
+    // R05.3 — each purpose takes as many pages as it can carry, and the verbose ones
+    // carry fewer. Over six pages that is 1 + 1 + 2 + 3 + 2 = 9 requests, and the shape
+    // is the point: the applications pass makes the most calls precisely because it is
+    // the one whose answers overran the output limit in the live run.
+    use otdel_knowledge::DraftPurpose;
+    assert_eq!(provider.calls_for(DraftPurpose::Inventory), 1);
+    assert_eq!(provider.calls_for(DraftPurpose::Facts), 1);
+    assert_eq!(provider.calls_for(DraftPurpose::Glossary), 2);
+    assert_eq!(provider.calls_for(DraftPurpose::Applications), 3);
+    assert_eq!(provider.calls_for(DraftPurpose::Inquiry), 2);
+    assert_eq!(provider.call_count(), 9);
+
+    // Each pass was asked for its own thing, and only its own thing. Counted rather than
+    // indexed: a purpose now spans several batches, so position no longer identifies it.
     let prompts = provider.prompts();
-    assert!(
-        prompts[0].contains("ТОЛЬКО СОСТАВ ПРЕДЛОЖЕНИЯ"),
-        "{}",
-        prompts[0]
-    );
-    assert!(
-        prompts[1].contains("ТОЛЬКО ХАРАКТЕРИСТИКИ"),
-        "{}",
-        prompts[1]
-    );
-    assert!(prompts[2].contains("ТОЛЬКО ТЕРМИНЫ"), "{}", prompts[2]);
-    assert!(
-        prompts[3].contains("ТОЛЬКО ЗАДАЧИ ПРИМЕНЕНИЯ"),
-        "{}",
-        prompts[3]
-    );
-    assert!(
-        prompts[4].contains("ТОЛЬКО ВОПРОСЫ И ПРОБЕЛЫ"),
-        "{}",
-        prompts[4]
-    );
+    let asked = |needle: &str| prompts.iter().filter(|p| p.contains(needle)).count();
+    assert_eq!(asked("ТОЛЬКО СОСТАВ ПРЕДЛОЖЕНИЯ"), 1);
+    assert_eq!(asked("ТОЛЬКО ХАРАКТЕРИСТИКИ"), 1);
+    assert_eq!(asked("ТОЛЬКО ТЕРМИНЫ"), 2);
+    assert_eq!(asked("ТОЛЬКО ЗАДАЧИ ПРИМЕНЕНИЯ"), 3);
+    assert_eq!(asked("ТОЛЬКО ВОПРОСЫ И ПРОБЕЛЫ"), 2);
+    // Every pass is told how much is enough — the bound whose absence truncated the live run.
+    assert_eq!(asked("ОБЪЁМ ОТВЕТА"), prompts.len());
     // …and the later passes were handed the products instead of being asked to re-list
     // them, which is what kept the budget from going on products a second time.
     assert!(
@@ -984,7 +982,7 @@ async fn a_material_with_terms_and_applications_produces_both_sections_and_may_p
         "{}",
         prompts[1]
     );
-    assert!(!prompts[2].contains("ТОЛЬКО СОСТАВ"), "{}", prompts[2]);
+    assert!(!prompts[1].contains("ТОЛЬКО СОСТАВ"), "{}", prompts[1]);
 
     // The sections the live run lost.
     let glossary = get(
@@ -1031,6 +1029,98 @@ async fn a_material_with_terms_and_applications_produces_both_sections_and_may_p
         validation.versions_published, 1,
         "a complete passport must still be publishable"
     );
+}
+
+/// A truncated answer costs one extra request, not the whole run.
+///
+/// The live failure: the applications pass, batch 3, came back cut off by the model's
+/// output limit. The scheduler treated that as a provider failure and failed the run —
+/// discarding the inventory, facts and glossary passes that had already completed, and
+/// marking the job permanently failed with nothing to resume from.
+///
+/// Truncation is a recoverable outcome now. The *same* purpose and the *same* pages are
+/// asked again with a larger envelope; the earlier passes are untouched; the cost of the
+/// recovery is recorded where an operator can see it.
+#[tokio::test]
+async fn a_truncated_applications_answer_is_recovered_without_losing_the_earlier_passes() {
+    let app = TestApp::start_with_env(std::collections::BTreeMap::from([(
+        "OTDEL_MAX_UPLOAD_BYTES".to_owned(),
+        "262144".to_owned(),
+    )]))
+    .await;
+    let client = app.sign_in().await;
+    let partner = app.create_partner(&client, "Партнёр").await;
+
+    let material = upload_catalogue(&app, &client, partner).await;
+    let quote = quotable(&page_text(&app, &client, partner, material).await);
+    let word = word_from(&quote);
+
+    let provider = support::scripted_run_truncating(
+        &full_draft_answer(&quote, &word),
+        otdel_knowledge::DraftPurpose::Applications,
+    );
+    let report = app
+        .run_knowledge(&app.knowledge_worker(provider.clone()))
+        .await;
+
+    // The run finished. Before R05.3 this was `jobs_failed: 1` with nothing stored.
+    assert_eq!(
+        report.jobs_completed, 1,
+        "the run must survive a truncation"
+    );
+    assert_eq!(report.jobs_failed, 0);
+
+    // The applications the truncated request would have lost.
+    let applications = get(
+        &app,
+        &client,
+        &format!("/api/partners/{partner}/applications"),
+    )
+    .await;
+    assert!(
+        !applications["items"].as_array().unwrap().is_empty(),
+        "the retry must produce the tasks: {applications}"
+    );
+
+    // The passes that had already completed kept what they found — the checkpoint.
+    let glossary = get(
+        &app,
+        &client,
+        &format!("/api/partners/{partner}/knowledge/glossary"),
+    )
+    .await;
+    assert!(!glossary["items"].as_array().unwrap().is_empty());
+    let passports = get(&app, &client, &format!("/api/partners/{partner}/passports")).await;
+    assert_eq!(passports["items"].as_array().unwrap().len(), 4);
+
+    // The recovery is accounted for: one extra call, recorded against the pass that
+    // needed it and nowhere else.
+    let coverage = coverage_of(&app, &client, partner).await;
+    let passes = coverage["passes"].as_array().unwrap();
+    let applications_pass = passes
+        .iter()
+        .find(|pass| pass["purpose"] == "applications")
+        .expect("the applications pass");
+    assert_eq!(applications_pass["truncated_retries"], 1);
+    // Three batches over six pages at two pages each, plus the one retry.
+    assert_eq!(applications_pass["requests_made"], 4);
+    assert_eq!(applications_pass["pages_processed"], 6);
+    // …and it still covered the material, so its topic is answerable.
+    assert_eq!(applications_pass["covered_everything"], true);
+
+    for other in passes
+        .iter()
+        .filter(|pass| pass["purpose"] != "applications")
+    {
+        assert_eq!(
+            other["truncated_retries"], 0,
+            "only the pass that truncated paid for it: {other}"
+        );
+    }
+
+    // Every purpose still got through, so the draft is complete enough to publish.
+    assert_eq!(coverage["requirements"], "met");
+    assert_eq!(coverage["allows_automatic_publication"], true);
 }
 
 /// The same material, with a budget that cannot reach the glossary and application passes.

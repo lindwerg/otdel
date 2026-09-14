@@ -689,11 +689,24 @@ gaps: [GapChange], limitations[], message}`.
   allows_automatic_publication, resumable_pages[], pages: [PageCoverage],
   declarations: [Declaration], passes: [RunPass]}`.
 - `RunPass` = `{id, run_id, material_id, purpose, requests_allowed, requests_made,
-  pages_total, pages_processed, pages_deferred, covered_everything, input_chars,
-  created_at}`; `purpose`: `inventory` | `facts` | `glossary` | `applications` | `inquiry`.
+  pages_total, pages_processed, pages_deferred, covered_everything, truncated_retries,
+  input_chars, created_at}`; `purpose`: `inventory` | `facts` | `glossary` |
+  `applications` | `inquiry`.
 - R05.2: разбор — пять проходов, каждому отправляется схема только из его секций. `passes`
   отвечает на вопрос, на который «44 из 44» ответить не может: под что именно читали
   страницы. `covered_everything` — вход требовательной проверки, а не производная величина.
+- R05.3: обрыв ответа по лимиту вывода — восстановимый исход прохода, а не отказ прогона.
+  Переспрашивают ту же цель на тех же страницах: конверт вывода удваивается дважды, потом
+  пачка делится пополам, и только страница, которая рвётся при любом размере,
+  откладывается — для этой цели, с причиной, и `covered_everything` становится `false`.
+  Ранее закончившиеся проходы сохраняются как контрольные точки и не переспрашиваются.
+- `truncated_retries` ≤ `requests_made` (проверяет БД): попытка восстановления — это
+  запрос. Считается отдельно, потому что «шесть запросов на материал» и «шесть запросов на
+  восстановление» — разные факты; второй означает, что цели дают слишком много страниц.
+- Страниц на запрос задаёт цель, а не одно число: `inventory`/`facts` — базовое, `inquiry`
+  — 4, `glossary` — 3, `applications` — 2. Потолок записей в ответе назван в промпте
+  явно; пришедшее сверх режется `DraftLimits`, и это ограничение ответа, а не материала —
+  непоместившееся остаётся непройденным охватом.
 - `state`: `unknown` | `complete` | `partial_accounted` | `incomplete`. Значения
   «достаточно хорошо» нет. `unknown` — разбор никто не оценивал, и это не успех.
 - `requirements`: `unknown` | `met` | `unmet`. Три значения, не булево: разбор, который

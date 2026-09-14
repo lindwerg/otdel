@@ -118,8 +118,23 @@ pub fn plan_batches_within(
     limits: &LlmLimits,
     allowed: usize,
 ) -> (Vec<PromptBatch>, Vec<usize>) {
+    plan_batches_for(catalog, limits, limits.max_pages_per_request, allowed)
+}
+
+/// The same planning, with the pages-per-request taken from the caller.
+///
+/// R05.3: the purpose decides how many pages it can carry — an applications request that
+/// takes six pages of a technical catalogue produces more output than the envelope holds,
+/// which is how a live pass came back truncated. See
+/// [`crate::schema::DraftPurpose::pages_per_request`].
+pub fn plan_batches_for(
+    catalog: &SourceCatalog,
+    limits: &LlmLimits,
+    pages_per_request: u32,
+    allowed: usize,
+) -> (Vec<PromptBatch>, Vec<usize>) {
     let per_page_budget = per_page_budget(limits);
-    let max_pages = limits.max_pages_per_request.max(1) as usize;
+    let max_pages = pages_per_request.max(1) as usize;
     let max_chars = limits.max_input_chars.max(1) as usize;
 
     let mut batches: Vec<PromptBatch> = Vec::new();
@@ -331,6 +346,19 @@ pub fn user_prompt(
     }
 
     out.push_str(purpose_instruction(purpose));
+
+    // R05.3 — the bound, in words. Strict structured output cannot express a count, and a
+    // live applications request came back cut off by the output limit because nothing told
+    // the model how much was enough. A model asked for "up to 8" writes 8 short entries;
+    // one asked for nothing in particular writes forty long ones and runs out of room.
+    out.push_str(&format!(
+        "\n\nОБЪЁМ ОТВЕТА: не более {} записей в этом ответе, и каждая — коротко. \
+         Цитата — одна строка источника, не абзац. Если на показанных страницах есть \
+         больше, верни самые важные: остальные страницы придут отдельным запросом, \
+         ничего не потеряется. Оборванный ответ не сохраняется целиком, поэтому короткий \
+         полный ответ лучше длинного неполного.",
+        purpose.max_items_per_response()
+    ));
 
     out
 }

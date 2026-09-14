@@ -136,6 +136,7 @@ pub struct NewRunPass {
     pub pages_processed: i32,
     pub pages_deferred: i32,
     pub covered_everything: bool,
+    pub truncated_retries: i32,
     pub input_chars: i32,
 }
 
@@ -251,13 +252,21 @@ pub async fn record_run_passes(
                 pass.purpose, pass.requests_made, pass.pages_deferred
             )));
         }
+        // A retry is a request; recording more of the first than the second would make
+        // the recovery look free.
+        if pass.truncated_retries > pass.requests_made {
+            return Err(DbError::Decode(format!(
+                "the `{}` pass reports {} truncation retries out of {} requests",
+                pass.purpose, pass.truncated_retries, pass.requests_made
+            )));
+        }
 
         sqlx::query(
             "INSERT INTO otdel.knowledge_run_passes \
                  (bureau_id, partner_id, material_id, run_id, purpose, requests_allowed, \
                   requests_made, pages_total, pages_processed, pages_deferred, \
-                  covered_everything, input_chars) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                  covered_everything, truncated_retries, input_chars) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(bureau_id)
         .bind(partner_id)
@@ -270,6 +279,7 @@ pub async fn record_run_passes(
         .bind(pass.pages_processed)
         .bind(pass.pages_deferred)
         .bind(pass.covered_everything)
+        .bind(pass.truncated_retries)
         .bind(pass.input_chars)
         .execute(tx.conn())
         .await?;

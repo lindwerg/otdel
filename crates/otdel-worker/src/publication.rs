@@ -30,10 +30,12 @@ use otdel_core::updates::{EventActor, EventKind};
 use otdel_db::publication::{
     self, NewClaim, NewEvidence, NewGap, NewVersion, PublishOutcome, RunOutcome,
 };
-use otdel_db::{events, jobs, partners, publication_read, Database};
+use otdel_db::{events, jobs, knowledge_read, partners, publication_read, Database};
 use otdel_embed::{EmbedRequest, EmbeddingProvider};
 use otdel_llm::LlmProvider;
-use otdel_publish::{check_claims, chunk, readiness, version, CheckedClaim, PublicationDecision};
+use otdel_publish::{
+    check_claims, chunk, readiness, version, CheckedClaim, PublicationDecision, SourceReadiness,
+};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -332,6 +334,10 @@ impl ValidationWorker {
         let gaps = publication_read::load_gaps(&mut tx, job.partner_id).await?;
         let published_fingerprint =
             publication_read::published_fingerprint(&mut tx, job.partner_id).await?;
+        // R05: what the understanding runs concluded about each material these candidates
+        // came from. Read here, with the candidates, so the check judges one consistent
+        // picture rather than candidates from now and verdicts from after the check.
+        let sources = source_readiness(&mut tx, job.partner_id).await?;
         tx.commit().await?;
 
         if candidates.is_empty() {
@@ -402,6 +408,7 @@ impl ValidationWorker {
         let decision = version::decide(
             &outcome.claims,
             &readiness,
+            &sources,
             &fingerprint,
             published_fingerprint.as_deref(),
         );
@@ -943,6 +950,27 @@ fn to_new_claim(claim: &CheckedClaim, chunk_max_chars: u32) -> NewClaim {
             .as_deref()
             .and_then(chunk::normalised_column),
     }
+}
+
+/// R05's verdict on each material this partner's knowledge is drawn from.
+///
+/// Built from the understanding runs rather than recomputed: the rule that judged the
+/// draft ran once, when the draft was made, against the pages and the unsettled readings
+/// that existed then. Re-deriving it here would be a second implementation of the same
+/// rule, free to disagree with the one the owner is looking at in the interface.
+async fn source_readiness(
+    tx: &mut otdel_db::ScopedTx,
+    partner_id: Uuid,
+) -> Result<Vec<SourceReadiness>, WorkerError> {
+    let runs = knowledge_read::list_runs(tx, partner_id).await?;
+    Ok(runs
+        .into_iter()
+        .map(|run| SourceReadiness {
+            material_filename: run.material_filename,
+            requirements: run.coverage.requirements,
+            missing: run.coverage.requirements_missing,
+        })
+        .collect())
 }
 
 #[cfg(test)]

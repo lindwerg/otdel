@@ -215,7 +215,12 @@ impl CandidateDraft {
     /// Lives here rather than in `coverage` so the same draft can be judged before it is
     /// stored and after — the rule reads a [`crate::coverage::DraftSnapshot`], and this is
     /// the in-memory way to build one.
-    pub fn snapshot(&self) -> crate::coverage::DraftSnapshot {
+    ///
+    /// `context` carries the two numbers a draft cannot know about itself: how much of the
+    /// material this pass actually processed, and how many readings it could not settle.
+    /// Both decide whether a declaration of absence may stand, so leaving them out would
+    /// let "there is none" clear a topic it has no standing to clear.
+    pub fn snapshot(&self, context: crate::coverage::RunContext) -> crate::coverage::DraftSnapshot {
         crate::coverage::DraftSnapshot {
             products_total: self.products.len(),
             products_with_summary: self
@@ -241,11 +246,21 @@ impl CandidateDraft {
                     .count(),
             commercial_gaps: self.count_gaps(GapNature::Commercial),
             technical_gaps: self.count_gaps(GapNature::Technical),
+            // What the material *states* commercially. "Nothing commercial is missing"
+            // is only sayable when something commercial is present, so the check needs
+            // the facts and not only the gaps.
+            commercial_facts: self
+                .facts
+                .iter()
+                .filter(|fact| fact.kind == FactKind::Commercial)
+                .count(),
             declared: self
                 .declarations
                 .iter()
                 .map(|declaration| declaration.topic)
                 .collect(),
+            pages_processed: context.pages_processed,
+            open_uncertainties: context.open_uncertainties,
         }
     }
 

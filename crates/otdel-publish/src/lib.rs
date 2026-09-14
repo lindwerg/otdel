@@ -56,7 +56,9 @@ pub use claim::{
 };
 pub use readiness::{assess, gap_blocks, GapText};
 pub use review::PROMPT_PROFILE;
-pub use version::{candidate_fingerprint, decide, fingerprint, PublicationDecision};
+pub use version::{
+    candidate_fingerprint, decide, fingerprint, PublicationDecision, SourceReadiness,
+};
 
 /// Purpose label of a review call. Appears in logs; never the content.
 pub const REVIEW_PURPOSE: &str = "claim_review";

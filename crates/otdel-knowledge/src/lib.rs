@@ -45,7 +45,7 @@ pub use candidate::{
 };
 pub use coverage::{
     evaluate_requirements, CoveragePlan, DraftSnapshot, PlannedPage, ProcessedPage, Requirement,
-    RequirementsOutcome, REQUIREMENTS, TECHNICAL_REQUIREMENT,
+    RequirementsOutcome, RunContext, REQUIREMENTS, TECHNICAL_REQUIREMENT,
 };
 pub use prompt::{PromptContext, TableContext};
 pub use schema::{DraftLimits, DraftResponse, PROMPT_PROFILE, SCHEMA_NAME};

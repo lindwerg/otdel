@@ -7,6 +7,7 @@ import { KnowledgePanel } from '../components/knowledge/KnowledgePanel'
 import { MaterialsPanel } from '../components/MaterialsPanel'
 import { PartnerFormDialog } from '../components/PartnerFormDialog'
 import { PartnerSidebar } from '../components/PartnerSidebar'
+import { PassportPanel } from '../components/passport/PassportPanel'
 import { PublicationPanel } from '../components/publication/PublicationPanel'
 import { ResearchPanel } from '../components/research/ResearchPanel'
 import { StatusMessage } from '../components/StatusMessage'
@@ -18,6 +19,11 @@ import { UpdatesPanel } from '../components/updates/UpdatesPanel'
 const TABS = [
   { id: 'materials', label: 'Материалы' },
   { id: 'knowledge', label: 'Знания' },
+  // R05. A separate section rather than another list inside «Знания»: the draft
+  // answers "what did the model produce", and this answers "what does the
+  // product base say, and out of how much of the document" — which is a
+  // different question and was the one nobody could ask.
+  { id: 'passports', label: 'Продуктовая база' },
   { id: 'research', label: 'Исследование' },
   { id: 'published', label: 'Версии и поиск' },
   { id: 'updates', label: 'Обновления' },
@@ -238,6 +244,8 @@ export function WorkspacePage() {
                 <MaterialsPanel key={selectedPartner.id} partnerId={selectedPartner.id} partnerName={selectedPartner.name} />
               ) : activeTab === 'knowledge' ? (
                 <KnowledgePanel key={selectedPartner.id} partnerId={selectedPartner.id} />
+              ) : activeTab === 'passports' ? (
+                <PassportPanel key={selectedPartner.id} partnerId={selectedPartner.id} />
               ) : activeTab === 'research' ? (
                 <ResearchPanel key={selectedPartner.id} partnerId={selectedPartner.id} />
               ) : activeTab === 'published' ? (

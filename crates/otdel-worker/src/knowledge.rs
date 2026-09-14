@@ -24,23 +24,24 @@ use std::time::Duration;
 use otdel_core::config::Config;
 use otdel_core::knowledge::KnowledgeRunStatus;
 use otdel_core::model::{Job, JobKind};
+use otdel_core::passport::{CoverageState, RequirementsState};
 use otdel_core::updates::{EventActor, EventKind};
-use otdel_db::knowledge::{
-    self, NewCategory, NewDraft, NewEvidence, NewFact, NewGap, NewProduct, NewQa, NewQuestion,
-    NewTerm, RunOutcome,
-};
+use otdel_db::knowledge::{self, RunOutcome};
+use otdel_db::passport;
 use otdel_db::{
     events, jobs, materials, pages, partners, publication, publication_read, updates, Database,
 };
 use otdel_knowledge::{
-    draft_knowledge, CandidateDraft, DraftLimits, KnowledgeError, PromptContext, SourceCatalog,
-    SourcePage, PROMPT_PROFILE,
+    draft_knowledge, evaluate_requirements, tables, CoveragePlan, DraftLimits, KnowledgeError,
+    PromptContext, SourceCatalog, SourcePage, StructuredCell, TableContext, TableReading,
+    PROMPT_PROFILE,
 };
 use otdel_llm::{LlmProvider, ProviderDescription};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::error::WorkerError;
+use crate::knowledge_draft::{collect_uncertainties, page_coverage_rows, to_new_draft};
 use crate::material_of;
 
 /// Delay before a transient model failure is tried again. Longer than the extraction
@@ -57,6 +58,13 @@ pub struct KnowledgeReport {
     pub candidates_rejected: u32,
     /// Runs that stopped because the model adapter is not configured.
     pub runs_awaiting_provider: u32,
+    /// R05 — pages this pass left for a later one because a budget was reached. Reported
+    /// beside the successes: a pass that "completed" ten jobs and deferred two hundred
+    /// pages has not read the partner's catalogues, and the report should say so.
+    pub pages_deferred: u32,
+    /// R05 — runs whose draft does not carry what a passport needs. These are exactly the
+    /// runs a person still has to look at before anything is published from them.
+    pub runs_below_requirements: u32,
 }
 
 pub struct KnowledgeWorker {
@@ -105,6 +113,10 @@ impl KnowledgeWorker {
                 Ok(outcome) => {
                     report.facts_stored += outcome.facts_stored;
                     report.candidates_rejected += outcome.rejected;
+                    report.pages_deferred += outcome.pages_deferred;
+                    if !outcome.requirements_met {
+                        report.runs_below_requirements += 1;
+                    }
                     self.settle(bureau_id, &job, None).await?;
                     report.jobs_completed += 1;
                 }
@@ -186,6 +198,13 @@ impl KnowledgeWorker {
             .await?
             .map_or_else(|| "партнёр".to_owned(), |partner| partner.name);
         let readable = pages::readable_with_text(&mut tx, material_id).await?;
+        // R05: *every* page of the material, not only the offerable ones. This list is
+        // the denominator — the thing the audited run never had, which is how eight pages
+        // of a forty-four page catalogue left the account without anybody noticing.
+        let inventory = pages::list_for_material(&mut tx, material_id).await?;
+        // R05: R03's table cells, at last consumed. Established rows become structured
+        // context in the prompt; everything else becomes an uncertainty and never a fact.
+        let table_cells = pages::table_cells_for_material(&mut tx, material_id).await?;
         let run =
             knowledge::start_run(&mut tx, job.partner_id, material_id, PROMPT_PROFILE).await?;
         // Phase 1F: which reading of the document this draft is about to be made from.
@@ -210,11 +229,43 @@ impl KnowledgeWorker {
             pages_with_text: catalog.len(),
         };
 
+        // The plan is built before the model is called and settled after, so a run that
+        // fails halfway still leaves an account naming every page and why it is not in
+        // the draft. A run with no account is refused by the publication gate, but a run
+        // whose account says «страница 37 ждёт распознавания» can be acted on.
+        let offerable: Vec<Uuid> = catalog
+            .entries()
+            .iter()
+            .map(|entry| entry.page.page_id)
+            .collect();
+        let mut plan = CoveragePlan::build(&inventory, &offerable);
+
+        let readings: Vec<(Uuid, i32, TableReading)> = table_cells
+            .iter()
+            .map(|(page_id, page_number, cells)| {
+                (
+                    *page_id,
+                    *page_number,
+                    tables::partition(*page_id, *page_number, cells),
+                )
+            })
+            .collect();
+        let table_context = TableContext::from_readings(
+            readings
+                .iter()
+                .map(|(page_id, _, reading)| (*page_id, reading)),
+        );
+        let structured: Vec<StructuredCell> = readings
+            .iter()
+            .flat_map(|(_, _, reading)| reading.structured.iter().cloned())
+            .collect();
+
         let description = self.provider.describe();
         let result = draft_knowledge(
             self.provider.as_ref(),
             &catalog,
             &context,
+            &table_context,
             &self.config.llm.limits,
             &self.draft_limits,
         )
@@ -246,7 +297,35 @@ impl KnowledgeWorker {
                     ),
                 };
 
+                // R05: a run that never reached the model still knows what the material
+                // is made of. Settling with nothing processed leaves every page carrying
+                // the reason it was not, which is the difference between "нечего было
+                // разбирать" and "разбор не состоялся, вот что осталось непрочитанным".
+                plan.settle(&[], &[]);
+                let mut coverage = plan.summarise();
+                coverage.requirements = RequirementsState::Unknown;
+
                 let mut tx = self.db.begin_scoped(bureau_id).await?;
+                passport::record_page_coverage(
+                    &mut tx,
+                    job.partner_id,
+                    material_id,
+                    run.id,
+                    &page_coverage_rows(&plan),
+                )
+                .await?;
+                // The tables were read by R03 and the unreadable pages are unreadable
+                // whatever the model did, so both findings survive a failed pass. A run
+                // that could not reach the provider still knows that page 37 holds a load
+                // table nobody could read, and that is worth more than a clean slate.
+                passport::record_uncertainties(
+                    &mut tx,
+                    job.partner_id,
+                    material_id,
+                    run.id,
+                    &collect_uncertainties(&readings, &plan),
+                )
+                .await?;
                 knowledge::finish_run(
                     &mut tx,
                     run.id,
@@ -262,6 +341,7 @@ impl KnowledgeWorker {
                         rejections: Vec::new(),
                         diagnostic: Some(error.to_string()),
                         counts: knowledge::DraftCounts::default(),
+                        coverage,
                     },
                 )
                 .await?;
@@ -281,7 +361,25 @@ impl KnowledgeWorker {
         // with ours, which is the "late result of an old run overwrites a newer one"
         // failure `docs/block-01-spec.md` §7 forbids. Stopping is the safe move: the
         // job belongs to whoever reclaimed it.
-        let new_draft = to_new_draft(&drafted.draft);
+        // R05, all before the transaction opens because none of it needs one:
+        //
+        //   * settle the page account against what the run actually did;
+        //   * judge the draft against the requirements a passport has to carry;
+        //   * ask each accepted fact whether a usable table cell says the same thing.
+        //
+        // The requirement verdict is computed from the draft in memory rather than from
+        // the rows after storage on purpose: it has to be the *same* rule in both places,
+        // and `CandidateDraft::snapshot` is the only way to build the rule's input from a
+        // draft that has not been stored yet.
+        plan.settle(&drafted.processed, &drafted.deferred);
+        let mut coverage = plan.summarise();
+        let requirements = evaluate_requirements(&drafted.draft.snapshot());
+        coverage.requirements = requirements.state;
+        coverage.requirements_missing = requirements.missing.clone();
+
+        let new_draft = to_new_draft(&drafted.draft, &structured);
+        let uncertainties = collect_uncertainties(&readings, &plan);
+
         let mut tx = self.db.begin_scoped(bureau_id).await?;
         let still_ours = jobs::heartbeat(
             &mut tx,
@@ -299,8 +397,35 @@ impl KnowledgeWorker {
         let counts =
             knowledge::replace_draft(&mut tx, job.partner_id, material_id, run.id, &new_draft)
                 .await?;
+        passport::record_page_coverage(
+            &mut tx,
+            job.partner_id,
+            material_id,
+            run.id,
+            &page_coverage_rows(&plan),
+        )
+        .await?;
+        passport::record_uncertainties(
+            &mut tx,
+            job.partner_id,
+            material_id,
+            run.id,
+            &uncertainties,
+        )
+        .await?;
+        // Derived last, from the candidates that exist after this draft replaced the
+        // previous one. A proposal made from the old rows would point at products the
+        // same transaction has just deleted.
+        let identity = passport::propose_identity_links(&mut tx, job.partner_id).await?;
 
-        let status = if drafted.draft.rejected > 0 || drafted.pages_skipped > 0 {
+        // `completed` is unavailable while a page is still queued — the database says the
+        // same thing, and this says it first so the run is not written twice. That rule
+        // is exactly what the audited run broke: eight pages were never offered and the
+        // run still reported success.
+        let status = if drafted.draft.rejected > 0
+            || drafted.pages_skipped > 0
+            || coverage.state != CoverageState::Complete
+        {
             KnowledgeRunStatus::Partial
         } else {
             KnowledgeRunStatus::Completed
@@ -321,6 +446,7 @@ impl KnowledgeWorker {
                 rejections: drafted.draft.rejections.clone(),
                 diagnostic: None,
                 counts,
+                coverage: coverage.clone(),
             },
         )
         .await?;
@@ -330,12 +456,24 @@ impl KnowledgeWorker {
             &events::NewEvent::new(
                 EventKind::UnderstandingFinished,
                 EventActor::Worker,
+                // R05: the denominator is in the sentence. «фактов 13» was reported as
+                // success over a catalogue whose pages nobody had counted; «страниц
+                // 36/44» in the same line makes that unreportable.
                 format!(
-                    "разбор материала «{}» завершён ({}): фактов {}, отклонено {}",
+                    "разбор материала «{}» завершён ({}): страниц {}/{}, фактов {}, задач {}, \
+                     отклонено {}{}",
                     stored.material.filename,
                     status.as_str(),
+                    coverage.pages_processed,
+                    coverage.pages_total,
                     counts.facts,
-                    drafted.draft.rejected
+                    counts.applications,
+                    drafted.draft.rejected,
+                    if requirements.state.is_met() {
+                        String::new()
+                    } else {
+                        format!("; паспорту не хватает: {}", requirements.missing.len())
+                    },
                 ),
             )
             .for_partner(job.partner_id)
@@ -346,6 +484,18 @@ impl KnowledgeWorker {
                 "facts": counts.facts,
                 "rejected": drafted.draft.rejected,
                 "source_revision": stored.material.content_revision,
+                "coverage_state": coverage.state.as_str(),
+                "pages_total": coverage.pages_total,
+                "pages_processed": coverage.pages_processed,
+                "pages_deferred": coverage.pages_deferred,
+                "pages_unreadable": coverage.pages_unreadable,
+                "requirements_state": coverage.requirements.as_str(),
+                "requirements_missing": coverage.requirements_missing,
+                "applications": counts.applications,
+                "declarations": counts.declarations,
+                "uncertainties": uncertainties.len(),
+                "identity_linked": identity.linked,
+                "identity_unclear": identity.unclear,
             })),
         )
         .await?;
@@ -383,6 +533,12 @@ impl KnowledgeWorker {
             facts = counts.facts,
             terms = counts.terms,
             gaps = counts.gaps,
+            applications = counts.applications,
+            declarations = counts.declarations,
+            uncertainties = uncertainties.len(),
+            coverage = coverage.state.as_str(),
+            pages = format!("{}/{}", coverage.pages_processed, coverage.pages_total),
+            requirements = coverage.requirements.as_str(),
             rejected = drafted.draft.rejected,
             requests = drafted.requests_made,
             "product knowledge drafted"
@@ -391,6 +547,8 @@ impl KnowledgeWorker {
         Ok(JobOutcome {
             facts_stored: u32::try_from(counts.facts).unwrap_or(0),
             rejected: drafted.draft.rejected,
+            pages_deferred: u32::try_from(coverage.pages_deferred).unwrap_or(0),
+            requirements_met: coverage.requirements.is_met(),
         })
     }
 
@@ -462,171 +620,8 @@ impl KnowledgeWorker {
 struct JobOutcome {
     facts_stored: u32,
     rejected: u32,
-}
-
-/// Map validated candidates onto the storage layer's input.
-///
-/// A plain translation on purpose: every rule has already been applied, and a mapping
-/// that decided anything would be a second place to look for the rules.
-fn to_new_draft(draft: &CandidateDraft) -> NewDraft {
-    NewDraft {
-        categories: draft
-            .categories
-            .iter()
-            .map(|category| NewCategory {
-                reference: category.reference.clone(),
-                kind: category.kind,
-                name: category.name.clone(),
-                summary: category.summary.clone(),
-            })
-            .collect(),
-        products: draft
-            .products
-            .iter()
-            .map(|product| NewProduct {
-                reference: product.reference.clone(),
-                category_ref: product.category_ref.clone(),
-                kind: product.kind,
-                name: product.name.clone(),
-                summary: product.summary.clone(),
-            })
-            .collect(),
-        facts: draft
-            .facts
-            .iter()
-            .map(|fact| NewFact {
-                product_ref: fact.product_ref.clone(),
-                kind: fact.kind,
-                attribute: fact.attribute.clone(),
-                value_text: fact.value_text.clone(),
-                unit: fact.unit.clone(),
-                conditions: fact.conditions.clone(),
-                model_context: fact.model_context.clone(),
-                evidence: fact.evidence.iter().map(evidence).collect(),
-            })
-            .collect(),
-        terms: draft
-            .terms
-            .iter()
-            .map(|term| NewTerm {
-                term: term.term.clone(),
-                definition: term.definition.clone(),
-                definition_is_model_context: term.definition_is_model_context,
-                evidence: term.evidence.iter().map(evidence).collect(),
-            })
-            .collect(),
-        qa: draft
-            .qa
-            .iter()
-            .map(|entry| NewQa {
-                question: entry.question.clone(),
-                answer: entry.answer.clone(),
-                answer_is_model_context: entry.answer_is_model_context,
-                evidence: entry.evidence.iter().map(evidence).collect(),
-            })
-            .collect(),
-        gaps: draft
-            .gaps
-            .iter()
-            .map(|gap| NewGap {
-                product_ref: gap.product_ref.clone(),
-                topic: gap.topic.clone(),
-                missing: gap.missing.clone(),
-                blocks: gap.blocks.clone(),
-                question: gap.question.as_ref().map(|question| NewQuestion {
-                    audience: question.audience,
-                    text: question.text.clone(),
-                }),
-            })
-            .collect(),
-    }
-}
-
-fn evidence(resolved: &otdel_knowledge::ResolvedEvidence) -> NewEvidence {
-    NewEvidence {
-        page_id: resolved.page_id,
-        page_number: resolved.page_number,
-        quote: resolved.quote.clone(),
-        char_start: resolved.char_start,
-        char_end: resolved.char_end,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use otdel_core::knowledge::{CategoryKind, FactKind, ProductKind, QuestionAudience};
-    use otdel_knowledge::{
-        CandidateCategory, CandidateFact, CandidateGap, CandidateProduct, CandidateQuestion,
-        ResolvedEvidence,
-    };
-
-    #[test]
-    fn mapping_preserves_the_quote_its_offsets_and_the_separated_model_context() {
-        let draft = CandidateDraft {
-            categories: vec![CandidateCategory {
-                reference: "b1:c1".to_owned(),
-                kind: CategoryKind::Direction,
-                name: "Монтажные системы".to_owned(),
-                summary: None,
-            }],
-            products: vec![CandidateProduct {
-                reference: "b1:p1".to_owned(),
-                category_ref: Some("b1:c1".to_owned()),
-                kind: ProductKind::Product,
-                name: "BP21".to_owned(),
-                summary: None,
-            }],
-            facts: vec![CandidateFact {
-                product_ref: Some("b1:p1".to_owned()),
-                kind: FactKind::Characteristic,
-                attribute: "нагрузка".to_owned(),
-                value_text: "3.5".to_owned(),
-                unit: Some("kN".to_owned()),
-                conditions: Some("две опоры".to_owned()),
-                model_context: Some("пояснение модели".to_owned()),
-                evidence: vec![ResolvedEvidence {
-                    page_id: Uuid::from_u128(5),
-                    material_id: Uuid::from_u128(6),
-                    page_number: 3,
-                    quote: "BP21 1200 3.5 kN".to_owned(),
-                    char_start: 12,
-                    char_end: 28,
-                }],
-            }],
-            gaps: vec![CandidateGap {
-                product_ref: Some("b1:p1".to_owned()),
-                topic: "price".to_owned(),
-                missing: "цена не указана".to_owned(),
-                blocks: None,
-                question: Some(CandidateQuestion {
-                    audience: QuestionAudience::Partner,
-                    text: "Какая цена?".to_owned(),
-                }),
-            }],
-            ..CandidateDraft::default()
-        };
-
-        let mapped = to_new_draft(&draft);
-
-        assert_eq!(mapped.categories.len(), 1);
-        assert_eq!(mapped.products[0].category_ref.as_deref(), Some("b1:c1"));
-        let fact = &mapped.facts[0];
-        assert_eq!(fact.unit.as_deref(), Some("kN"));
-        assert_eq!(fact.conditions.as_deref(), Some("две опоры"));
-        assert_eq!(fact.model_context.as_deref(), Some("пояснение модели"));
-        assert_eq!(fact.evidence[0].quote, "BP21 1200 3.5 kN");
-        assert_eq!(fact.evidence[0].char_start, 12);
-        assert_eq!(fact.evidence[0].char_end, 28);
-        assert_eq!(
-            mapped.gaps[0].question.as_ref().unwrap().audience,
-            QuestionAudience::Partner
-        );
-    }
-
-    #[test]
-    fn an_empty_draft_maps_to_an_empty_draft() {
-        let mapped = to_new_draft(&CandidateDraft::default());
-        assert_eq!(mapped, NewDraft::default());
-    }
+    /// Pages the request budget left for a later pass.
+    pages_deferred: u32,
+    /// Whether the draft carries what a passport has to have.
+    requirements_met: bool,
 }

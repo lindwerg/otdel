@@ -2,13 +2,16 @@ import type {
   AnswerRequest,
   AnswerResponse,
   ApiErrorBody,
+  CoverageReport,
   ExportDocument,
   GlossaryTerm,
   HistoryEvent,
   Job,
+  KnowledgeDeclaration,
   KnowledgeGap,
   KnowledgeOverview,
   KnowledgeRun,
+  KnowledgeUncertainty,
   KnowledgeVersion,
   ListResponse,
   Material,
@@ -16,7 +19,10 @@ import type {
   PageDetail,
   PageView,
   Partner,
+  ProductApplication,
+  ProductIdentityLink,
   ProductNode,
+  ProductPassport,
   ProviderState,
   QaEntry,
   RefreshPlan,
@@ -318,6 +324,58 @@ export async function listKnowledgeQa(partnerId: string): Promise<QaEntry[]> {
 
 export async function listGaps(partnerId: string): Promise<KnowledgeGap[]> {
   const res = await apiRequest<ListResponse<KnowledgeGap>>(knowledgePath(partnerId, '/gaps'))
+  return res.items
+}
+
+// --- The product base (R05) ------------------------------------------------
+//
+// These five endpoints sit beside `/knowledge`, not under it, because they are
+// not another view of the draft: they are what a productologist reads. A
+// passport arrives with its gaps, its uncertainties and its identity proposals
+// already attached — there is no parameter here that drops them, and no
+// separate call a caller could forget to make.
+
+export async function listPassports(partnerId: string): Promise<ProductPassport[]> {
+  const res = await apiRequest<ListResponse<ProductPassport>>(partnerPath(partnerId, '/passports'))
+  return res.items
+}
+
+/**
+ * The page account of every run of this partner.
+ *
+ * Runs nobody judged are included, with `state: 'unknown'`. Filtering them out
+ * here would restore exactly the silence this endpoint exists to break.
+ */
+export async function listCoverage(partnerId: string): Promise<CoverageReport[]> {
+  const res = await apiRequest<ListResponse<CoverageReport>>(partnerPath(partnerId, '/coverage'))
+  return res.items
+}
+
+export async function listApplications(partnerId: string): Promise<ProductApplication[]> {
+  const res = await apiRequest<ListResponse<ProductApplication>>(
+    partnerPath(partnerId, '/applications'),
+  )
+  return res.items
+}
+
+export async function listUncertainties(partnerId: string): Promise<KnowledgeUncertainty[]> {
+  const res = await apiRequest<ListResponse<KnowledgeUncertainty>>(
+    partnerPath(partnerId, '/uncertainties'),
+  )
+  return res.items
+}
+
+export async function listIdentityLinks(partnerId: string): Promise<ProductIdentityLink[]> {
+  const res = await apiRequest<ListResponse<ProductIdentityLink>>(
+    partnerPath(partnerId, '/identity'),
+  )
+  return res.items
+}
+
+export async function listDeclarations(partnerId: string): Promise<KnowledgeDeclaration[]> {
+  const res = await apiRequest<ListResponse<KnowledgeDeclaration>>(
+    partnerPath(partnerId, '/declarations'),
+  )
   return res.items
 }
 

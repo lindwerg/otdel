@@ -338,6 +338,7 @@ mod tests {
             conditions: None,
             model_context: None,
             evidence: Vec::new(),
+            origin: otdel_core::passport::FactOrigin::default(),
             created_at: Utc::now(),
         }
     }

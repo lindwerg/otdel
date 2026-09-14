@@ -16,9 +16,17 @@ pub mod events;
 pub mod jobs;
 pub mod knowledge;
 pub mod knowledge_read;
+/// The understanding run row: queueing, closing, and the page account written with its
+/// status.
+pub mod knowledge_run;
 pub mod materials;
 pub mod pages;
 pub mod partners;
+/// R05 — writing the page account, the explicit absences, the application map and the
+/// identity proposals.
+pub mod passport;
+/// R05 — reading the product base back: passports, coverage, applications, uncertainties.
+pub mod passport_read;
 pub mod publication;
 pub mod publication_read;
 pub mod research;

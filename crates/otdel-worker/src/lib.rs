@@ -31,6 +31,8 @@
 pub mod error;
 pub mod extraction;
 pub mod knowledge;
+/// R05 — translating validated candidates into what the storage layer stores.
+mod knowledge_draft;
 pub mod pagemap;
 pub mod publication;
 pub mod research;

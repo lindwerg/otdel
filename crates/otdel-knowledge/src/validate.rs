@@ -26,10 +26,16 @@
 //! interface shows next to the run.
 
 use otdel_core::knowledge::{CategoryKind, FactKind, ProductKind, QuestionAudience};
+use otdel_core::passport::{
+    AliasRelation, ApplicationDetailKind, DeclarationOrigin, DeclarationTopic, GapNature,
+    SynonymRelation,
+};
 
 use crate::candidate::{
-    normalise_name, CandidateCategory, CandidateDraft, CandidateFact, CandidateGap,
-    CandidateProduct, CandidateQa, CandidateQuestion, CandidateTerm, ResolvedEvidence,
+    normalise_name, CandidateAlias, CandidateApplication, CandidateApplicationDetail,
+    CandidateCategory, CandidateDeclaration, CandidateDraft, CandidateFact, CandidateGap,
+    CandidateProduct, CandidateQa, CandidateQuestion, CandidateSense, CandidateSynonym,
+    CandidateTerm, ResolvedEvidence,
 };
 use crate::measure;
 use crate::quote;
@@ -56,13 +62,267 @@ pub fn validate_response(
     let mut draft = CandidateDraft::default();
 
     validate_categories(response, limits, prefix, &mut draft);
-    validate_products(response, limits, prefix, &mut draft);
+    validate_products(response, catalog, limits, prefix, &mut draft);
     validate_facts(response, catalog, limits, prefix, &mut draft);
     validate_terms(response, catalog, limits, &mut draft);
     validate_qa(response, catalog, limits, &mut draft);
     validate_gaps(response, limits, prefix, &mut draft);
+    // After the products, so an application may reference one; before the declarations,
+    // so a declaration can be checked against what the response actually produced.
+    validate_applications(response, catalog, limits, prefix, &mut draft);
+    validate_declarations(response, limits, &mut draft);
 
     draft
+}
+
+/// Accept the run's explicit absences.
+///
+/// A declaration is refused when the same response *did* produce rows on that topic:
+/// "there are no terms" beside eleven terms is not a statement about the material, it is a
+/// contradiction, and storing it would let a later reader satisfy a requirement with it.
+fn validate_declarations(
+    response: &DraftResponse,
+    limits: &DraftLimits,
+    draft: &mut CandidateDraft,
+) {
+    let declarations = &response.declarations;
+    for (topic, stated) in [
+        (DeclarationTopic::Glossary, declarations.glossary.as_deref()),
+        (
+            DeclarationTopic::Questions,
+            declarations.questions.as_deref(),
+        ),
+        (
+            DeclarationTopic::Applications,
+            declarations.applications.as_deref(),
+        ),
+        (
+            DeclarationTopic::CommercialUnknowns,
+            declarations.commercial_unknowns.as_deref(),
+        ),
+        (
+            DeclarationTopic::TechnicalUnknowns,
+            declarations.technical_unknowns.as_deref(),
+        ),
+    ] {
+        let Some(stated) = optional_text(stated, limits.max_long_text_chars) else {
+            continue;
+        };
+        if produced_rows_for(draft, topic) {
+            draft.reject(format!(
+                "заявление «в материале этого нет» по теме «{}» отклонено: в том же ответе \
+                 такие записи есть",
+                topic.as_str()
+            ));
+            continue;
+        }
+        draft.declare(CandidateDeclaration {
+            topic,
+            stated,
+            origin: DeclarationOrigin::Model,
+        });
+    }
+}
+
+/// Did this response produce anything on the topic a declaration calls empty?
+fn produced_rows_for(draft: &CandidateDraft, topic: DeclarationTopic) -> bool {
+    match topic {
+        DeclarationTopic::Glossary => !draft.terms.is_empty(),
+        DeclarationTopic::Applications => !draft.applications.is_empty(),
+        DeclarationTopic::Questions => draft.gaps.iter().any(|gap| gap.question.is_some()),
+        DeclarationTopic::CommercialUnknowns => draft
+            .gaps
+            .iter()
+            .any(|gap| gap.nature == GapNature::Commercial),
+        DeclarationTopic::TechnicalUnknowns => draft
+            .gaps
+            .iter()
+            .any(|gap| gap.nature == GapNature::Technical),
+    }
+}
+
+/// Accept the tasks a material says its products serve.
+///
+/// An application has to be quoted like anything else — it is a claim about what the
+/// document says the product is for, and an unquoted one is the model's opinion. Details
+/// are stricter still on one side and looser on the other: a parameter or a constraint
+/// asserts something and must carry its own fragment, while a question asserts nothing and
+/// needs only an addressee.
+fn validate_applications(
+    response: &DraftResponse,
+    catalog: &SourceCatalog,
+    limits: &DraftLimits,
+    prefix: &str,
+    draft: &mut CandidateDraft,
+) {
+    for (index, application) in response.applications.iter().enumerate() {
+        if index >= limits.max_applications {
+            draft.reject(format!(
+                "принято не более {} задач применения, остальные отброшены",
+                limits.max_applications
+            ));
+            break;
+        }
+        let Some(task) = text(&application.task, limits.max_long_text_chars) else {
+            draft.reject("задача применения отклонена: не сказано, что за задача");
+            continue;
+        };
+
+        let subject = format!("задача «{}»", short(&task));
+        let resolved = resolve_evidence(&application.evidence, catalog, limits, &subject, draft);
+        let Some(evidence) = resolved.into_iter().next() else {
+            draft.reject(format!(
+                "{subject} отклонена: нет подтверждённой цитаты из этого материала"
+            ));
+            continue;
+        };
+
+        let product_ref = match application.product_ref.as_deref().map(str::trim) {
+            Some(reference) if !reference.is_empty() => {
+                match resolve_product(draft, prefix, reference) {
+                    Some(found) => Some(found),
+                    None => {
+                        draft.note(format!(
+                            "{subject} сохранена без привязки к изделию: ссылка «{}» не найдена",
+                            short(reference)
+                        ));
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        let details = validate_application_details(application, catalog, limits, &subject, draft);
+
+        draft.applications.push(CandidateApplication {
+            product_ref,
+            task,
+            summary: optional_text(application.summary.as_deref(), limits.max_long_text_chars),
+            model_context: optional_text(
+                application.model_context.as_deref(),
+                limits.max_long_text_chars,
+            ),
+            evidence,
+            details,
+        });
+    }
+}
+
+fn validate_application_details(
+    application: &crate::schema::DraftApplication,
+    catalog: &SourceCatalog,
+    limits: &DraftLimits,
+    subject: &str,
+    draft: &mut CandidateDraft,
+) -> Vec<CandidateApplicationDetail> {
+    let mut details: Vec<CandidateApplicationDetail> = Vec::new();
+
+    for (index, detail) in application.details.iter().enumerate() {
+        if index >= limits.max_details_per_application {
+            draft.note(format!(
+                "{subject}: принято не более {} строк, остальные отброшены",
+                limits.max_details_per_application
+            ));
+            break;
+        }
+        let Some(kind) = ApplicationDetailKind::parse(detail.kind.trim()) else {
+            draft.reject(format!(
+                "{subject}: строка отклонена, неизвестный вид «{}»",
+                short(&detail.kind)
+            ));
+            continue;
+        };
+        let Some(label) = text(&detail.label, limits.max_short_text_chars) else {
+            draft.reject(format!("{subject}: строка отклонена, пустое название"));
+            continue;
+        };
+
+        let resolved = resolve_evidence(
+            &detail.evidence,
+            catalog,
+            limits,
+            &format!("{subject} → «{}»", short(&label)),
+            draft,
+        );
+        let evidence = resolved.into_iter().next();
+
+        if kind.is_a_claim() {
+            let Some(value_text) =
+                optional_text(detail.value.as_deref(), limits.max_short_text_chars)
+            else {
+                draft.reject(format!(
+                    "{subject}: «{}» отклонено, у параметра или ограничения нет значения",
+                    short(&label)
+                ));
+                continue;
+            };
+            let Some(evidence) = evidence else {
+                draft.reject(format!(
+                    "{subject}: «{}» отклонено, утверждение без цитаты",
+                    short(&label)
+                ));
+                continue;
+            };
+            // The same discipline as a fact: the value has to be in the fragment that is
+            // shown next to it, and the unit has to be written in the document rather
+            // than supplied by the model alongside the number.
+            if !quoted_anywhere(&value_text, std::slice::from_ref(&evidence)) {
+                draft.reject(format!(
+                    "{subject}: «{}» отклонено, значения «{}» нет в цитате",
+                    short(&label),
+                    short(&value_text)
+                ));
+                continue;
+            }
+            let unit = match optional_text(detail.unit.as_deref(), MAX_UNIT_CHARS) {
+                Some(unit) if unit_is_quoted(&unit, std::slice::from_ref(&evidence)) => Some(unit),
+                Some(unit) => {
+                    draft.note(format!(
+                        "{subject}: единица «{}» у «{}» не сохранена — в цитате её нет",
+                        short(&unit),
+                        short(&label)
+                    ));
+                    None
+                }
+                None => None,
+            };
+            details.push(CandidateApplicationDetail {
+                kind,
+                label,
+                value_text: Some(value_text),
+                unit,
+                audience: None,
+                evidence: Some(evidence),
+            });
+            continue;
+        }
+
+        // A question. It asserts nothing, so it needs no quotation — but without an
+        // addressee it cannot be routed, and a question nobody will ask is not a question.
+        let Some(audience) = detail
+            .audience
+            .as_deref()
+            .map(str::trim)
+            .and_then(QuestionAudience::parse)
+        else {
+            draft.reject(format!(
+                "{subject}: вопрос «{}» отклонён, не указано, кому он адресован",
+                short(&label)
+            ));
+            continue;
+        };
+        details.push(CandidateApplicationDetail {
+            kind,
+            label,
+            value_text: None,
+            unit: None,
+            audience: Some(audience),
+            evidence,
+        });
+    }
+
+    details
 }
 
 fn validate_categories(
@@ -100,8 +360,54 @@ fn validate_categories(
     }
 }
 
+/// Accept the surface forms a response records for one product or term.
+///
+/// Two rules, both of them the reason an alias is safe to store at all: the fragment must
+/// be a real page of this run, and the surface form must literally appear in it. A name
+/// nobody can point at on a page is the model's association, and this is the table a later
+/// search will follow to answer as if two names were one product.
+fn resolve_surface_forms<T>(
+    forms: &[crate::schema::DraftSurfaceForm],
+    catalog: &SourceCatalog,
+    limits: &DraftLimits,
+    owner: &str,
+    draft: &mut CandidateDraft,
+    build: impl Fn(&crate::schema::DraftSurfaceForm, String, ResolvedEvidence) -> Option<T>,
+) -> Vec<T> {
+    let mut accepted: Vec<T> = Vec::new();
+
+    for form in forms.iter().take(limits.max_surface_forms_per_item) {
+        let Some(surface) = text(&form.surface, limits.max_short_text_chars) else {
+            draft.reject(format!("{owner}: пустая форма названия отклонена"));
+            continue;
+        };
+        let subject = format!("{owner} → «{}»", short(&surface));
+        let resolved = resolve_evidence(&form.evidence, catalog, limits, &subject, draft);
+        let Some(evidence) = resolved
+            .into_iter()
+            .find(|item| quote::contains_token(&item.quote, &surface))
+        else {
+            draft.reject(format!(
+                "{subject} отклонена: нет цитаты, в которой эта форма действительно \
+                 встречается"
+            ));
+            continue;
+        };
+        match build(form, surface, evidence) {
+            Some(built) => accepted.push(built),
+            None => draft.reject(format!(
+                "{subject} отклонена: неизвестное отношение «{}»",
+                short(&form.relation)
+            )),
+        }
+    }
+
+    accepted
+}
+
 fn validate_products(
     response: &DraftResponse,
+    catalog: &SourceCatalog,
     limits: &DraftLimits,
     prefix: &str,
     draft: &mut CandidateDraft,
@@ -146,12 +452,29 @@ fn validate_products(
             _ => None,
         };
 
+        let aliases = resolve_surface_forms(
+            &product.aliases,
+            catalog,
+            limits,
+            &format!("изделие «{}»", short(&name)),
+            draft,
+            |form, surface, evidence| {
+                Some(CandidateAlias {
+                    surface,
+                    relation: AliasRelation::parse(form.relation.trim())?,
+                    note: form.note.as_deref().map(|note| clip(note, 200)),
+                    evidence,
+                })
+            },
+        );
+
         draft.products.push(CandidateProduct {
             reference: product_ref(prefix, &product.reference),
             category_ref,
             kind,
             name,
             summary: optional_text(product.summary.as_deref(), limits.max_long_text_chars),
+            aliases,
         });
     }
 }
@@ -405,13 +728,88 @@ fn validate_terms(
             ));
         }
 
+        let synonyms = resolve_surface_forms(
+            &term.synonyms,
+            catalog,
+            limits,
+            &format!("термин «{}»", short(&name)),
+            draft,
+            |form, surface, evidence| {
+                Some(CandidateSynonym {
+                    surface,
+                    relation: SynonymRelation::parse(form.relation.trim())?,
+                    evidence,
+                })
+            },
+        );
+        let senses = validate_senses(term, catalog, limits, &name, draft);
+
         draft.terms.push(CandidateTerm {
             term: name,
             definition,
             definition_is_model_context: !from_source,
             evidence,
+            senses,
+            synonyms,
         });
     }
+}
+
+/// Accept the further readings of a term.
+///
+/// A sense carries the same burden as the primary definition and one more: its quotation
+/// must show the term *in that reading*, which is checked the only way a server honestly
+/// can — the fragment has to contain the term. What makes a second sense worth storing is
+/// that the alternative is a single definition silently covering a usage it does not fit.
+fn validate_senses(
+    term: &crate::schema::DraftTerm,
+    catalog: &SourceCatalog,
+    limits: &DraftLimits,
+    name: &str,
+    draft: &mut CandidateDraft,
+) -> Vec<CandidateSense> {
+    let mut senses: Vec<CandidateSense> = Vec::new();
+
+    for sense in term.senses.iter().take(limits.max_senses_per_term) {
+        let Some(label) = text(&sense.label, limits.max_short_text_chars) else {
+            draft.reject(format!(
+                "значение термина «{}» отклонено: нет пояснения, какое это значение",
+                short(name)
+            ));
+            continue;
+        };
+        let Some(definition) = text(&sense.definition, limits.max_long_text_chars) else {
+            draft.reject(format!(
+                "значение «{}» термина «{}» отклонено: пустое определение",
+                short(&label),
+                short(name)
+            ));
+            continue;
+        };
+
+        let subject = format!("термин «{}», значение «{}»", short(name), short(&label));
+        let resolved = resolve_evidence(&sense.evidence, catalog, limits, &subject, draft);
+        let Some(evidence) = resolved
+            .into_iter()
+            .find(|item| quote::contains_token(&item.quote, name))
+        else {
+            draft.reject(format!(
+                "{subject} отклонено: нет цитаты, в которой термин встречается в этом значении"
+            ));
+            continue;
+        };
+
+        let from_source = sense.definition_from_source
+            && quoted_anywhere(&definition, std::slice::from_ref(&evidence));
+        senses.push(CandidateSense {
+            label,
+            definition,
+            definition_is_model_context: !from_source,
+            evidence,
+        });
+    }
+
+    senses
 }
 
 fn validate_qa(
@@ -540,12 +938,39 @@ fn validate_gaps(
             _ => None,
         };
 
+        // An unclassified gap becomes `other` rather than being refused: it is a real
+        // unknown and losing it would be worse than not counting it. What it does *not*
+        // do is satisfy the commercial or technical requirement — silence there stays
+        // silence, which is the asymmetry the whole package rests on.
+        let nature = match gap.nature.as_deref().map(str::trim) {
+            Some(value) if !value.is_empty() => match GapNature::parse(value) {
+                Some(nature) => nature,
+                None => {
+                    draft.note(format!(
+                        "пробел «{}» сохранён как прочий: неизвестный вид «{}»",
+                        short(&topic),
+                        short(value)
+                    ));
+                    GapNature::Other
+                }
+            },
+            _ => {
+                draft.note(format!(
+                    "пробел «{}» сохранён как прочий: не сказано, коммерческий он или \
+                     технический",
+                    short(&topic)
+                ));
+                GapNature::Other
+            }
+        };
+
         draft.gaps.push(CandidateGap {
             product_ref,
             topic,
             missing,
             blocks: optional_text(gap.blocks.as_deref(), limits.max_long_text_chars),
             question,
+            nature,
         });
     }
 }

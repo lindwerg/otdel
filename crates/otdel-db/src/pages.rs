@@ -446,6 +446,52 @@ pub async fn regions_for_page(tx: &mut ScopedTx, page_id: Uuid) -> DbResult<Vec<
     Ok(details)
 }
 
+/// Every table cell of a material, grouped by the page it sits on.
+///
+/// R05's understanding pass needs all of them at once: it shows the model the established
+/// table rows of each page beside that page's text, and turns the rest into uncertainties.
+/// Doing that one region at a time would be one round trip per table of a forty-four page
+/// catalogue, which is how a reading that should be free becomes a reason to skip it.
+///
+/// Pages with no table region do not appear in the result at all.
+pub async fn table_cells_for_material(
+    tx: &mut ScopedTx,
+    material_id: Uuid,
+) -> DbResult<Vec<(Uuid, i32, Vec<TableCell>)>> {
+    let bureau_id = tx.bureau_id();
+    let rows = sqlx::query(
+        "SELECT c.id, c.region_id, c.row_index, c.column_index, c.is_header, c.raw_text, \
+                c.value_kind, c.unit, c.column_header, c.x0, c.y0, c.x1, c.y1, \
+                c.role, c.usability, c.ambiguity_reasons, c.column_header_path, \
+                c.row_header_path, c.subject, c.property, c.unit_ref, c.conditions, \
+                r.page_id, r.page_number, r.source \
+           FROM otdel.table_cells c \
+           JOIN otdel.page_regions r ON r.bureau_id = c.bureau_id AND r.id = c.region_id \
+          WHERE c.bureau_id = $1 AND r.material_id = $2 AND r.kind = 'table' \
+          ORDER BY r.page_number, r.ordinal, c.row_index, c.column_index",
+    )
+    .bind(bureau_id)
+    .bind(material_id)
+    .fetch_all(tx.conn())
+    .await?;
+
+    let mut pages: Vec<(Uuid, i32, Vec<TableCell>)> = Vec::new();
+    for row in &rows {
+        let page_id: Uuid = row.try_get("page_id")?;
+        let page_number: i32 = row.try_get("page_number")?;
+        let source: String = row.try_get("source")?;
+        let source = TextSource::parse(&source)
+            .ok_or_else(|| DbError::Decode(format!("unknown region text source `{source}`")))?;
+        let cell = cell_from_row(row, page_number, source)?;
+
+        match pages.last_mut() {
+            Some((known, _, cells)) if *known == page_id => cells.push(cell),
+            _ => pages.push((page_id, page_number, vec![cell])),
+        }
+    }
+    Ok(pages)
+}
+
 async fn cells_for_region(
     tx: &mut ScopedTx,
     region_id: Uuid,

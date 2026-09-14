@@ -26,6 +26,7 @@ pub mod knowledge;
 pub mod llm_config;
 pub mod media;
 pub mod model;
+pub mod passport;
 pub mod publication;
 pub mod research;
 pub mod research_config;

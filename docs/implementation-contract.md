@@ -660,6 +660,103 @@ gaps: [GapChange], limitations[], message}`.
 - Удаление выполняется функцией БД с встроенным порогом (минимум 1 день); у рабочей роли
   нет права DELETE ни на журнал, ни на очередь.
 
+## API R05 — продуктовая база: паспорта, охват, карта применения и неясности
+
+Этот раздел добавляет пять чтений рядом с `/knowledge`, а не внутри него. Причина —
+разные вопросы: `/knowledge` отвечает «что выдала модель», а эти — «что говорит
+продуктовая база и на какой доле документа она основана». Второй вопрос до R05 задать
+было нечем.
+
+**Паспорта.**
+
+- `GET /api/partners/{id}/passports[?product_id=]` → `{items: [ProductPassport]}`.
+- `GET /api/partners/{id}/passports/{product_id}` → `ProductPassport`; 404, если изделия
+  нет у этого партнёра.
+- `ProductPassport` = `{product, category|null, material_filename, aliases[], facts[],
+  applications[], gaps[], uncertainties[], identity_links[]}`.
+- Паспорт **собирается**, а не хранится: каждая часть приходит из своей таблицы, поэтому
+  разойтись с кандидатами он не может.
+- Пробелы, неясности и предположения о тождестве приходят **всегда**. Параметра, который
+  их отключает, нет: читатель, которому показали только факты, знает половину правды.
+
+**Охват.**
+
+- `GET /api/partners/{id}/coverage` → `{items: [CoverageReport]}` по каждому разбору,
+  включая те, которые до модели не дошли.
+- `CoverageReport` = `{run_id, material_id, material_filename, status, pages_total,
+  pages_offered, pages_processed, pages_deferred, pages_unreadable, state, notes[],
+  requirements, requirements_missing[], prompt_tokens, completion_tokens, cost_micro_usd,
+  allows_automatic_publication, resumable_pages[], pages: [PageCoverage],
+  declarations: [Declaration]}`.
+- `state`: `unknown` | `complete` | `partial_accounted` | `incomplete`. Значения
+  «достаточно хорошо» нет. `unknown` — разбор никто не оценивал, и это не успех.
+- `requirements`: `unknown` | `met` | `unmet`. Три значения, не булево: разбор, который
+  не проверяли, и разбор, который проверили и забраковали, — разные состояния.
+- `allows_automatic_publication` — обе половины ворот сразу, считает сервер. Клиент не
+  выводит это сам, чтобы интерфейс и воркер не разошлись в выводах.
+- `PageCoverage` = `{id, material_id, run_id, page_id, page_number, disposition, offered,
+  chars_sent, batch_index, reason, created_at}` — по строке на каждую страницу материала.
+- `disposition`: `processed` | `deferred_budget` | `unreadable_needs_ocr` |
+  `unreadable_failed` | `unreadable_empty` | `not_read_yet` | `not_offered_no_text` |
+  `excluded_by_request`. У всего, кроме `processed`, `reason` непустой — БД не даёт
+  сохранить страницу, выпавшую из разбора без причины.
+
+**Заявления об отсутствии.**
+
+- `GET /api/partners/{id}/declarations` → `{items: [Declaration]}`.
+- `Declaration` = `{id, material_id, run_id, topic, stated, origin, created_at}`;
+  `topic`: `glossary` | `questions` | `applications` | `commercial_unknowns` |
+  `technical_unknowns`; `origin`: `model` | `server`.
+- Пустой массив требование не закрывает. Требование закрывают строки **или** заявление —
+  предложение, с которым человек может не согласиться.
+
+**Карта применения.**
+
+- `GET /api/partners/{id}/applications[?product_id=]` → `{items: [ProductApplication]}`.
+- `ProductApplication` = `{id, partner_id, material_id, run_id, product_id|null,
+  product_name|null, task, summary, model_context, page_id, page_number, quote,
+  char_start, char_end, details: [ApplicationDetail], created_at}`.
+- `ApplicationDetail` = `{id, application_id, kind, label, value_text, unit, audience,
+  page_id, page_number, quote, char_start, char_end, created_at}`;
+  `kind`: `parameter` | `constraint` | `question`.
+- `parameter` и `constraint` — утверждения: у них обязательны значение и цитата.
+  `question` ничего не утверждает: у него обязателен только адресат.
+
+**Неясности.**
+
+- `GET /api/partners/{id}/uncertainties[?product_id=]` → `{items: [Uncertainty]}`
+  (только `status = open`).
+- `Uncertainty` = `{id, partner_id, material_id, run_id, product_id|null, kind, subject,
+  detail, reasons[], quote|null, page_id, page_number, region_id, status, created_at}`;
+  `kind`: `ambiguous_table_cell` | `unreadable_page` | `unresolved_unit` |
+  `unresolved_subject` | `uninterpreted_diagram`.
+- Пробел — то, чего материал **не** говорит. Неясность — то, что он говорит в виде,
+  который нельзя прочитать как значение. Это разные вопросы и разные таблицы; ни то ни
+  другое не факт.
+
+**Тождество между материалами.**
+
+- `GET /api/partners/{id}/identity` → `{items: [IdentityLink]}`.
+- `IdentityLink` = `{id, product_id, other_product_id, state, basis, note, material_id,
+  page_id, page_number, other_material_id, other_page_id, other_page_number, created_at}`;
+  `state`: `linked` | `unclear`; `basis`: `identical_designation_quoted` |
+  `alias_quoted_in_both` | `name_similarity_only`.
+- Это **предложение**, а не слияние: строки изделий остаются раздельными. `linked` без
+  страницы с каждой стороны непредставим, и `name_similarity_only` никогда не `linked` —
+  оба правила стоят ограничениями в БД, а не соглашением в коде.
+
+**Изменения в существующих ответах 1C.**
+
+- `KnowledgeRun` получает `coverage` (объект выше без `pages`/`declarations`) и счётчики
+  `applications_created`, `declarations_made`, `uncertainties_open`.
+- `KnowledgeFact` получает `origin` = `{source, cell_id, subject, property, unit,
+  conditions[]}`; `source`: `page_text` | `table_cell`. Это происхождение второго рода —
+  рядом с цитатой, а не вместо неё.
+- `GlossaryTerm` получает `senses[]` и `synonyms[]`; `KnowledgeGap` получает `nature`
+  (`commercial` | `technical` | `other`).
+- `KnowledgeSummary` получает `applications_total`, `uncertainties_total`,
+  `passports_substantive`, `materials_ready`.
+
 ## Следующие контракты
 
 Блок 1 контрактов больше не добавляет. Расширение входов (DOCX/XLSX/PPTX, веб-ссылки,

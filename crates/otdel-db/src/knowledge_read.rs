@@ -12,11 +12,15 @@ use otdel_core::knowledge::{
     KnowledgeFact, KnowledgeGap, KnowledgeRun, KnowledgeRunStatus, KnowledgeSummary,
     PreparedQuestion, Product, ProductCategory, ProductKind, QaEntry, QuestionAudience,
 };
+use otdel_core::passport::{
+    CoverageState, FactOrigin, GapNature, RequirementsState, RunCoverage, StructuralSource,
+};
 use sqlx::postgres::PgRow;
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::error::{DbError, DbResult};
+use crate::passport_read;
 use crate::tenancy::ScopedTx;
 
 /// Which parent an evidence row belongs to.
@@ -57,6 +61,10 @@ pub(crate) fn run_from_row(row: &PgRow) -> DbResult<KnowledgeRun> {
         model: row.try_get("model")?,
         prompt_profile: row.try_get("prompt_profile")?,
         pages_considered: row.try_get("pages_considered")?,
+        coverage: coverage_from_row(row)?,
+        applications_created: 0,
+        declarations_made: 0,
+        uncertainties_open: 0,
         requests_made: row.try_get("requests_made")?,
         input_chars: row.try_get("input_chars")?,
         categories_created: 0,
@@ -72,6 +80,35 @@ pub(crate) fn run_from_row(row: &PgRow) -> DbResult<KnowledgeRun> {
         started_at: row.try_get::<Option<DateTime<Utc>>, _>("started_at")?,
         finished_at: row.try_get::<Option<DateTime<Utc>>, _>("finished_at")?,
         created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
+    })
+}
+
+/// The page account stored on the run row.
+///
+/// A state the vocabulary does not know is a decode failure rather than a fallback to
+/// `unknown`: `unknown` means "nobody judged this run", and quietly producing it for a
+/// value this build cannot read would be the same conflation — a row that *was* judged,
+/// reported as one that was not.
+fn coverage_from_row(row: &PgRow) -> DbResult<RunCoverage> {
+    let state: String = row.try_get("coverage_state")?;
+    let requirements: String = row.try_get("requirements_state")?;
+
+    Ok(RunCoverage {
+        pages_total: row.try_get("pages_total")?,
+        pages_offered: row.try_get("pages_offered")?,
+        pages_processed: row.try_get("pages_processed")?,
+        pages_deferred: row.try_get("pages_deferred")?,
+        pages_unreadable: row.try_get("pages_unreadable")?,
+        state: CoverageState::parse(&state)
+            .ok_or_else(|| DbError::Decode(format!("unknown coverage state `{state}`")))?,
+        notes: row.try_get::<Vec<String>, _>("coverage_notes")?,
+        requirements: RequirementsState::parse(&requirements).ok_or_else(|| {
+            DbError::Decode(format!("unknown requirements state `{requirements}`"))
+        })?,
+        requirements_missing: row.try_get::<Vec<String>, _>("requirements_missing")?,
+        prompt_tokens: row.try_get("prompt_tokens")?,
+        completion_tokens: row.try_get("completion_tokens")?,
+        cost_micro_usd: row.try_get("cost_micro_usd")?,
     })
 }
 
@@ -112,7 +149,13 @@ const RUN_COUNTS: &str = "\
      (SELECT count(*) FROM otdel.knowledge_gaps g \
        WHERE g.bureau_id = r.bureau_id AND g.material_id = r.material_id) AS gaps, \
      (SELECT count(*) FROM otdel.knowledge_questions qq \
-       WHERE qq.bureau_id = r.bureau_id AND qq.material_id = r.material_id) AS questions";
+       WHERE qq.bureau_id = r.bureau_id AND qq.material_id = r.material_id) AS questions, \
+     (SELECT count(*) FROM otdel.product_applications a \
+       WHERE a.bureau_id = r.bureau_id AND a.material_id = r.material_id) AS applications, \
+     (SELECT count(*) FROM otdel.knowledge_declarations d \
+       WHERE d.bureau_id = r.bureau_id AND d.run_id = r.id) AS declarations, \
+     (SELECT count(*) FROM otdel.knowledge_uncertainties u \
+       WHERE u.bureau_id = r.bureau_id AND u.run_id = r.id AND u.status = 'open') AS uncertainties";
 
 fn run_with_counts(row: &PgRow) -> DbResult<KnowledgeRun> {
     let mut run = run_from_row(row)?;
@@ -123,6 +166,9 @@ fn run_with_counts(row: &PgRow) -> DbResult<KnowledgeRun> {
     run.qa_created = count(row, "qa")?;
     run.gaps_created = count(row, "gaps")?;
     run.questions_created = count(row, "questions")?;
+    run.applications_created = count(row, "applications")?;
+    run.declarations_made = count(row, "declarations")?;
+    run.uncertainties_open = count(row, "uncertainties")?;
     Ok(run)
 }
 
@@ -198,12 +244,28 @@ pub async fn summary(tx: &mut ScopedTx, partner_id: Uuid) -> DbResult<KnowledgeS
             (SELECT count(*) FROM otdel.knowledge_qa WHERE bureau_id = $1 AND partner_id = $2) AS qa, \
             (SELECT count(*) FROM otdel.knowledge_gaps WHERE bureau_id = $1 AND partner_id = $2 AND status = 'open') AS gaps, \
             (SELECT count(*) FROM otdel.knowledge_questions WHERE bureau_id = $1 AND partner_id = $2 AND status = 'prepared') AS questions, \
+            (SELECT count(*) FROM otdel.product_applications WHERE bureau_id = $1 AND partner_id = $2) AS applications, \
+            (SELECT count(*) FROM otdel.knowledge_uncertainties \
+              WHERE bureau_id = $1 AND partner_id = $2 AND status = 'open') AS uncertainties, \
+            (SELECT count(*) FROM otdel.products p \
+              WHERE p.bureau_id = $1 AND p.partner_id = $2 \
+                AND (p.summary IS NOT NULL \
+                  OR EXISTS (SELECT 1 FROM otdel.knowledge_facts f \
+                              WHERE f.bureau_id = p.bureau_id AND f.product_id = p.id) \
+                  OR EXISTS (SELECT 1 FROM otdel.product_applications a \
+                              WHERE a.bureau_id = p.bureau_id AND a.product_id = p.id) \
+                  OR EXISTS (SELECT 1 FROM otdel.knowledge_gaps g \
+                              WHERE g.bureau_id = p.bureau_id AND g.product_id = p.id))) AS substantive, \
             (SELECT count(DISTINCT p.material_id) FROM otdel.material_pages p \
                JOIN otdel.materials m ON m.bureau_id = p.bureau_id AND m.id = p.material_id \
               WHERE p.bureau_id = $1 AND m.partner_id = $2 \
                 AND p.status IN ('extracted', 'partial') AND btrim(coalesce(p.text_content, '')) <> '') AS readable, \
             (SELECT count(*) FROM otdel.knowledge_runs \
-              WHERE bureau_id = $1 AND partner_id = $2 AND status IN ('completed', 'partial')) AS understood",
+              WHERE bureau_id = $1 AND partner_id = $2 AND status IN ('completed', 'partial')) AS understood, \
+            (SELECT count(*) FROM otdel.knowledge_runs \
+              WHERE bureau_id = $1 AND partner_id = $2 \
+                AND coverage_state IN ('complete', 'partial_accounted') \
+                AND requirements_state = 'met') AS ready",
     )
     .bind(bureau_id)
     .bind(partner_id)
@@ -218,8 +280,18 @@ pub async fn summary(tx: &mut ScopedTx, partner_id: Uuid) -> DbResult<KnowledgeS
         qa_total: count(&row, "qa")?,
         gaps_total: count(&row, "gaps")?,
         questions_total: count(&row, "questions")?,
+        applications_total: count(&row, "applications")?,
+        uncertainties_total: count(&row, "uncertainties")?,
+        // Deliberately not `products_total`: a product row with a name and nothing else
+        // is what the audited run produced forty-four of, and a roll-up that counts it
+        // as a passport repeats the report that hid the problem.
+        passports_substantive: count(&row, "substantive")?,
         materials_readable: count(&row, "readable")?,
         materials_understood: count(&row, "understood")?,
+        // The two halves of the gate, asked of the stored rows rather than recomputed —
+        // `RunCoverage::allows_automatic_publication` says the same thing in Rust and
+        // this says it in SQL, and they must not be allowed to disagree.
+        materials_ready: count(&row, "ready")?,
     })
 }
 
@@ -299,7 +371,8 @@ pub async fn list_facts(
     let rows = sqlx::query(
         "SELECT f.id, f.partner_id, f.material_id, f.run_id, f.product_id, p.name AS product_name, \
                 f.kind, f.status, f.attribute, f.value_text, f.unit, f.conditions, \
-                f.model_context, f.created_at \
+                f.model_context, f.structural_source, f.source_cell_id, f.structural_subject, \
+                f.structural_property, f.structural_unit, f.structural_conditions, f.created_at \
            FROM otdel.knowledge_facts f \
            LEFT JOIN otdel.products p ON p.bureau_id = f.bureau_id AND p.id = f.product_id \
           WHERE f.bureau_id = $1 AND f.partner_id = $2 \
@@ -340,12 +413,31 @@ pub async fn list_facts(
                 conditions: row.try_get("conditions")?,
                 model_context: row.try_get("model_context")?,
                 evidence: take_evidence(&mut evidence, id),
+                origin: origin_from_row(row)?,
                 created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
             })
         })
         .collect()
 }
 
+/// Which structure a fact's value sat in, and what that structure said it was about.
+fn origin_from_row(row: &PgRow) -> DbResult<FactOrigin> {
+    let source: String = row.try_get("structural_source")?;
+    Ok(FactOrigin {
+        source: StructuralSource::parse(&source)
+            .ok_or_else(|| DbError::Decode(format!("unknown structural source `{source}`")))?,
+        // May be NULL even on a table-derived fact: re-reading the page replaces its
+        // cells and the pointer goes with them. The copied words below stay, which is
+        // why the fact remains readable and remains honest about where it came from.
+        cell_id: row.try_get("source_cell_id")?,
+        subject: row.try_get("structural_subject")?,
+        property: row.try_get("structural_property")?,
+        unit: row.try_get("structural_unit")?,
+        conditions: row.try_get::<Vec<String>, _>("structural_conditions")?,
+    })
+}
+
+/// Terms of a partner, each with its evidence, its further readings and its spellings.
 pub async fn list_terms(tx: &mut ScopedTx, partner_id: Uuid) -> DbResult<Vec<GlossaryTerm>> {
     let bureau_id = tx.bureau_id();
     let rows = sqlx::query(
@@ -365,6 +457,10 @@ pub async fn list_terms(tx: &mut ScopedTx, partner_id: Uuid) -> DbResult<Vec<Glo
         .map(|row| row.try_get::<Uuid, _>("id"))
         .collect::<Result<_, _>>()?;
     let mut evidence = evidence_for(tx, EvidenceOwner::Term, &ids).await?;
+    // R05: a term whose second reading is fetched separately is a term some caller will
+    // forget to fetch. Both come back with the term or neither does.
+    let mut senses = passport_read::senses_for(tx, &ids).await?;
+    let mut synonyms = passport_read::synonyms_for(tx, &ids).await?;
 
     rows.iter()
         .map(|row| {
@@ -378,6 +474,8 @@ pub async fn list_terms(tx: &mut ScopedTx, partner_id: Uuid) -> DbResult<Vec<Glo
                 definition: row.try_get("definition")?,
                 definition_is_model_context: row.try_get("definition_is_model_context")?,
                 evidence: take_evidence(&mut evidence, id),
+                senses: take_owned(&mut senses, id),
+                synonyms: take_owned(&mut synonyms, id),
                 created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
             })
         })
@@ -427,7 +525,7 @@ pub async fn list_gaps(tx: &mut ScopedTx, partner_id: Uuid) -> DbResult<Vec<Know
     let bureau_id = tx.bureau_id();
     let rows = sqlx::query(
         "SELECT g.id, g.partner_id, g.material_id, g.run_id, g.product_id, p.name AS product_name, \
-                g.topic, g.missing, g.blocks, g.created_at, \
+                g.topic, g.missing, g.blocks, g.nature, g.created_at, \
                 q.id AS question_id, q.audience, q.text_content, q.status AS question_status, \
                 q.created_at AS question_created_at \
            FROM otdel.knowledge_gaps g \
@@ -464,6 +562,7 @@ pub async fn list_gaps(tx: &mut ScopedTx, partner_id: Uuid) -> DbResult<Vec<Know
                 None => None,
             };
 
+            let nature: String = row.try_get("nature")?;
             Ok(KnowledgeGap {
                 id: row.try_get("id")?,
                 partner_id: row.try_get("partner_id")?,
@@ -474,6 +573,8 @@ pub async fn list_gaps(tx: &mut ScopedTx, partner_id: Uuid) -> DbResult<Vec<Know
                 topic: row.try_get("topic")?,
                 missing: row.try_get("missing")?,
                 blocks: row.try_get("blocks")?,
+                nature: GapNature::parse(&nature)
+                    .ok_or_else(|| DbError::Decode(format!("unknown gap nature `{nature}`")))?,
                 question,
                 created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
             })
@@ -528,8 +629,16 @@ async fn evidence_for(
 }
 
 fn take_evidence(evidence: &mut Vec<(Uuid, FactEvidence)>, owner_id: Uuid) -> Vec<FactEvidence> {
+    take_owned(evidence, owner_id)
+}
+
+/// Move every child of `owner_id` out of a batch fetched for many owners at once.
+///
+/// Draining rather than cloning-and-filtering: the batch shrinks as it is consumed, so a
+/// partner with a thousand terms does not rescan a thousand rows a thousand times.
+pub(crate) fn take_owned<T: Clone>(items: &mut Vec<(Uuid, T)>, owner_id: Uuid) -> Vec<T> {
     let mut taken = Vec::new();
-    evidence.retain(|(id, item)| {
+    items.retain(|(id, item)| {
         if *id == owner_id {
             taken.push(item.clone());
             false
@@ -540,6 +649,6 @@ fn take_evidence(evidence: &mut Vec<(Uuid, FactEvidence)>, owner_id: Uuid) -> Ve
     taken
 }
 
-fn count(row: &PgRow, column: &str) -> DbResult<i32> {
+pub(crate) fn count(row: &PgRow, column: &str) -> DbResult<i32> {
     Ok(i32::try_from(row.try_get::<i64, _>(column)?).unwrap_or(i32::MAX))
 }

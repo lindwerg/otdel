@@ -12,6 +12,9 @@ pub mod knowledge;
 pub mod materials;
 pub mod pages;
 pub mod partners;
+/// R05 — the product base as a person reads it: passports, coverage, the application
+/// map, the uncertainties and the identity proposals.
+pub mod passports;
 pub mod publication;
 pub mod research;
 pub mod retrieval;
@@ -107,6 +110,27 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/partners/{partner_id}/materials/{material_id}/understand",
             post(knowledge::understand),
+        )
+        // R05: the product base. A passport travels with its gaps, its uncertainties and
+        // its identity proposals — there is no parameter here that drops them.
+        .route("/partners/{partner_id}/passports", get(passports::list))
+        .route(
+            "/partners/{partner_id}/passports/{product_id}",
+            get(passports::show),
+        )
+        .route("/partners/{partner_id}/coverage", get(passports::coverage))
+        .route(
+            "/partners/{partner_id}/applications",
+            get(passports::applications),
+        )
+        .route(
+            "/partners/{partner_id}/uncertainties",
+            get(passports::uncertainties),
+        )
+        .route("/partners/{partner_id}/identity", get(passports::identity))
+        .route(
+            "/partners/{partner_id}/declarations",
+            get(passports::declarations),
         )
         // Phase 1D: bounded industry research, its money and its sources. No handler
         // here reaches the network — approving a question queues a job.

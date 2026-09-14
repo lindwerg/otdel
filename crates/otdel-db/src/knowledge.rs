@@ -15,18 +15,24 @@
 //! deferred constraint trigger. The validation in `otdel-knowledge` is the first line;
 //! this is the one that holds regardless of the caller.
 //!
-//! Reading the draft back lives in [`crate::knowledge_read`].
+//! The run row itself — queueing it, closing it, and the page account written with its
+//! status — lives in [`crate::knowledge_run`]; reading the draft back lives in
+//! [`crate::knowledge_read`].
 
-use chrono::{DateTime, Utc};
 use otdel_core::knowledge::{
-    CategoryKind, FactKind, KnowledgeRun, KnowledgeRunStatus, ProductKind, QuestionAudience,
+    CategoryKind, FactKind, KnowledgeRunStatus, ProductKind, QuestionAudience,
 };
+use otdel_core::passport::{FactOrigin, GapNature, RunCoverage};
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::error::{DbError, DbResult};
-use crate::knowledge_read;
+use crate::passport::{self, NewAlias, NewApplication, NewDeclaration, NewSense, NewSynonym};
 use crate::tenancy::ScopedTx;
+
+// The run lifecycle lives next door but is re-exported here, so every caller keeps
+// naming one module for "writing a draft and closing its run".
+pub use crate::knowledge_run::{enqueue_run, finish_run, reclaim_stalled_runs, start_run};
 
 /// A fragment of a page, already located there by the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +60,9 @@ pub struct NewProduct {
     pub kind: ProductKind,
     pub name: String,
     pub summary: Option<String>,
+    /// R05 — other names this material uses for the same product, each with the fragment
+    /// that shows it. Recorded, never merged.
+    pub aliases: Vec<NewAlias>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +76,9 @@ pub struct NewFact {
     pub model_context: Option<String>,
     /// Never empty — the database refuses a fact without it.
     pub evidence: Vec<NewEvidence>,
+    /// R05 — which structure the value sat in. Defaults to `page_text`, which is the
+    /// truthful answer whenever no cell was matched.
+    pub origin: FactOrigin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +87,10 @@ pub struct NewTerm {
     pub definition: String,
     pub definition_is_model_context: bool,
     pub evidence: Vec<NewEvidence>,
+    /// R05 — further readings of the same word in this material.
+    pub senses: Vec<NewSense>,
+    /// R05 — other spellings of the same term.
+    pub synonyms: Vec<NewSynonym>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +113,8 @@ pub struct NewGap {
     pub topic: String,
     pub missing: String,
     pub blocks: Option<String>,
+    /// R05 — commercial, technical, or neither. Classified by the run.
+    pub nature: GapNature,
     pub question: Option<NewQuestion>,
 }
 
@@ -109,6 +127,12 @@ pub struct NewDraft {
     pub terms: Vec<NewTerm>,
     pub qa: Vec<NewQa>,
     pub gaps: Vec<NewGap>,
+    /// R05 — the tasks the material says its products serve.
+    pub applications: Vec<NewApplication>,
+    /// R05 — the topics this run stated are empty, in its own words. The one thing here
+    /// that has no rows of its own to justify it, and the reason an empty array can ever
+    /// be an answer.
+    pub declarations: Vec<NewDeclaration>,
 }
 
 /// What was actually written.
@@ -121,6 +145,13 @@ pub struct DraftCounts {
     pub qa: i32,
     pub gaps: i32,
     pub questions: i32,
+    /// R05.
+    pub applications: i32,
+    pub application_details: i32,
+    pub declarations: i32,
+    pub aliases: i32,
+    pub senses: i32,
+    pub synonyms: i32,
 }
 
 /// Counters and provenance of a finished run.
@@ -137,169 +168,13 @@ pub struct RunOutcome {
     pub rejections: Vec<String>,
     pub diagnostic: Option<String>,
     pub counts: DraftCounts,
-}
-
-/// Create or reset the run row of a material, in `queued`.
-///
-/// Called when the work is enqueued (by the owner or by the extraction worker), so the
-/// interface can show "материал поставлен в очередь на разбор" instead of nothing.
-pub async fn enqueue_run(
-    tx: &mut ScopedTx,
-    partner_id: Uuid,
-    material_id: Uuid,
-    prompt_profile: &str,
-) -> DbResult<KnowledgeRun> {
-    upsert_run(
-        tx,
-        partner_id,
-        material_id,
-        prompt_profile,
-        KnowledgeRunStatus::Queued,
-    )
-    .await
-}
-
-/// Mark the run as running and clear the previous counters.
-pub async fn start_run(
-    tx: &mut ScopedTx,
-    partner_id: Uuid,
-    material_id: Uuid,
-    prompt_profile: &str,
-) -> DbResult<KnowledgeRun> {
-    upsert_run(
-        tx,
-        partner_id,
-        material_id,
-        prompt_profile,
-        KnowledgeRunStatus::Running,
-    )
-    .await
-}
-
-async fn upsert_run(
-    tx: &mut ScopedTx,
-    partner_id: Uuid,
-    material_id: Uuid,
-    prompt_profile: &str,
-    status: KnowledgeRunStatus,
-) -> DbResult<KnowledgeRun> {
-    let bureau_id = tx.bureau_id();
-    let started_at: Option<DateTime<Utc>> = match status {
-        KnowledgeRunStatus::Running => Some(Utc::now()),
-        _ => None,
-    };
-
-    sqlx::query(
-        "INSERT INTO otdel.knowledge_runs \
-             (bureau_id, partner_id, material_id, status, prompt_profile, started_at) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
-         ON CONFLICT (material_id) DO UPDATE \
-            SET status = EXCLUDED.status, \
-                prompt_profile = EXCLUDED.prompt_profile, \
-                started_at = coalesce(EXCLUDED.started_at, otdel.knowledge_runs.started_at), \
-                finished_at = NULL, \
-                diagnostic = NULL, \
-                rejections = '{}', \
-                pages_considered = 0, \
-                pages_skipped = 0, \
-                requests_made = 0, \
-                input_chars = 0, \
-                facts_accepted = 0, \
-                facts_rejected = 0, \
-                updated_at = now()",
-    )
-    .bind(bureau_id)
-    .bind(partner_id)
-    .bind(material_id)
-    .bind(status.as_str())
-    .bind(prompt_profile)
-    .bind(started_at)
-    .execute(tx.conn())
-    .await?;
-
-    // Read it back through the same query the API uses, so a run always carries the
-    // live counts and the material's name rather than a second, divergent shape.
-    knowledge_read::find_run(tx, partner_id, material_id)
-        .await?
-        .ok_or_else(|| DbError::Decode("the run row disappeared after it was written".to_owned()))
-}
-
-/// Record how a run ended, including a run that produced nothing.
-pub async fn finish_run(tx: &mut ScopedTx, run_id: Uuid, outcome: &RunOutcome) -> DbResult<()> {
-    let bureau_id = tx.bureau_id();
-    let rejections: Vec<String> = outcome
-        .rejections
-        .iter()
-        .map(|reason| reason.chars().take(500).collect())
-        .take(100)
-        .collect();
-
-    sqlx::query(
-        "UPDATE otdel.knowledge_runs \
-            SET status = $3, \
-                provider = $4, \
-                model = $5, \
-                pages_considered = $6, \
-                pages_skipped = $7, \
-                requests_made = $8, \
-                input_chars = $9, \
-                facts_accepted = $10, \
-                facts_rejected = $11, \
-                rejections = $12, \
-                diagnostic = $13, \
-                finished_at = now(), \
-                updated_at = now() \
-          WHERE bureau_id = $1 AND id = $2",
-    )
-    .bind(bureau_id)
-    .bind(run_id)
-    .bind(outcome.status.as_str())
-    .bind(outcome.provider.as_deref())
-    .bind(outcome.model.as_deref())
-    .bind(outcome.pages_considered)
-    .bind(outcome.pages_skipped)
-    .bind(outcome.requests_made)
-    .bind(outcome.input_chars)
-    .bind(outcome.counts.facts)
-    .bind(outcome.facts_rejected)
-    .bind(&rejections)
-    .bind(outcome.diagnostic.as_deref())
-    .execute(tx.conn())
-    .await?;
-
-    Ok(())
-}
-
-/// Settle runs that say `running` but have no job behind them any more.
-///
-/// A worker killed mid-run leaves the run row claiming to be in progress; the queue
-/// recovers the *job* (lease reclaim, attempt limit), but nothing would ever correct
-/// the run, and the interface would show a spinner forever while the owner's own
-/// "разобрать" button stays hidden behind "уже выполняется". Returns how many rows
-/// were corrected.
-pub async fn reclaim_stalled_runs(tx: &mut ScopedTx) -> DbResult<u64> {
-    let bureau_id = tx.bureau_id();
-    let result = sqlx::query(
-        "UPDATE otdel.knowledge_runs r \
-            SET status = 'failed', \
-                diagnostic = coalesce(r.diagnostic, \
-                    'разбор прерван: обработчик остановился, задание больше не выполняется'), \
-                finished_at = now(), \
-                updated_at = now() \
-          WHERE r.bureau_id = $1 AND r.status = 'running' \
-            AND NOT EXISTS ( \
-                SELECT 1 FROM otdel.jobs j \
-                 WHERE j.bureau_id = r.bureau_id \
-                   AND j.material_id = r.material_id \
-                   AND j.kind = 'understand_material' \
-                   AND j.status IN ('queued', 'running') \
-            )",
-    )
-    .bind(bureau_id)
-    .execute(tx.conn())
-    .await?;
-
-    Ok(result.rows_affected())
+    /// R05 — the page account, the requirement verdict and what the pass cost.
+    ///
+    /// Written in the same statement as the status, so no reader can ever see a run
+    /// described as finished without the account of what it covered. A run that failed
+    /// before planning stores [`RunCoverage::default`], whose state is `unknown` — which
+    /// is the truth and is refused by the publication gate.
+    pub coverage: RunCoverage,
 }
 
 /// Replace a material's candidates with this run's.
@@ -329,6 +204,10 @@ pub async fn replace_draft(
     insert_terms(tx, &scope, &draft.terms, &mut counts).await?;
     insert_qa(tx, &scope, &draft.qa, &mut counts).await?;
     insert_gaps(tx, &scope, &draft.gaps, &products, &mut counts).await?;
+    // R05, after the products so an application can name one, and inside the same
+    // transaction so a passport can never show a task whose product was rolled back.
+    passport::insert_applications(tx, &scope, &draft.applications, &products, &mut counts).await?;
+    passport::insert_declarations(tx, &scope, &draft.declarations, &mut counts).await?;
 
     Ok(counts)
 }
@@ -338,7 +217,20 @@ pub async fn clear_material_draft(tx: &mut ScopedTx, material_id: Uuid) -> DbRes
     let bureau_id = tx.bureau_id();
     // Order matters only for readability: the foreign keys cascade. Facts are deleted
     // before their products so the cascade does the same work either way.
+    //
+    // The R05 tables are listed explicitly rather than left to the cascade for one of
+    // them: `knowledge_declarations` hangs off the *run*, not off a product, and a run
+    // row survives a re-draft. A stale declaration would keep satisfying a requirement
+    // for a draft that no longer exists, which is precisely the inference this package
+    // was built to remove.
     for table in [
+        "otdel.application_details",
+        "otdel.product_applications",
+        "otdel.knowledge_declarations",
+        "otdel.knowledge_uncertainties",
+        "otdel.glossary_senses",
+        "otdel.glossary_synonyms",
+        "otdel.product_aliases",
         "otdel.knowledge_questions",
         "otdel.knowledge_gaps",
         "otdel.knowledge_qa",
@@ -358,17 +250,18 @@ pub async fn clear_material_draft(tx: &mut ScopedTx, material_id: Uuid) -> DbRes
     Ok(())
 }
 
-struct Scope {
-    bureau_id: Uuid,
-    partner_id: Uuid,
-    material_id: Uuid,
-    run_id: Uuid,
+/// The bureau, partner, material and run every candidate row of one draft belongs to.
+pub(crate) struct Scope {
+    pub(crate) bureau_id: Uuid,
+    pub(crate) partner_id: Uuid,
+    pub(crate) material_id: Uuid,
+    pub(crate) run_id: Uuid,
 }
 
 /// Draft-local reference → stored identifier.
-type Resolved = Vec<(String, Uuid)>;
+pub(crate) type Resolved = Vec<(String, Uuid)>;
 
-fn resolve(map: &Resolved, reference: &str) -> Option<Uuid> {
+pub(crate) fn resolve(map: &Resolved, reference: &str) -> Option<Uuid> {
     map.iter()
         .find(|(key, _)| key == reference)
         .map(|(_, id)| *id)
@@ -455,6 +348,7 @@ async fn insert_products(
         if !resolved.iter().any(|(_, kept)| *kept == id) {
             counts.products += 1;
         }
+        passport::insert_aliases(tx, scope, id, &product.aliases, counts).await?;
         resolved.push((product.reference.clone(), id));
     }
 
@@ -482,11 +376,38 @@ async fn insert_facts(
             .as_deref()
             .and_then(|reference| resolve(products, reference));
 
+        // Claiming a table origin means naming what the table said the value was about.
+        // The database enforces the same rule; refusing here keeps the caller's mistake
+        // from becoming a constraint violation that aborts the whole draft.
+        let origin = &fact.origin;
+        if origin.is_from_a_table()
+            && (origin
+                .subject
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+                || origin
+                    .property
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty())
+        {
+            return Err(DbError::Decode(
+                "refusing to store a fact claiming a table origin without the cell's \
+                 subject and property"
+                    .to_owned(),
+            ));
+        }
+
         let row = sqlx::query(
             "INSERT INTO otdel.knowledge_facts \
                  (bureau_id, partner_id, material_id, run_id, product_id, kind, attribute, \
-                  value_text, unit, conditions, model_context) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                  value_text, unit, conditions, model_context, structural_source, \
+                  source_cell_id, structural_subject, structural_property, structural_unit, \
+                  structural_conditions) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
              RETURNING id",
         )
         .bind(scope.bureau_id)
@@ -500,6 +421,12 @@ async fn insert_facts(
         .bind(fact.unit.as_deref())
         .bind(fact.conditions.as_deref())
         .bind(fact.model_context.as_deref())
+        .bind(origin.source.as_str())
+        .bind(origin.cell_id)
+        .bind(origin.subject.as_deref())
+        .bind(origin.property.as_deref())
+        .bind(origin.unit.as_deref())
+        .bind(&origin.conditions)
         .fetch_one(tx.conn())
         .await?;
 
@@ -546,6 +473,8 @@ async fn insert_terms(
 
         let term_id: Uuid = row.try_get("id")?;
         insert_evidence(tx, scope, EvidenceParent::Term(term_id), &term.evidence).await?;
+        passport::insert_senses(tx, scope, term_id, &term.senses, counts).await?;
+        passport::insert_synonyms(tx, scope, term_id, &term.synonyms, counts).await?;
         counts.terms += 1;
     }
     Ok(())
@@ -602,8 +531,9 @@ async fn insert_gaps(
 
         let row = sqlx::query(
             "INSERT INTO otdel.knowledge_gaps \
-                 (bureau_id, partner_id, material_id, run_id, product_id, topic, missing, blocks) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+                 (bureau_id, partner_id, material_id, run_id, product_id, topic, missing, \
+                  blocks, nature) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
         )
         .bind(scope.bureau_id)
         .bind(scope.partner_id)
@@ -613,6 +543,7 @@ async fn insert_gaps(
         .bind(&gap.topic)
         .bind(&gap.missing)
         .bind(gap.blocks.as_deref())
+        .bind(gap.nature.as_str())
         .fetch_one(tx.conn())
         .await?;
 

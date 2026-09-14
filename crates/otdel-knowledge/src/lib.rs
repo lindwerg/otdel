@@ -21,12 +21,16 @@
 //! caller records the run as `needs_provider` — storing nothing.
 
 pub mod candidate;
+/// R05 — the page account, and the requirement check that stands before publication.
+pub mod coverage;
 /// How a written quantity is read: numbers, units, and what may be compared with what.
 pub mod measure;
 pub mod prompt;
 pub mod quote;
 pub mod schema;
 pub mod source;
+/// R05 — reading a table as a table: structured context in, uncertainties out.
+pub mod tables;
 pub mod validate;
 
 use otdel_core::llm_config::LlmLimits;
@@ -34,12 +38,19 @@ use otdel_llm::{LlmError, LlmProvider, LlmRequest};
 use tracing::{debug, warn};
 
 pub use candidate::{
-    CandidateCategory, CandidateDraft, CandidateFact, CandidateGap, CandidateProduct, CandidateQa,
-    CandidateQuestion, CandidateTerm, ResolvedEvidence,
+    CandidateAlias, CandidateApplication, CandidateApplicationDetail, CandidateCategory,
+    CandidateDeclaration, CandidateDraft, CandidateFact, CandidateGap, CandidateProduct,
+    CandidateQa, CandidateQuestion, CandidateSense, CandidateSynonym, CandidateTerm,
+    ResolvedEvidence,
 };
-pub use prompt::PromptContext;
+pub use coverage::{
+    evaluate_requirements, CoveragePlan, DraftSnapshot, PlannedPage, ProcessedPage, Requirement,
+    RequirementsOutcome, REQUIREMENTS, TECHNICAL_REQUIREMENT,
+};
+pub use prompt::{PromptContext, TableContext};
 pub use schema::{DraftLimits, DraftResponse, PROMPT_PROFILE, SCHEMA_NAME};
 pub use source::{SourceCatalog, SourcePage};
+pub use tables::{CellUncertainty, StructuralConfirmation, StructuredCell, TableReading};
 
 /// Why a whole run could not be produced.
 ///
@@ -71,15 +82,29 @@ pub struct DraftOutcome {
     pub pages_considered: u32,
     /// Pages left out because the run's request budget was reached.
     pub pages_skipped: u32,
+    /// R05 — every page whose request came back, with which request carried it and how
+    /// much of it was sent. This is what [`CoveragePlan::settle`] needs, and it is
+    /// recorded per request rather than counted at the end: a run that made three calls
+    /// and lost one must not be able to describe the pages of the lost call as processed.
+    pub processed: Vec<ProcessedPage>,
+    /// R05 — the pages the request budget stopped, by identity rather than by count, so
+    /// the next pass can be given exactly them.
+    pub deferred: Vec<uuid::Uuid>,
     pub provider: String,
     pub model: Option<String>,
 }
 
 /// Run the product role over one material's pages.
+///
+/// `tables` carries the server's reading of R03's table cells for the pages of this run.
+/// Passing [`prompt::TableContext::default`] is legitimate and means the material has no
+/// established table structure — it is not a way to opt out of anything, because the
+/// uncertainties the same reading produced are stored by the caller either way.
 pub async fn draft_knowledge(
     provider: &dyn LlmProvider,
     catalog: &SourceCatalog,
     context: &PromptContext,
+    tables: &prompt::TableContext,
     limits: &LlmLimits,
     draft_limits: &DraftLimits,
 ) -> Result<DraftOutcome, KnowledgeError> {
@@ -92,8 +117,14 @@ pub async fn draft_knowledge(
         return Err(KnowledgeError::ProviderNotConfigured(description.message));
     }
 
-    let (batches, pages_skipped) = prompt::plan_batches(catalog, limits);
+    let (batches, deferred_indices) = prompt::plan_batches(catalog, limits);
     let system_prompt = prompt::system_prompt();
+
+    let deferred: Vec<uuid::Uuid> = deferred_indices
+        .iter()
+        .map(|position| catalog.entries()[*position].page.page_id)
+        .collect();
+    let pages_skipped = deferred.len();
 
     let mut outcome = DraftOutcome {
         draft: CandidateDraft::default(),
@@ -101,6 +132,8 @@ pub async fn draft_knowledge(
         input_chars: 0,
         pages_considered: 0,
         pages_skipped: u32::try_from(pages_skipped).unwrap_or(u32::MAX),
+        processed: Vec::new(),
+        deferred,
         provider: description.provider.clone(),
         model: None,
     };
@@ -121,7 +154,7 @@ pub async fn draft_knowledge(
         let request = LlmRequest {
             purpose: "knowledge_draft",
             system_prompt: system_prompt.clone(),
-            user_prompt: prompt::user_prompt(context, &entries, limits),
+            user_prompt: prompt::user_prompt(context, &entries, tables, limits),
             schema_name: SCHEMA_NAME,
             schema: schema::response_schema(),
             max_output_tokens: limits.max_output_tokens,
@@ -156,6 +189,23 @@ pub async fn draft_knowledge(
             .saturating_add(u32::try_from(input_chars).unwrap_or(u32::MAX));
         outcome.pages_considered += u32::try_from(entries.len()).unwrap_or(0);
         outcome.model = Some(response.model.clone());
+
+        // The answer came back, so every page of this request was genuinely put in front
+        // of the model — including when the answer turns out not to match the schema
+        // below. That refusal is counted as a refusal; calling the pages unread would be
+        // a second, wrong story about the same event.
+        let batch_index = i32::try_from(index + 1).unwrap_or(i32::MAX);
+        let page_budget = prompt::per_page_budget(limits);
+        outcome
+            .processed
+            .extend(entries.iter().map(|entry| {
+                ProcessedPage {
+                    page_id: entry.page.page_id,
+                    batch_index,
+                    chars_sent: i32::try_from(entry.page.text.chars().count().min(page_budget))
+                        .unwrap_or(i32::MAX),
+                }
+            }));
 
         match DraftResponse::parse(&response.json) {
             Ok(parsed) => {
@@ -242,6 +292,7 @@ mod tests {
             &provider,
             &catalog,
             &context(),
+            &TableContext::default(),
             &LlmLimits::default(),
             &DraftLimits::default(),
         )
@@ -259,6 +310,7 @@ mod tests {
             &provider,
             &SourceCatalog::default(),
             &context(),
+            &TableContext::default(),
             &LlmLimits::default(),
             &DraftLimits::default(),
         )
@@ -293,6 +345,7 @@ mod tests {
             &provider,
             &catalog,
             &context(),
+            &TableContext::default(),
             &limits,
             &DraftLimits::default(),
         )
@@ -337,6 +390,7 @@ mod tests {
             &provider,
             &catalog,
             &context(),
+            &TableContext::default(),
             &LlmLimits::default(),
             &DraftLimits::default(),
         )
@@ -356,6 +410,7 @@ mod tests {
             &provider,
             &catalog,
             &context(),
+            &TableContext::default(),
             &LlmLimits::default(),
             &DraftLimits::default(),
         )
@@ -385,6 +440,7 @@ mod tests {
             &provider,
             &catalog,
             &context(),
+            &TableContext::default(),
             &LlmLimits::default(),
             &DraftLimits::default(),
         )
@@ -414,6 +470,7 @@ mod tests {
             &provider,
             &catalog,
             &context(),
+            &TableContext::default(),
             &limits,
             &DraftLimits::default(),
         )
@@ -427,5 +484,21 @@ mod tests {
             .rejections
             .iter()
             .any(|reason| reason.contains("не вошло в разбор")));
+
+        // R05: the five are named, not counted. This is the account the audited run
+        // could not produce — and it is what lets the next pass resume exactly here.
+        assert_eq!(outcome.processed.len(), 1);
+        assert_eq!(outcome.processed[0].batch_index, 1);
+        assert!(outcome.processed[0].chars_sent > 0);
+        let deferred: Vec<Uuid> = catalog.entries()[1..]
+            .iter()
+            .map(|entry| entry.page.page_id)
+            .collect();
+        assert_eq!(outcome.deferred, deferred);
+        // No page is in both accounts: a page is either read or waiting, never both.
+        assert!(!outcome
+            .processed
+            .iter()
+            .any(|done| outcome.deferred.contains(&done.page_id)));
     }
 }

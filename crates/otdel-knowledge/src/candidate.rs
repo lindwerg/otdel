@@ -7,6 +7,10 @@
 //! said so" to a stored fact — the type system carries the rule.
 
 use otdel_core::knowledge::{CategoryKind, FactKind, ProductKind, QuestionAudience};
+use otdel_core::passport::{
+    AliasRelation, ApplicationDetailKind, DeclarationOrigin, DeclarationTopic, GapNature,
+    SynonymRelation,
+};
 use uuid::Uuid;
 
 /// A fragment of a real page of this run.
@@ -37,6 +41,79 @@ pub struct CandidateProduct {
     pub kind: ProductKind,
     pub name: String,
     pub summary: Option<String>,
+    /// Other names the material uses for this product. Recorded, never merged: the
+    /// relation says how far the claim goes, and `unclear` keeps a resemblance from
+    /// silently becoming an identity.
+    pub aliases: Vec<CandidateAlias>,
+}
+
+/// A surface form of a product, with the fragment that shows it.
+///
+/// Evidence is a single resolved fragment rather than a list: a surface form is a claim
+/// about one place in the document, and "it is written this way somewhere" is exactly the
+/// unfalsifiable shape this package exists to remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateAlias {
+    pub surface: String,
+    pub relation: AliasRelation,
+    pub note: Option<String>,
+    pub evidence: ResolvedEvidence,
+}
+
+/// A surface form of a glossary term.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateSynonym {
+    pub surface: String,
+    pub relation: SynonymRelation,
+    pub evidence: ResolvedEvidence,
+}
+
+/// A further reading of the same term inside one material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateSense {
+    /// Short disambiguator: «в контексте кабельных лотков». Not a number.
+    pub label: String,
+    pub definition: String,
+    pub definition_is_model_context: bool,
+    pub evidence: ResolvedEvidence,
+}
+
+/// One parameter, constraint or question under an application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateApplicationDetail {
+    pub kind: ApplicationDetailKind,
+    pub label: String,
+    /// `None` only for a question, which asserts nothing.
+    pub value_text: Option<String>,
+    pub unit: Option<String>,
+    /// `Some` only for a question.
+    pub audience: Option<QuestionAudience>,
+    /// Required for a parameter or a constraint; a question may carry none.
+    pub evidence: Option<ResolvedEvidence>,
+}
+
+/// A task the material says a product serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateApplication {
+    pub product_ref: Option<String>,
+    /// The task in the buyer's words.
+    pub task: String,
+    pub summary: Option<String>,
+    /// The model's own framing. Never presented as a quotation.
+    pub model_context: Option<String>,
+    pub evidence: ResolvedEvidence,
+    pub details: Vec<CandidateApplicationDetail>,
+}
+
+/// An explicit "there is none", in the run's own words.
+///
+/// The reason this is a row and not a flag: a flag records that somebody ticked a box,
+/// while a sentence records *why*, and a reader can disagree with a sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateDeclaration {
+    pub topic: DeclarationTopic,
+    pub stated: String,
+    pub origin: DeclarationOrigin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +139,11 @@ pub struct CandidateTerm {
     /// `true` when the definition is the model's wording rather than the source's.
     pub definition_is_model_context: bool,
     pub evidence: Vec<ResolvedEvidence>,
+    /// Further readings of the same word in this material. A catalogue that uses
+    /// «консоль» for a bracket in one section and for a load scheme in another has two,
+    /// and one definition would make the second usage wrong or invisible.
+    pub senses: Vec<CandidateSense>,
+    pub synonyms: Vec<CandidateSynonym>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +170,9 @@ pub struct CandidateGap {
     pub missing: String,
     pub blocks: Option<String>,
     pub question: Option<CandidateQuestion>,
+    /// Which kind of unknown this is. Classified by the run, never inferred from the
+    /// topic's wording.
+    pub nature: GapNature,
 }
 
 /// Everything one run produced, plus an honest account of what it refused.
@@ -99,6 +184,10 @@ pub struct CandidateDraft {
     pub terms: Vec<CandidateTerm>,
     pub qa: Vec<CandidateQa>,
     pub gaps: Vec<CandidateGap>,
+    pub applications: Vec<CandidateApplication>,
+    /// Topics this run stated are empty, with the words on the record. Never inferred
+    /// from an empty array: that inference is the whole failure this package answers.
+    pub declarations: Vec<CandidateDeclaration>,
     /// How many candidates were refused outright.
     pub rejected: u32,
     /// Why, in words, deduplicated and bounded. Shown to the owner as-is.
@@ -117,6 +206,66 @@ impl CandidateDraft {
             && self.terms.is_empty()
             && self.qa.is_empty()
             && self.gaps.is_empty()
+            && self.applications.is_empty()
+            && self.declarations.is_empty()
+    }
+
+    /// Reduce the draft to the counts the requirement check asks about.
+    ///
+    /// Lives here rather than in `coverage` so the same draft can be judged before it is
+    /// stored and after — the rule reads a [`crate::coverage::DraftSnapshot`], and this is
+    /// the in-memory way to build one.
+    pub fn snapshot(&self) -> crate::coverage::DraftSnapshot {
+        crate::coverage::DraftSnapshot {
+            products_total: self.products.len(),
+            products_with_summary: self
+                .products
+                .iter()
+                .filter(|product| product.summary.is_some())
+                .count(),
+            applications_total: self.applications.len(),
+            terms_total: self.terms.len(),
+            // A prepared question reaches the record either on its own gap or under an
+            // application; both are questions somebody has to be asked, and counting only
+            // the first would let a run pass by moving them.
+            questions_total: self
+                .gaps
+                .iter()
+                .filter(|gap| gap.question.is_some())
+                .count()
+                + self
+                    .applications
+                    .iter()
+                    .flat_map(|application| application.details.iter())
+                    .filter(|detail| detail.kind == ApplicationDetailKind::Question)
+                    .count(),
+            commercial_gaps: self.count_gaps(GapNature::Commercial),
+            technical_gaps: self.count_gaps(GapNature::Technical),
+            declared: self
+                .declarations
+                .iter()
+                .map(|declaration| declaration.topic)
+                .collect(),
+        }
+    }
+
+    fn count_gaps(&self, nature: GapNature) -> usize {
+        self.gaps.iter().filter(|gap| gap.nature == nature).count()
+    }
+
+    /// Record an explicit absence, keeping the first statement on a topic.
+    ///
+    /// First rather than last on purpose: a server-side declaration is only ever added
+    /// after the model's, and the model's own words are the more informative of the two.
+    pub fn declare(&mut self, declaration: CandidateDeclaration) {
+        if self
+            .declarations
+            .iter()
+            .any(|kept| kept.topic == declaration.topic)
+        {
+            return;
+        }
+        self.declarations.push(declaration);
     }
 
     /// Record one refusal. Repeated reasons are counted once.
@@ -167,10 +316,27 @@ impl CandidateDraft {
             }
             match self
                 .products
-                .iter()
+                .iter_mut()
                 .find(|kept| kept.kind == product.kind && same_name(&kept.name, &product.name))
             {
-                Some(kept) => remap.push((product.reference.clone(), kept.reference.clone())),
+                Some(kept) => {
+                    // The same product named on two pages is one product with two pages'
+                    // worth of aliases — dropping the second batch would lose a surface
+                    // form purely because of which request happened to see it.
+                    for alias in product.aliases {
+                        if !kept
+                            .aliases
+                            .iter()
+                            .any(|known| same_name(&known.surface, &alias.surface))
+                        {
+                            kept.aliases.push(alias);
+                        }
+                    }
+                    if kept.summary.is_none() {
+                        kept.summary = product.summary;
+                    }
+                    remap.push((product.reference.clone(), kept.reference.clone()));
+                }
                 None => self.products.push(product),
             }
         }
@@ -218,7 +384,78 @@ impl CandidateDraft {
             self.gaps.push(gap);
         }
 
-        self.terms.extend(other.terms);
+        for mut application in other.applications {
+            if let Some(target) = application
+                .product_ref
+                .as_ref()
+                .and_then(|reference| lookup(&remap, reference))
+            {
+                application.product_ref = Some(target);
+            }
+            // Two requests describing the same task for the same product is one task.
+            // Merged by product and task text only: the details differ per page, and
+            // keeping both sets is the point.
+            match self.applications.iter_mut().find(|kept| {
+                kept.product_ref == application.product_ref
+                    && same_name(&kept.task, &application.task)
+            }) {
+                Some(kept) => {
+                    for detail in application.details {
+                        if !kept.details.iter().any(|known| {
+                            known.kind == detail.kind && same_name(&known.label, &detail.label)
+                        }) {
+                            kept.details.push(detail);
+                        }
+                    }
+                }
+                None => self.applications.push(application),
+            }
+        }
+
+        // The same term drafted from two requests is one term carrying both readings.
+        for term in other.terms {
+            match self
+                .terms
+                .iter_mut()
+                .find(|kept| same_name(&kept.term, &term.term))
+            {
+                Some(kept) => {
+                    for sense in term.senses {
+                        if !kept
+                            .senses
+                            .iter()
+                            .any(|known| same_name(&known.label, &sense.label))
+                        {
+                            kept.senses.push(sense);
+                        }
+                    }
+                    for synonym in term.synonyms {
+                        if !kept
+                            .synonyms
+                            .iter()
+                            .any(|known| same_name(&known.surface, &synonym.surface))
+                        {
+                            kept.synonyms.push(synonym);
+                        }
+                    }
+                    for evidence in term.evidence {
+                        let known = kept.evidence.iter().any(|existing| {
+                            existing.page_id == evidence.page_id
+                                && existing.char_start == evidence.char_start
+                        });
+                        if !known {
+                            kept.evidence.push(evidence);
+                        }
+                    }
+                }
+                None => self.terms.push(term),
+            }
+        }
+
+        for declaration in other.declarations {
+            self.declare(declaration);
+        }
+
         self.qa.extend(other.qa);
         self.rejected = self.rejected.saturating_add(other.rejected);
         for reason in other.rejections {
@@ -273,6 +510,7 @@ mod tests {
             kind: ProductKind::Product,
             name: name.to_owned(),
             summary: None,
+            aliases: Vec::new(),
         }
     }
 

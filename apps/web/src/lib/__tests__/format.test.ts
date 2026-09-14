@@ -153,6 +153,14 @@ describe('knowledge labels (phase 1C)', () => {
       conditions: null,
       model_context: null,
       evidence: [],
+      origin: {
+        source: 'page_text',
+        cell_id: null,
+        subject: null,
+        property: null,
+        unit: null,
+        conditions: [],
+      },
       created_at: '2026-01-01T10:00:00Z',
       ...overrides,
     }

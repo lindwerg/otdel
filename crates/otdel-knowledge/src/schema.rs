@@ -24,7 +24,11 @@ pub const SCHEMA_NAME: &str = "otdel_product_knowledge_draft";
 ///
 /// A later run with a different profile is distinguishable from an older one, which is
 /// what `docs/block-01-spec.md` §6.1 asks for when a processing profile changes.
-pub const PROMPT_PROFILE: &str = "productologist/2026-09-13.2";
+///
+/// R05 raises it: the response now carries applications, aliases, senses, synonyms, a
+/// classification on every gap and — the part that matters most — the declarations that
+/// make "there are none" a statement instead of an empty array.
+pub const PROMPT_PROFILE: &str = "productologist/2026-09-14.r05";
 
 /// Upper bounds on what one response may contain. Anything beyond is refused (and
 /// counted), never silently truncated into "success".
@@ -39,6 +43,14 @@ pub struct DraftLimits {
     pub max_evidence_per_item: usize,
     pub max_short_text_chars: usize,
     pub max_long_text_chars: usize,
+    /// R05 — tasks a response may propose.
+    pub max_applications: usize,
+    /// Parameters, constraints and questions under one application, each counted apart.
+    pub max_details_per_application: usize,
+    /// Recorded surface forms under one product or one term.
+    pub max_surface_forms_per_item: usize,
+    /// Readings of one term.
+    pub max_senses_per_term: usize,
 }
 
 impl Default for DraftLimits {
@@ -55,6 +67,10 @@ impl Default for DraftLimits {
             max_short_text_chars: 200,
             // Summaries, definitions, answers, conditions, model context.
             max_long_text_chars: 1_000,
+            max_applications: 40,
+            max_details_per_application: 12,
+            max_surface_forms_per_item: 6,
+            max_senses_per_term: 4,
         }
     }
 }
@@ -83,6 +99,25 @@ pub struct DraftCategory {
     pub summary: Option<String>,
 }
 
+/// A surface form the material uses for a product or a term.
+///
+/// Recorded, never merged. `relation` carries how far the claim goes, and `unclear` is a
+/// legal answer — it is the one that keeps a resemblance from becoming an identity.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DraftSurfaceForm {
+    pub surface: String,
+    /// For a product: `alias` | `sense` | `unclear`. For a term: `synonym` |
+    /// `abbreviation` | `unclear`.
+    pub relation: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    /// One fragment showing this form in the document. Required: a surface form nobody
+    /// can point at is not recorded.
+    #[serde(default)]
+    pub evidence: Vec<DraftEvidence>,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DraftProduct {
@@ -95,6 +130,9 @@ pub struct DraftProduct {
     pub name: String,
     #[serde(default)]
     pub summary: Option<String>,
+    /// Other names the material uses for this product.
+    #[serde(default)]
+    pub aliases: Vec<DraftSurfaceForm>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -130,6 +168,86 @@ pub struct DraftTerm {
     pub definition_from_source: bool,
     #[serde(default)]
     pub evidence: Vec<DraftEvidence>,
+    /// Further readings of the same word inside this material. A catalogue that uses
+    /// «консоль» for a bracket in one section and for a load scheme in another has two,
+    /// and one definition would make the second usage either wrong or invisible.
+    #[serde(default)]
+    pub senses: Vec<DraftSense>,
+    /// Other ways the material writes this term.
+    #[serde(default)]
+    pub synonyms: Vec<DraftSurfaceForm>,
+}
+
+/// One reading of a term, with its own evidence.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DraftSense {
+    /// Short disambiguator: «в контексте кабельных лотков». Not a number.
+    pub label: String,
+    pub definition: String,
+    #[serde(default)]
+    pub definition_from_source: bool,
+    #[serde(default)]
+    pub evidence: Vec<DraftEvidence>,
+}
+
+/// One line under an application.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DraftApplicationDetail {
+    /// `parameter` | `constraint` | `question`.
+    pub kind: String,
+    pub label: String,
+    /// The source's value. Required for a parameter or a constraint; omitted for a
+    /// question, which asserts nothing.
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub unit: Option<String>,
+    /// `partner` | `industry`. Only for a question, and required there.
+    #[serde(default)]
+    pub audience: Option<String>,
+    #[serde(default)]
+    pub evidence: Vec<DraftEvidence>,
+}
+
+/// A task the material says a product serves.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DraftApplication {
+    #[serde(default)]
+    pub product_ref: Option<String>,
+    /// The task in the buyer's words: «закрепить кабельный лоток к бетонному перекрытию».
+    pub task: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub model_context: Option<String>,
+    #[serde(default)]
+    pub evidence: Vec<DraftEvidence>,
+    #[serde(default)]
+    pub details: Vec<DraftApplicationDetail>,
+}
+
+/// The run's explicit statements that a topic has nothing in it.
+///
+/// Every field is nullable, and `null` means "not declared" — which is *not* the same as
+/// "there is none". A topic with no rows and no declaration fails its requirement, and
+/// that asymmetry is the entire reason this object exists: the audited run produced empty
+/// arrays for four topics and nothing could tell that apart from four honest absences.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DraftDeclarations {
+    #[serde(default)]
+    pub glossary: Option<String>,
+    #[serde(default)]
+    pub questions: Option<String>,
+    #[serde(default)]
+    pub applications: Option<String>,
+    #[serde(default)]
+    pub commercial_unknowns: Option<String>,
+    #[serde(default)]
+    pub technical_unknowns: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -158,6 +276,14 @@ pub struct DraftGap {
     /// `partner` | `industry`. Only meaningful together with `question`.
     #[serde(default)]
     pub audience: Option<String>,
+    /// `commercial` | `technical` | `other`.
+    ///
+    /// The requirement check asks separately whether the commercial unknowns and the
+    /// technical ones were recorded, so the run classifies its own gaps. The alternative
+    /// — matching words against the free-text topic — would put a lexicon in the
+    /// publication path, where a vocabulary miss silently becomes a clearance.
+    #[serde(default)]
+    pub nature: Option<String>,
 }
 
 /// The whole response. Missing arrays are accepted as empty; unknown fields are not.
@@ -176,6 +302,13 @@ pub struct DraftResponse {
     pub qa: Vec<DraftQa>,
     #[serde(default)]
     pub gaps: Vec<DraftGap>,
+    #[serde(default)]
+    pub applications: Vec<DraftApplication>,
+    /// The statements that make "there are none" an answer. Defaulted rather than
+    /// required on the Rust side so an older stored response still parses; the JSON
+    /// schema does require it, which is where the model is actually held to it.
+    #[serde(default)]
+    pub declarations: DraftDeclarations,
 }
 
 impl DraftResponse {
@@ -214,12 +347,43 @@ fn evidence_schema() -> Value {
     })
 }
 
+/// An array of surface forms, parameterised by the relations this position allows.
+///
+/// Products and terms describe different kinds of resemblance (`alias`/`sense` versus
+/// `synonym`/`abbreviation`), but both admit `unclear` and both require evidence — so the
+/// shape is shared and only the enum differs. `evidence` is required here rather than
+/// optional: [`crate::validate`] drops a surface form whose fragment does not resolve, and
+/// asking for it in the schema makes that refusal rare instead of routine.
+fn surface_form_schema(relations: &[&str], description: &str) -> Value {
+    json!({
+        "type": "array",
+        "description": description,
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["surface", "relation", "note", "evidence"],
+            "properties": {
+                "surface": {
+                    "type": "string",
+                    "description": "Написание дословно из материала.",
+                },
+                "relation": {"type": "string", "enum": relations},
+                "note": nullable_string(),
+                "evidence": evidence_schema(),
+            },
+        },
+    })
+}
+
 /// The JSON Schema sent to the provider.
 pub fn response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["categories", "products", "facts", "glossary", "qa", "gaps"],
+        "required": [
+            "categories", "products", "facts", "glossary", "qa", "gaps",
+            "applications", "declarations",
+        ],
         "properties": {
             "categories": {
                 "type": "array",
@@ -243,7 +407,7 @@ pub fn response_schema() -> Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["ref", "category_ref", "kind", "name", "summary"],
+                    "required": ["ref", "category_ref", "kind", "name", "summary", "aliases"],
                     "properties": {
                         "ref": {
                             "type": "string",
@@ -256,6 +420,10 @@ pub fn response_schema() -> Value {
                         "kind": {"type": "string", "enum": ["product", "service"]},
                         "name": {"type": "string"},
                         "summary": nullable_string(),
+                        "aliases": surface_form_schema(
+                            &["alias", "sense", "unclear"],
+                            "Другое написание этого же изделия в материале. alias — то же изделие другими словами; sense — более узкое значение в одном разделе; unclear — похоже, но материал этого не подтверждает. Форма должна встречаться в цитате дословно.",
+                        ),
                     },
                 },
             },
@@ -294,12 +462,39 @@ pub fn response_schema() -> Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["term", "definition", "definition_from_source", "evidence"],
+                    "required": [
+                        "term", "definition", "definition_from_source", "evidence",
+                        "senses", "synonyms",
+                    ],
                     "properties": {
                         "term": {"type": "string"},
                         "definition": {"type": "string"},
                         "definition_from_source": {"type": "boolean"},
                         "evidence": evidence_schema(),
+                        "senses": {
+                            "type": "array",
+                            "description": "Другие значения этого же слова в этом материале. Заполняется, только если материал действительно употребляет слово по-разному.",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                    "label", "definition", "definition_from_source", "evidence",
+                                ],
+                                "properties": {
+                                    "label": {
+                                        "type": "string",
+                                        "description": "Короткое уточнение значения, например \"в контексте кабельных лотков\". Не номер.",
+                                    },
+                                    "definition": {"type": "string"},
+                                    "definition_from_source": {"type": "boolean"},
+                                    "evidence": evidence_schema(),
+                                },
+                            },
+                        },
+                        "synonyms": surface_form_schema(
+                            &["synonym", "abbreviation", "unclear"],
+                            "Другое написание этого же термина в материале. synonym — то же понятие другими словами; abbreviation — сокращение; unclear — похоже, но материал этого не подтверждает.",
+                        ),
                     },
                 },
             },
@@ -323,6 +518,7 @@ pub fn response_schema() -> Value {
                     "additionalProperties": false,
                     "required": [
                         "product_ref", "topic", "missing", "blocks", "question", "audience",
+                        "nature",
                     ],
                     "properties": {
                         "product_ref": {
@@ -338,11 +534,103 @@ pub fn response_schema() -> Value {
                             "enum": ["partner", "industry", null],
                             "description": "Кому адресован вопрос. Обязателен, если question заполнен: вопрос без адресата не сохраняется.",
                         },
+                        "nature": {
+                            "type": ["string", "null"],
+                            "enum": ["commercial", "technical", "other", null],
+                            "description": "Характер пробела: commercial — цена, срок, партия, условия поставки; technical — нагрузки, размеры, материалы, совместимость; other — всё остальное.",
+                        },
                     },
+                },
+            },
+            "applications": {
+                "type": "array",
+                "description": "Задачи, которые материал прямо связывает с изделием: не рекламные обещания, а работа, которую изделие выполняет.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "product_ref", "task", "summary", "model_context", "evidence", "details",
+                    ],
+                    "properties": {
+                        "product_ref": {
+                            "type": ["string", "null"],
+                            "description": "Ярлык изделия (поле ref из products), не название.",
+                        },
+                        "task": {
+                            "type": "string",
+                            "description": "Задача словами покупателя: «закрепить кабельный лоток к бетонному перекрытию».",
+                        },
+                        "summary": nullable_string(),
+                        "model_context": nullable_string(),
+                        "evidence": evidence_schema(),
+                        "details": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                    "kind", "label", "value", "unit", "audience", "evidence",
+                                ],
+                                "properties": {
+                                    "kind": {
+                                        "type": "string",
+                                        "enum": ["parameter", "constraint", "question"],
+                                    },
+                                    "label": {"type": "string"},
+                                    "value": {
+                                        "type": ["string", "null"],
+                                        "description": "Значение дословно из источника. Обязательно для parameter и constraint; для question — null, вопрос ничего не утверждает.",
+                                    },
+                                    "unit": nullable_string(),
+                                    "audience": {
+                                        "type": ["string", "null"],
+                                        "enum": ["partner", "industry", null],
+                                        "description": "Только для kind = question, и там обязателен.",
+                                    },
+                                    "evidence": evidence_schema(),
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            // Not an array: a declaration is a sentence about a topic, and there is a
+            // fixed list of topics. `null` means "not declared", which is deliberately
+            // different from "there is none" — an empty array elsewhere in this response
+            // satisfies no requirement unless the matching sentence appears here.
+            "declarations": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "glossary", "questions", "applications", "commercial_unknowns",
+                    "technical_unknowns",
+                ],
+                "description": "Прямые утверждения «в материале этого нет». Заполняйте только то, что действительно проверили; null означает «не проверял», а не «нет».",
+                "properties": {
+                    "glossary": declaration_field(
+                        "Почему в материале нет терминов, требующих пояснения.",
+                    ),
+                    "questions": declaration_field(
+                        "Почему по материалу нечего спросить.",
+                    ),
+                    "applications": declaration_field(
+                        "Почему материал не описывает задач применения.",
+                    ),
+                    "commercial_unknowns": declaration_field(
+                        "Почему в материале не осталось коммерческих неизвестных (цена, срок, партия).",
+                    ),
+                    "technical_unknowns": declaration_field(
+                        "Почему в материале не осталось технических неизвестных.",
+                    ),
                 },
             },
         },
     })
+}
+
+/// One declaration slot: a sentence, or `null` for "not declared".
+fn declaration_field(description: &str) -> Value {
+    json!({"type": ["string", "null"], "description": description})
 }
 
 #[cfg(test)]

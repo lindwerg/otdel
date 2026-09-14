@@ -288,6 +288,10 @@ pub struct KnowledgeFact {
     /// evidence points at it.
     pub model_context: Option<String>,
     pub evidence: Vec<FactEvidence>,
+    /// R05 — which structure the value sat in, and what that structure said it was about.
+    /// Never a replacement for the quotation: both are shown.
+    #[serde(default)]
+    pub origin: crate::passport::FactOrigin,
     pub created_at: DateTime<Utc>,
 }
 
@@ -303,6 +307,13 @@ pub struct GlossaryTerm {
     /// evidence still points at the fragment the term was read from.
     pub definition_is_model_context: bool,
     pub evidence: Vec<FactEvidence>,
+    /// R05 — further readings of the same word in the same material. One definition for a
+    /// word the catalogue uses two ways makes the second usage wrong or invisible.
+    #[serde(default)]
+    pub senses: Vec<crate::passport::GlossarySense>,
+    /// R05 — other spellings, recorded and never merged.
+    #[serde(default)]
+    pub synonyms: Vec<crate::passport::GlossarySynonym>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -338,6 +349,12 @@ pub struct KnowledgeGap {
     pub missing: String,
     /// Which answers this gap prevents.
     pub blocks: Option<String>,
+    /// R05 — which kind of unknown this is, classified by the run rather than guessed
+    /// from the topic's wording. The requirement check asks about the commercial and the
+    /// technical unknowns separately, and a lexicon in that path would turn a vocabulary
+    /// miss into a silent clearance.
+    #[serde(default)]
+    pub nature: crate::passport::GapNature,
     /// The question prepared from this gap, when there is one.
     pub question: Option<PreparedQuestion>,
     pub created_at: DateTime<Utc>,
@@ -370,6 +387,24 @@ pub struct KnowledgeRun {
     pub model: Option<String>,
     pub prompt_profile: String,
     pub pages_considered: i32,
+    /// R05 — the page account of this run: how many pages the material has, how many were
+    /// offered, processed, deferred and unreadable, and the verdict over that account.
+    ///
+    /// It lives on the run rather than beside it because the audited failure was exactly
+    /// a reader who saw `pages_considered` and had no way to ask "out of how many". A
+    /// caller holding a run now cannot avoid seeing the denominator.
+    pub coverage: crate::passport::RunCoverage,
+    /// R05 — tasks, explicit absences and unsettled readings this run left behind.
+    ///
+    /// Beside the counters above rather than below them, because that is how they have to
+    /// be read: «44 изделия, 13 фактов» was reported as success, and the same line with
+    /// «0 задач, 0 заявлений, 8 неясностей» beside it is not.
+    #[serde(default)]
+    pub applications_created: i32,
+    #[serde(default)]
+    pub declarations_made: i32,
+    #[serde(default)]
+    pub uncertainties_open: i32,
     pub requests_made: i32,
     pub input_chars: i32,
     pub categories_created: i32,
@@ -413,10 +448,20 @@ pub struct KnowledgeSummary {
     pub qa_total: i32,
     pub gaps_total: i32,
     pub questions_total: i32,
+    /// R05 — tasks the materials say the products serve.
+    pub applications_total: i32,
+    /// R05 — things the materials state in a form nobody may read as a value. Shown
+    /// beside the totals above rather than below them: a base with many facts and many
+    /// open uncertainties is not the same base as one with many facts and none.
+    pub uncertainties_total: i32,
+    /// R05 — products whose passport carries something a reader could act on.
+    pub passports_substantive: i32,
     /// Materials that have been read and could be drafted from.
     pub materials_readable: i32,
     /// Materials that have a completed or partial run.
     pub materials_understood: i32,
+    /// R05 — materials whose run may be published without a person reading it first.
+    pub materials_ready: i32,
 }
 
 /// Stable idempotency key for the understanding job of one material.
@@ -515,11 +560,24 @@ mod tests {
                 char_start: 10,
                 char_end: 23,
             }],
+            origin: crate::passport::FactOrigin {
+                source: crate::passport::StructuralSource::TableCell,
+                cell_id: Some(Uuid::from_u128(8)),
+                subject: Some("BP21".to_owned()),
+                property: Some("Безопасная рабочая нагрузка".to_owned()),
+                unit: Some("кН".to_owned()),
+                conditions: vec!["две опоры".to_owned()],
+            },
             created_at: now,
         };
 
         let value = serde_json::to_value(&fact).unwrap();
         assert_eq!(value["status"], "candidate");
+        // R05: which structure the number sat in travels with the fact, beside the
+        // quotation rather than instead of it.
+        assert_eq!(value["origin"]["source"], "table_cell");
+        assert_eq!(value["origin"]["property"], "Безопасная рабочая нагрузка");
+        assert!(value["evidence"][0]["quote"].is_string());
         assert_eq!(value["unit"], "kN");
         assert_eq!(value["evidence"][0]["page_number"], 3);
         assert_eq!(value["evidence"][0]["quote"], "BP21 1200 3.5");

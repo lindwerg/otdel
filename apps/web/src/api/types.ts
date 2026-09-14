@@ -359,6 +359,11 @@ export interface KnowledgeRun {
   model: string | null
   prompt_profile: string
   pages_considered: number
+  /** R05 — the page account of this run, and the verdict over it. */
+  coverage: RunCoverage
+  applications_created: number
+  declarations_made: number
+  uncertainties_open: number
   requests_made: number
   input_chars: number
   categories_created: number
@@ -385,8 +390,16 @@ export interface KnowledgeSummary {
   qa_total: number
   gaps_total: number
   questions_total: number
+  /** R05 — tasks the materials say the products serve. */
+  applications_total: number
+  /** R05 — things the materials state that nobody may read as a value. */
+  uncertainties_total: number
+  /** R05 — products whose passport says something a reader could act on. */
+  passports_substantive: number
   materials_readable: number
   materials_understood: number
+  /** R05 — runs that pass both halves of the publication gate. */
+  materials_ready: number
 }
 
 /** A read material that has never been drafted — the entry point for a first draft. */
@@ -468,6 +481,8 @@ export interface KnowledgeFact {
   /** The model's own words. Shown as explicitly not a quotation. */
   model_context: string | null
   evidence: FactEvidence[]
+  /** R05 — which structure the value sat in, beside the quotation, never instead of it. */
+  origin: FactOrigin
   created_at: string
 }
 
@@ -489,6 +504,10 @@ export interface GlossaryTerm {
   /** true when the definition is the model's wording, not the source's. */
   definition_is_model_context: boolean
   evidence: FactEvidence[]
+  /** R05 — other readings of the same word in the same material. */
+  senses: GlossarySense[]
+  /** R05 — other spellings, recorded and never merged. */
+  synonyms: GlossarySynonym[]
   created_at: string
 }
 
@@ -524,6 +543,8 @@ export interface KnowledgeGap {
   topic: string
   missing: string
   blocks: string | null
+  /** R05 — which kind of unknown this is, classified by the run itself. */
+  nature: GapNature
   question: PreparedQuestion | null
   created_at: string
 }
@@ -1472,4 +1493,274 @@ export interface ExportDocument {
   version: KnowledgeVersion
   claims: VersionClaim[]
   gaps: VersionGap[]
+}
+
+// --- R05: the product base -------------------------------------------------
+//
+// Two conventions run through everything below, and they are the same two the
+// server's vocabulary is built on.
+//
+// * Absence carries a reason or it is not absence. `PageDisposition` has no
+//   value meaning "gone" and `CoverageState` has none meaning "good enough".
+// * Unclear is a first-class answer. `unclear` appears in three enums here and
+//   never means "probably yes": the interface must render it as an open
+//   question, never as a link the reader can follow.
+
+/** What became of one page of a material during one run. */
+export type PageDisposition =
+  | 'processed'
+  | 'deferred_budget'
+  | 'unreadable_needs_ocr'
+  | 'unreadable_failed'
+  | 'unreadable_empty'
+  | 'not_read_yet'
+  | 'not_offered_no_text'
+  | 'excluded_by_request'
+
+/** The verdict over a run's page account. There is deliberately no "good enough". */
+export type CoverageState = 'unknown' | 'complete' | 'partial_accounted' | 'incomplete'
+
+/** Whether the run produced what a passport needs. Three values, never a boolean. */
+export type RequirementsState = 'unknown' | 'met' | 'unmet'
+
+export type GapNature = 'commercial' | 'technical' | 'other'
+export type StructuralSource = 'page_text' | 'table_cell'
+export type AliasRelation = 'alias' | 'sense' | 'unclear'
+export type SynonymRelation = 'synonym' | 'abbreviation' | 'unclear'
+export type IdentityState = 'linked' | 'unclear'
+export type IdentityBasis =
+  | 'identical_designation_quoted'
+  | 'alias_quoted_in_both'
+  | 'name_similarity_only'
+export type ApplicationDetailKind = 'parameter' | 'constraint' | 'question'
+export type DeclarationTopic =
+  | 'glossary'
+  | 'questions'
+  | 'applications'
+  | 'commercial_unknowns'
+  | 'technical_unknowns'
+export type UncertaintyKind =
+  | 'ambiguous_table_cell'
+  | 'unreadable_page'
+  | 'unresolved_unit'
+  | 'unresolved_subject'
+  | 'uninterpreted_diagram'
+
+/** Which structure a fact's value sat in, and what that structure said it was about. */
+export interface FactOrigin {
+  source: StructuralSource
+  /** May be null on a table-derived fact: re-reading the page replaces its cells. */
+  cell_id: string | null
+  subject: string | null
+  property: string | null
+  unit: string | null
+  conditions: string[]
+}
+
+/** The page account and the cost of one run. */
+export interface RunCoverage {
+  pages_total: number
+  pages_offered: number
+  pages_processed: number
+  pages_deferred: number
+  pages_unreadable: number
+  state: CoverageState
+  /** Why the state is not `complete`, in the server's words. Shown as-is. */
+  notes: string[]
+  requirements: RequirementsState
+  /** `name: explanation` lines. Shown as-is. */
+  requirements_missing: string[]
+  prompt_tokens: number | null
+  completion_tokens: number | null
+  /** null means the provider did not report a cost — never "free". */
+  cost_micro_usd: number | null
+}
+
+export interface PageCoverage {
+  id: string
+  material_id: string
+  run_id: string
+  page_id: string
+  page_number: number
+  disposition: PageDisposition
+  offered: boolean
+  chars_sent: number
+  batch_index: number | null
+  /** Present whenever the page was not processed. */
+  reason: string | null
+  created_at: string
+}
+
+/** An explicit "there is none", in the run's own words. */
+export interface KnowledgeDeclaration {
+  id: string
+  material_id: string
+  run_id: string
+  topic: DeclarationTopic
+  stated: string
+  origin: 'model' | 'server'
+  created_at: string
+}
+
+/**
+ * One run's coverage, its verdict and the account behind it.
+ *
+ * `RunCoverage` is flattened into this shape by the server, so `state` and
+ * `pages_total` sit at the top level.
+ */
+export interface CoverageReport extends RunCoverage {
+  run_id: string
+  material_id: string
+  material_filename: string
+  status: KnowledgeRunStatus
+  /** Both halves of the gate, decided by the server so the two cannot disagree. */
+  allows_automatic_publication: boolean
+  /** Pages a later pass could still turn into knowledge. */
+  resumable_pages: number[]
+  pages: PageCoverage[]
+  declarations: KnowledgeDeclaration[]
+}
+
+/** A recorded surface form of a product. Never a merge. */
+export interface ProductAlias {
+  id: string
+  product_id: string
+  material_id: string
+  run_id: string
+  surface: string
+  relation: AliasRelation
+  note: string | null
+  page_id: string
+  page_number: number
+  quote: string
+  char_start: number
+  char_end: number
+  created_at: string
+}
+
+export interface GlossarySense {
+  id: string
+  term_id: string
+  material_id: string
+  run_id: string
+  /** Short disambiguator: «в контексте кабельных лотков». Not a number. */
+  label: string
+  definition: string
+  definition_is_model_context: boolean
+  page_id: string
+  page_number: number
+  quote: string
+  char_start: number
+  char_end: number
+  created_at: string
+}
+
+export interface GlossarySynonym {
+  id: string
+  term_id: string
+  material_id: string
+  run_id: string
+  surface: string
+  relation: SynonymRelation
+  page_id: string
+  page_number: number
+  quote: string
+  char_start: number
+  char_end: number
+  created_at: string
+}
+
+/** A proposal that two product rows describe one product. Never applied. */
+export interface ProductIdentityLink {
+  id: string
+  product_id: string
+  other_product_id: string
+  state: IdentityState
+  basis: IdentityBasis
+  note: string | null
+  material_id: string | null
+  page_id: string | null
+  page_number: number | null
+  other_material_id: string | null
+  other_page_id: string | null
+  other_page_number: number | null
+  created_at: string
+}
+
+/** One parameter, constraint or question under an application. */
+export interface ApplicationDetail {
+  id: string
+  application_id: string
+  kind: ApplicationDetailKind
+  label: string
+  /** null only for a question, which asserts nothing. */
+  value_text: string | null
+  unit: string | null
+  audience: QuestionAudience | null
+  page_id: string | null
+  page_number: number | null
+  quote: string | null
+  char_start: number | null
+  char_end: number | null
+  created_at: string
+}
+
+/** A task the material says a product serves. */
+export interface ProductApplication {
+  id: string
+  partner_id: string
+  material_id: string
+  run_id: string
+  product_id: string | null
+  product_name: string | null
+  task: string
+  summary: string | null
+  /** The model's own framing. Never a quotation. */
+  model_context: string | null
+  page_id: string
+  page_number: number
+  quote: string
+  char_start: number
+  char_end: number
+  details: ApplicationDetail[]
+  created_at: string
+}
+
+/** Something the material states in a form nobody may read as a value. */
+export interface KnowledgeUncertainty {
+  id: string
+  partner_id: string
+  material_id: string
+  run_id: string
+  product_id: string | null
+  kind: UncertaintyKind
+  subject: string
+  detail: string
+  reasons: string[]
+  /** The cell's own text, shown as explicitly *not* a claim. */
+  quote: string | null
+  page_id: string | null
+  page_number: number | null
+  region_id: string | null
+  status: string
+  created_at: string
+}
+
+/**
+ * Everything known about one product, assembled for reading.
+ *
+ * The gaps, the uncertainties and the identity proposals arrive with the facts
+ * and are not optional: a reader shown only the facts has been told half the
+ * truth, which is the failure this whole surface exists to remove.
+ */
+export interface ProductPassport {
+  product: Product
+  category: ProductCategory | null
+  material_filename: string
+  aliases: ProductAlias[]
+  facts: KnowledgeFact[]
+  applications: ProductApplication[]
+  gaps: KnowledgeGap[]
+  uncertainties: KnowledgeUncertainty[]
+  identity_links: ProductIdentityLink[]
 }

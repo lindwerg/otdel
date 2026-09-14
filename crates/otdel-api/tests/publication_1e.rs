@@ -119,7 +119,21 @@ fn draft(facts: Vec<Value>) -> Value {
             "blocks": "коммерческое предложение",
             "question": "Какая отпускная цена профиля BP21?",
             "audience": "partner",
+            "nature": "commercial",
         }],
+        "applications": [],
+        // R05: this suite is about the *publication* rules, so its draft has to be one
+        // R05 passes — otherwise every test below would be blocked by the new gate for a
+        // reason that has nothing to do with what it is testing. One page and one product
+        // is small enough for a sentence to answer for, and the run holds nothing that
+        // contradicts one.
+        "declarations": {
+            "glossary": "лист не вводит терминов, требующих пояснения",
+            "questions": null,
+            "applications": "лист перечисляет обозначения и не описывает задач применения",
+            "commercial_unknowns": null,
+            "technical_unknowns": "технических величин, кроме приведённых, на листе нет",
+        },
     })
 }
 

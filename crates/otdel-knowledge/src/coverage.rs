@@ -257,6 +257,21 @@ pub struct ProcessedPage {
     pub chars_sent: i32,
 }
 
+/// The scale of the pass a declaration is asked to speak for.
+///
+/// A declaration is one sentence. The owner is expected to be able to check it by reading
+/// the material — and that is a real, bounded task for a short document and an unbounded
+/// one for a catalogue. Past these sizes a sentence stops being a check anybody will redo
+/// and becomes a rubber stamp, so the honest record is not "cleared" but "nobody has
+/// confirmed this".
+///
+/// The two limits are deliberately small. They are not a guess at where a model becomes
+/// unreliable; they are the point past which *a person* will not re-read the document to
+/// disagree, which is the only thing that made a declaration trustworthy in the first
+/// place.
+const MAX_PAGES_ONE_SENTENCE_MAY_SPEAK_FOR: usize = 4;
+const MAX_PRODUCTS_ONE_SENTENCE_MAY_SPEAK_FOR: usize = 3;
+
 /// What a run produced, reduced to the counts the requirement check needs.
 ///
 /// Deliberately counts rather than the rows themselves: the rule must be the same whether
@@ -274,13 +289,106 @@ pub struct DraftSnapshot {
     pub commercial_gaps: usize,
     /// Gaps the run classified as technical.
     pub technical_gaps: usize,
+    /// Facts the run classified as commercial. A *stated* price, lead time or minimum
+    /// order — the thing whose absence would make it an unknown instead.
+    pub commercial_facts: usize,
     /// Topics the run explicitly declared empty, with words on the record.
     pub declared: Vec<DeclarationTopic>,
+    /// Pages this pass actually processed.
+    pub pages_processed: usize,
+    /// Readings this run could not settle: an ambiguous cell, a unit written nowhere, a
+    /// page nobody could read. Each one is something still open in this material.
+    pub open_uncertainties: usize,
+}
+
+/// The run context a [`DraftSnapshot`] cannot get from the candidates alone.
+///
+/// Separate from the draft because neither number is a candidate: the page count belongs
+/// to the coverage plan and the uncertainties come from R03's table cells. Passing them in
+/// explicitly keeps [`crate::candidate::CandidateDraft::snapshot`] from having to reach
+/// for state it does not own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunContext {
+    pub pages_processed: usize,
+    pub open_uncertainties: usize,
+}
+
+/// Why a declaration did not clear its topic — or that it did.
+///
+/// Three outcomes rather than a boolean, because the two refusals call for different
+/// actions. A contradicted declaration means the run disagreed with itself and the draft
+/// is wrong; a disproportionate one means nobody has checked yet and a person must.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeclarationVerdict {
+    /// Small enough to be checkable, and nothing in the run contradicts it.
+    Accepted,
+    /// The same run produced something that makes the statement false.
+    Contradicted(String),
+    /// Too much material for one sentence to answer for.
+    Disproportionate(String),
 }
 
 impl DraftSnapshot {
     fn declares(&self, topic: DeclarationTopic) -> bool {
         self.declared.contains(&topic)
+    }
+
+    /// Whether "there is none" on this topic may stand as this run's answer.
+    ///
+    /// The declaration was already checked once, at validation time, against the response
+    /// that carried it: a response claiming "no terms" beside eleven terms is refused
+    /// there. This is the second check, and it is the one the audited live run needed —
+    /// it asks whether the *whole run* leaves the statement standing.
+    ///
+    /// The contradiction rules below are not heuristics about wording. Each is the topic's
+    /// own meaning, read back:
+    ///
+    /// * an unresolved unit, an ambiguous load cell or a page nobody could read **is** a
+    ///   technical unknown, so "no technical unknowns remain" cannot be said while the run
+    ///   holds one;
+    /// * the same readings are, by construction, things somebody has to settle, so
+    ///   "nothing to ask" cannot be said either;
+    /// * "nothing commercial is missing" requires that something commercial is *present*.
+    ///   A run that recorded no commercial fact has not established that prices are
+    ///   stated — it has established that they are not.
+    fn declaration_verdict(&self, topic: DeclarationTopic) -> DeclarationVerdict {
+        if let Some(reason) = self.contradiction(topic) {
+            return DeclarationVerdict::Contradicted(reason);
+        }
+        if self.pages_processed > MAX_PAGES_ONE_SENTENCE_MAY_SPEAK_FOR
+            || self.products_total > MAX_PRODUCTS_ONE_SENTENCE_MAY_SPEAK_FOR
+        {
+            return DeclarationVerdict::Disproportionate(format!(
+                "заявление «в материале этого нет» не принято: разобрано страниц {}, \
+                 изделий {} — отсутствие в таком объёме одним предложением не \
+                 подтверждается, нужен человек",
+                self.pages_processed, self.products_total
+            ));
+        }
+        DeclarationVerdict::Accepted
+    }
+
+    fn contradiction(&self, topic: DeclarationTopic) -> Option<String> {
+        match topic {
+            DeclarationTopic::TechnicalUnknowns if self.open_uncertainties > 0 => Some(format!(
+                "заявление «технических неизвестных нет» противоречит этому же разбору: \
+                 нерешённых чтений {} (единица не написана, ячейка неоднозначна, \
+                 страница не прочитана) — каждое из них и есть техническая неизвестность",
+                self.open_uncertainties
+            )),
+            DeclarationTopic::Questions if self.open_uncertainties > 0 => Some(format!(
+                "заявление «спрашивать нечего» противоречит этому же разбору: \
+                 нерешённых чтений {} — каждое требует, чтобы кто-то его разъяснил",
+                self.open_uncertainties
+            )),
+            DeclarationTopic::CommercialUnknowns if self.commercial_facts == 0 => Some(
+                "заявление «коммерческих неизвестных нет» не принято: в разборе нет ни \
+                 одного коммерческого факта. Сказать, что цена и сроки не отсутствуют, \
+                 можно только если они в материале названы"
+                    .to_owned(),
+            ),
+            _ => None,
+        }
     }
 }
 
@@ -347,12 +455,38 @@ pub struct RequirementsOutcome {
 /// Decide whether a draft carries what a passport needs.
 ///
 /// Returns [`RequirementsState::Unmet`] with the reasons, or [`RequirementsState::Met`]
-/// with nothing. There is no third outcome and no threshold: every clause below is a
-/// yes/no question about rows that either exist or were explicitly declared absent.
+/// with nothing.
+///
+/// Each topic is satisfied by rows, or by a declaration **that survives the run**. The
+/// second half changed after a live pass over a real 44-page technical catalogue came back
+/// `requirements = met` with 0 terms, 0 applications, 123 unsettled readings — and five
+/// declarations saying there was nothing to find. The original rule accepted any
+/// declaration, so the audited failure had simply moved: instead of an empty array passing
+/// silently, a self-serving sentence passed it. A declaration is now refused when the same
+/// run contradicts it or when it is asked to answer for more material than one sentence
+/// can, and the refusal is reported under the topic's own name with the reason attached.
 pub fn evaluate_requirements(snapshot: &DraftSnapshot) -> RequirementsOutcome {
     let mut missing: Vec<String> = Vec::new();
     let fail = |requirement: &Requirement, missing: &mut Vec<String>| {
         missing.push(format!("{}: {}", requirement.name, requirement.explanation));
+    };
+
+    // A topic with no rows: satisfied only by a declaration this run leaves standing.
+    // When the declaration is refused, the topic is reported under its own name with the
+    // refusal as the explanation — never with the generic "nothing was said", which would
+    // hide that something *was* said and was not good enough.
+    let absent = |requirement: &Requirement, topic: DeclarationTopic, missing: &mut Vec<String>| {
+        if !snapshot.declares(topic) {
+            fail(requirement, missing);
+            return;
+        }
+        match snapshot.declaration_verdict(topic) {
+            DeclarationVerdict::Accepted => {}
+            DeclarationVerdict::Contradicted(reason)
+            | DeclarationVerdict::Disproportionate(reason) => {
+                missing.push(format!("{}: {}", requirement.name, reason));
+            }
+        }
     };
 
     if snapshot.products_total == 0 {
@@ -361,20 +495,32 @@ pub fn evaluate_requirements(snapshot: &DraftSnapshot) -> RequirementsOutcome {
         fail(&REQUIREMENTS[1], &mut missing);
     }
 
-    if snapshot.applications_total == 0 && !snapshot.declares(DeclarationTopic::Applications) {
-        fail(&REQUIREMENTS[2], &mut missing);
+    if snapshot.applications_total == 0 {
+        absent(
+            &REQUIREMENTS[2],
+            DeclarationTopic::Applications,
+            &mut missing,
+        );
     }
-    if snapshot.terms_total == 0 && !snapshot.declares(DeclarationTopic::Glossary) {
-        fail(&REQUIREMENTS[3], &mut missing);
+    if snapshot.terms_total == 0 {
+        absent(&REQUIREMENTS[3], DeclarationTopic::Glossary, &mut missing);
     }
-    if snapshot.questions_total == 0 && !snapshot.declares(DeclarationTopic::Questions) {
-        fail(&REQUIREMENTS[4], &mut missing);
+    if snapshot.questions_total == 0 {
+        absent(&REQUIREMENTS[4], DeclarationTopic::Questions, &mut missing);
     }
-    if snapshot.commercial_gaps == 0 && !snapshot.declares(DeclarationTopic::CommercialUnknowns) {
-        fail(&REQUIREMENTS[5], &mut missing);
+    if snapshot.commercial_gaps == 0 {
+        absent(
+            &REQUIREMENTS[5],
+            DeclarationTopic::CommercialUnknowns,
+            &mut missing,
+        );
     }
-    if snapshot.technical_gaps == 0 && !snapshot.declares(DeclarationTopic::TechnicalUnknowns) {
-        fail(&TECHNICAL_REQUIREMENT, &mut missing);
+    if snapshot.technical_gaps == 0 {
+        absent(
+            &TECHNICAL_REQUIREMENT,
+            DeclarationTopic::TechnicalUnknowns,
+            &mut missing,
+        );
     }
 
     if missing.is_empty() {
@@ -586,7 +732,31 @@ mod tests {
             questions_total: 2,
             commercial_gaps: 1,
             technical_gaps: 1,
+            commercial_facts: 0,
             declared: Vec::new(),
+            pages_processed: 3,
+            open_uncertainties: 0,
+        }
+    }
+
+    /// A short material that already satisfies everything with rows.
+    ///
+    /// Short on purpose: a declaration over this much material is proportionate, so a test
+    /// that switches one topic off and declares it is testing the declaration rule and
+    /// nothing else.
+    fn small() -> DraftSnapshot {
+        DraftSnapshot {
+            products_total: 1,
+            products_with_summary: 1,
+            applications_total: 1,
+            terms_total: 1,
+            questions_total: 1,
+            commercial_gaps: 1,
+            technical_gaps: 1,
+            commercial_facts: 0,
+            declared: Vec::new(),
+            pages_processed: 2,
+            open_uncertainties: 0,
         }
     }
 
@@ -632,14 +802,8 @@ mod tests {
     #[test]
     fn an_explicit_declaration_satisfies_a_requirement_and_an_empty_array_does_not() {
         let bare = DraftSnapshot {
-            products_total: 1,
-            products_with_summary: 1,
-            applications_total: 1,
             terms_total: 0,
-            questions_total: 1,
-            commercial_gaps: 1,
-            technical_gaps: 1,
-            declared: Vec::new(),
+            ..small()
         };
         assert_eq!(
             evaluate_requirements(&bare).state,
@@ -660,19 +824,164 @@ mod tests {
     #[test]
     fn a_declaration_for_one_topic_does_not_cover_another() {
         let snapshot = DraftSnapshot {
-            products_total: 1,
-            products_with_summary: 1,
-            applications_total: 1,
-            terms_total: 1,
             questions_total: 0,
             commercial_gaps: 0,
-            technical_gaps: 1,
             declared: vec![DeclarationTopic::Questions],
+            ..small()
         };
         let outcome = evaluate_requirements(&snapshot);
         assert_eq!(outcome.state, RequirementsState::Unmet);
         assert_eq!(outcome.missing.len(), 1);
         assert!(outcome.missing[0].starts_with("commercial_unknowns:"));
+    }
+
+    /// The live regression, at the rule that let it through.
+    ///
+    /// A real pass over a technical catalogue reported `requirements = met` with 0 terms,
+    /// 0 applications and 123 unsettled readings, on the strength of five sentences saying
+    /// there was nothing to find. Generic here — the numbers are the shape of the run, not
+    /// a particular partner's.
+    fn declared_everything_over_a_large_material() -> DraftSnapshot {
+        DraftSnapshot {
+            products_total: 31,
+            products_with_summary: 31,
+            applications_total: 0,
+            terms_total: 0,
+            questions_total: 0,
+            commercial_gaps: 0,
+            technical_gaps: 0,
+            commercial_facts: 0,
+            declared: DeclarationTopic::ALL.to_vec(),
+            pages_processed: 44,
+            open_uncertainties: 123,
+        }
+    }
+
+    #[test]
+    fn declaring_every_topic_empty_over_a_large_material_clears_nothing() {
+        let outcome = evaluate_requirements(&declared_everything_over_a_large_material());
+
+        assert_eq!(
+            outcome.state,
+            RequirementsState::Unmet,
+            "five sentences must not clear a forty-four page catalogue: {:?}",
+            outcome.missing
+        );
+        // Every topic that has no rows is named, declaration or not.
+        assert_eq!(outcome.missing.len(), 5, "{:?}", outcome.missing);
+        for topic in [
+            "applications:",
+            "glossary:",
+            "questions:",
+            "commercial_unknowns:",
+            "technical_unknowns:",
+        ] {
+            assert!(
+                outcome.missing.iter().any(|line| line.starts_with(topic)),
+                "{topic} is not named in {:?}",
+                outcome.missing
+            );
+        }
+    }
+
+    /// The refusals say *which* kind of refusal they are, because the two need different
+    /// actions: a contradiction means the draft is wrong, a disproportion means nobody has
+    /// checked yet.
+    #[test]
+    fn a_refused_declaration_explains_itself_rather_than_reading_as_silence() {
+        let outcome = evaluate_requirements(&declared_everything_over_a_large_material());
+        let line = |topic: &str| {
+            outcome
+                .missing
+                .iter()
+                .find(|line| line.starts_with(topic))
+                .unwrap_or_else(|| panic!("{topic} missing from {:?}", outcome.missing))
+                .clone()
+        };
+
+        // Contradicted: the run is holding the very things it says are not there.
+        assert!(line("technical_unknowns:").contains("противоречит"));
+        assert!(line("technical_unknowns:").contains("123"));
+        assert!(line("questions:").contains("противоречит"));
+        // "Nothing commercial is missing" needs something commercial to be present.
+        assert!(line("commercial_unknowns:").contains("коммерческого факта"));
+        // Disproportionate: nobody will re-read 44 pages to disagree with one sentence.
+        assert!(line("glossary:").contains("нужен человек"));
+        assert!(line("applications:").contains("44"));
+        // None of them reads as "nothing was said": something was said and was refused.
+        assert!(!line("glossary:").contains("не сказано"));
+    }
+
+    #[test]
+    fn an_unsettled_reading_is_itself_a_technical_unknown_and_a_question() {
+        // Small enough to be proportionate, so only the contradiction can fail it.
+        let snapshot = DraftSnapshot {
+            questions_total: 0,
+            technical_gaps: 0,
+            open_uncertainties: 1,
+            declared: vec![
+                DeclarationTopic::Questions,
+                DeclarationTopic::TechnicalUnknowns,
+            ],
+            ..small()
+        };
+        let outcome = evaluate_requirements(&snapshot);
+        assert_eq!(outcome.state, RequirementsState::Unmet);
+        assert_eq!(outcome.missing.len(), 2, "{:?}", outcome.missing);
+
+        // …and with nothing unsettled, the same two declarations stand.
+        let settled = DraftSnapshot {
+            open_uncertainties: 0,
+            ..snapshot
+        };
+        assert_eq!(
+            evaluate_requirements(&settled).state,
+            RequirementsState::Met
+        );
+    }
+
+    #[test]
+    fn nothing_commercial_is_missing_only_if_something_commercial_is_stated() {
+        let snapshot = DraftSnapshot {
+            commercial_gaps: 0,
+            commercial_facts: 0,
+            declared: vec![DeclarationTopic::CommercialUnknowns],
+            ..small()
+        };
+        let outcome = evaluate_requirements(&snapshot);
+        assert_eq!(outcome.state, RequirementsState::Unmet);
+        assert!(outcome.missing[0].starts_with("commercial_unknowns:"));
+
+        // The same declaration beside a stated price is an observation, not a dodge.
+        let priced = DraftSnapshot {
+            commercial_facts: 1,
+            ..snapshot
+        };
+        assert_eq!(evaluate_requirements(&priced).state, RequirementsState::Met);
+    }
+
+    /// A small material keeps the escape hatch: the rule limits it, it does not remove it.
+    #[test]
+    fn a_short_material_may_still_say_there_is_none() {
+        let snapshot = DraftSnapshot {
+            terms_total: 0,
+            applications_total: 0,
+            declared: vec![DeclarationTopic::Glossary, DeclarationTopic::Applications],
+            ..small()
+        };
+        assert_eq!(
+            evaluate_requirements(&snapshot).state,
+            RequirementsState::Met
+        );
+
+        // One page more than a person will re-check, and the same sentences defer.
+        let larger = DraftSnapshot {
+            pages_processed: MAX_PAGES_ONE_SENTENCE_MAY_SPEAK_FOR + 1,
+            ..snapshot
+        };
+        let outcome = evaluate_requirements(&larger);
+        assert_eq!(outcome.state, RequirementsState::Unmet);
+        assert_eq!(outcome.missing.len(), 2, "{:?}", outcome.missing);
     }
 
     #[test]

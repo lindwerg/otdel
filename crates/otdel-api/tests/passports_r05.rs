@@ -19,7 +19,9 @@ mod support;
 use std::sync::Arc;
 
 use axum::http::StatusCode;
+use otdel_embed::EmbeddingProvider;
 use otdel_llm::fake::{FakeProvider, FakeReply};
+use otdel_llm::{LlmProvider, UnconfiguredProvider};
 use serde_json::{json, Value};
 use support::{TestApp, TestClient};
 use uuid::Uuid;
@@ -76,6 +78,44 @@ fn second_catalogue() -> Vec<u8> {
                 .text(50.0, 40.0, 7.0, "1/1 basisparts.ru"),
         )
         .build()
+}
+
+/// A multi-page technical document with several products and a table nobody can read.
+///
+/// Generic on purpose: the *shape* is what the live pass had — more pages than a sentence
+/// can answer for, several products, and a load column whose unit is written nowhere — and
+/// nothing here is a particular partner's text.
+fn technical_catalogue() -> Vec<u8> {
+    use otdel_extract::fixtures::{PageBuilder, PdfBuilder};
+    let mut builder = PdfBuilder::new();
+    for page in 1..=6 {
+        builder = builder.page(
+            PageBuilder::new()
+                .text(50.0, 780.0, 18.0, "Mounting systems catalogue")
+                .text(
+                    50.0,
+                    750.0,
+                    11.0,
+                    &format!("Section {page}: profiles and consoles"),
+                )
+                .text(
+                    50.0,
+                    730.0,
+                    11.0,
+                    "Every item ships with mounting hardware.",
+                )
+                // A load table with no unit anywhere: R03 marks the column unreadable and
+                // R05 records one uncertainty per group.
+                .row(
+                    700.0,
+                    &[(50.0, "Profile"), (220.0, "Length"), (400.0, "Load")],
+                )
+                .row(680.0, &[(50.0, "AP10"), (220.0, "1200"), (400.0, "3.5")])
+                .row(660.0, &[(50.0, "AP20"), (220.0, "1500"), (400.0, "4.2")])
+                .text(50.0, 40.0, 7.0, &format!("{page}/6")),
+        );
+    }
+    builder.build()
 }
 
 async fn get(app: &TestApp, client: &TestClient, uri: &str) -> Value {
@@ -145,14 +185,26 @@ fn thin_answer(quote: &str) -> Value {
     })
 }
 
-/// The same draft, with every absence stated in words instead of left as an empty array.
+/// The same draft, with every absence answered instead of left as an empty array.
+///
+/// Note what is *not* declared. «Коммерческих неизвестных нет» is unavailable to this
+/// material: saying nothing commercial is missing requires that something commercial is
+/// present, and this draft states no price. The honest answer there is a gap, so the
+/// fixture records one — which is the shape the rule is meant to push a run into.
 fn declared_answer(quote: &str) -> Value {
     let mut answer = thin_answer(quote);
+    answer["gaps"] = json!([{
+        "product_ref": "p1", "topic": "цена",
+        "missing": "цена в материале не указана",
+        "blocks": "коммерческое предложение",
+        "question": "Какая отпускная цена?",
+        "audience": "partner", "nature": "commercial",
+    }]);
     answer["declarations"] = json!({
         "glossary": "каталог не вводит терминов, требующих пояснения",
-        "questions": "по этому листу спрашивать нечего: он перечисляет обозначения",
+        "questions": null,
         "applications": "лист не описывает задач применения, только обозначения",
-        "commercial_unknowns": "коммерческих сведений на листе нет и не подразумевается",
+        "commercial_unknowns": null,
         "technical_unknowns": "технических величин на листе нет",
     });
     answer
@@ -361,8 +413,11 @@ async fn a_draft_of_products_and_nothing_else_is_not_success_until_the_absences_
 
     // The statements themselves are on the record, in the run's own words, and a person
     // can disagree with them. A flag could not have been disagreed with.
+    // Three, not five. `questions` and `commercial_unknowns` are answered by rows —
+    // a prepared question and a commercial gap — and the run is right not to claim in
+    // words what it can show with records.
     let declarations = declared["declarations"].as_array().unwrap();
-    assert_eq!(declarations.len(), 5, "{declarations:?}");
+    assert_eq!(declarations.len(), 3, "{declarations:?}");
     let glossary = declarations
         .iter()
         .find(|item| item["topic"] == "glossary")
@@ -598,6 +653,206 @@ async fn a_run_stopped_by_its_budget_names_the_pages_it_left_and_is_never_comple
     );
 }
 
+// --- the live regression -------------------------------------------------------------------
+
+/// The defect a live pass found, reproduced end to end and then made unreportable.
+///
+/// A real run over a multi-page technical catalogue came back `coverage = complete`,
+/// `requirements = met` with **0 terms, 0 applications and 123 unsettled readings** — and
+/// a published version was built from it. It passed because the declaration escape hatch
+/// was unconditional: the model said "there is none" about all five topics and every
+/// requirement cleared. The audited failure had simply moved. Instead of an empty array
+/// passing silently, a self-serving sentence passed it.
+///
+/// Two things have to hold now, and this test asserts both against the same run:
+///
+/// 1. the requirement check refuses those declarations and names each topic, so an empty
+///    glossary and an empty application map are reported rather than cleared;
+/// 2. nothing publishes itself from a partner in that state.
+#[tokio::test]
+async fn declaring_every_topic_empty_over_a_real_catalogue_neither_passes_nor_publishes() {
+    // The suite's default upload limit is a few kilobytes; a six-page document is the
+    // point of this test, so it gets room for one.
+    let app = TestApp::start_with_env(std::collections::BTreeMap::from([(
+        "OTDEL_MAX_UPLOAD_BYTES".to_owned(),
+        "262144".to_owned(),
+    )]))
+    .await;
+    let client = app.sign_in().await;
+    let partner = app.create_partner(&client, "Партнёр").await;
+
+    let response = app
+        .send(client.upload_request(
+            &format!("/api/partners/{partner}/materials"),
+            "technical.pdf",
+            Some("application/pdf"),
+            &technical_catalogue(),
+        ))
+        .await;
+    assert_eq!(response.status, StatusCode::CREATED, "{}", response.text());
+    app.run_worker(&app.extractor()).await;
+
+    let quote = quotable(
+        &page_text(
+            &app,
+            &client,
+            partner,
+            Uuid::parse_str(response.json()["id"].as_str().unwrap()).unwrap(),
+        )
+        .await,
+    );
+    let word = word_from(&quote);
+
+    // Exactly the live answer's shape: several products, a fact or two, and every topic
+    // waved away in words. One reply per page — the run is not budget-limited here, so
+    // the *only* thing standing between this draft and "met" is the declaration rule.
+    let answer = json!({
+        "categories": [],
+        "products": (1..=4).map(|n| json!({
+            "ref": format!("p{n}"), "category_ref": null, "kind": "product",
+            "name": format!("AP{n}0"), "summary": "профиль монтажный", "aliases": [],
+        })).collect::<Vec<_>>(),
+        "facts": [{
+            "product_ref": "p1", "kind": "characteristic",
+            "attribute": "обозначение", "value": word,
+            "unit": null, "conditions": null, "model_context": null,
+            "evidence": [{"source": "S1", "quote": quote}],
+        }],
+        "glossary": [],
+        "qa": [],
+        "gaps": [],
+        "applications": [],
+        "declarations": {
+            "glossary": "каталог не вводит терминов",
+            "questions": "спрашивать нечего",
+            "applications": "задач применения материал не описывает",
+            "commercial_unknowns": "коммерческих неизвестных не осталось",
+            "technical_unknowns": "технических неизвестных не осталось",
+        },
+    });
+
+    let replies: Vec<Value> = (0..6).map(|_| answer.clone()).collect();
+    let report = app
+        .run_knowledge(&app.knowledge_worker(scripted(replies)))
+        .await;
+    assert_eq!(report.jobs_completed, 1);
+    assert_eq!(
+        report.runs_below_requirements, 1,
+        "the pass itself must report that this draft is not publishable"
+    );
+
+    // --- 1. the requirement check --------------------------------------------------
+    let coverage = coverage_of(&app, &client, partner).await;
+    // The pages really were all read: this is not a coverage failure, and reporting it as
+    // one would send the owner looking in the wrong place.
+    assert_eq!(coverage["state"], "complete");
+    assert_eq!(coverage["pages_processed"], coverage["pages_total"]);
+    assert_eq!(
+        coverage["requirements"], "unmet",
+        "five sentences must not clear a six-page catalogue: {coverage}"
+    );
+    assert_eq!(coverage["allows_automatic_publication"], false);
+
+    let missing: Vec<String> = coverage["requirements_missing"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line.as_str().unwrap().to_owned())
+        .collect();
+    // The two the owner called out by name, plus the rest, each under its own topic.
+    for topic in [
+        "glossary:",
+        "applications:",
+        "questions:",
+        "commercial_unknowns:",
+        "technical_unknowns:",
+    ] {
+        assert!(
+            missing.iter().any(|line| line.starts_with(topic)),
+            "{topic} is not named in {missing:?}"
+        );
+    }
+    // The refusals explain themselves rather than reading as "nothing was said": a
+    // declaration *was* made and was not good enough, which is a different instruction
+    // to the owner.
+    assert!(
+        missing.iter().any(|line| line.contains("нужен человек")),
+        "{missing:?}"
+    );
+    assert!(
+        missing.iter().any(|line| line.contains("противоречит")),
+        "the unsettled readings contradict the declarations: {missing:?}"
+    );
+
+    // The uncertainties the contradiction rests on are real and visible.
+    let unknowns = get(
+        &app,
+        &client,
+        &format!("/api/partners/{partner}/uncertainties"),
+    )
+    .await;
+    assert!(
+        !unknowns["items"].as_array().unwrap().is_empty(),
+        "the table with no unit must leave something unsettled"
+    );
+
+    // --- 2. the publication gate ----------------------------------------------------
+    // The understanding worker queues a check automatically; run it.
+    // No model and no embedding adapter: the deterministic check alone is enough to
+    // publish, so nothing here weakens the case — if this partner published, it would be
+    // on the strength of the rules and not of a missing dependency.
+    let llm: Arc<dyn LlmProvider> = Arc::new(UnconfiguredProvider::new(
+        &otdel_core::llm_config::LlmSettings::default(),
+    ));
+    let embeddings: Arc<dyn EmbeddingProvider> =
+        otdel_embed::build_provider(&otdel_core::retrieval_config::EmbeddingSettings::default());
+    let validation = app
+        .run_validation(&app.validation_worker(llm, embeddings))
+        .await;
+    assert_eq!(validation.jobs_completed, 1);
+    assert_eq!(
+        validation.versions_published, 0,
+        "a partner whose passports are incomplete does not publish itself"
+    );
+    assert_eq!(validation.versions_blocked, 1);
+
+    let published = get(&app, &client, &format!("/api/partners/{partner}/versions")).await;
+    let live: Vec<&Value> = published["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|version| version["status"] == "published")
+        .collect();
+    assert!(live.is_empty(), "nothing was published: {published}");
+
+    // The blocked snapshot says why, in the owner's terms, naming the material.
+    let blocked = published["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|version| version["status"] == "blocked")
+        .expect("the snapshot is kept and marked, never discarded");
+    let reasons: Vec<String> = blocked["blocked_reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line.as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        reasons.iter().any(|line| line.contains("паспорт собран")),
+        "{reasons:?}"
+    );
+    assert!(
+        reasons.iter().any(|line| line.contains("technical.pdf")),
+        "{reasons:?}"
+    );
+
+    // Preserved: the partial draft is still there to look at. Blocking publication is not
+    // throwing the work away.
+    let passports = get(&app, &client, &format!("/api/partners/{partner}/passports")).await;
+    assert_eq!(passports["items"].as_array().unwrap().len(), 4);
+}
+
 /// Re-queueing a material drops what the previous pass said about *itself*.
 ///
 /// The run row survives a re-queue, so its page account, its unsettled readings and its
@@ -617,7 +872,7 @@ async fn re_queueing_a_material_leaves_no_claim_from_the_previous_pass() {
     app.run_knowledge(&app.knowledge_worker(provider)).await;
 
     let settled = coverage_of(&app, &client, partner).await;
-    assert_eq!(settled["declarations"].as_array().unwrap().len(), 5);
+    assert_eq!(settled["declarations"].as_array().unwrap().len(), 3);
     assert_eq!(settled["pages"].as_array().unwrap().len(), 1);
 
     // Queue it again and look before the worker runs.

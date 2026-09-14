@@ -33,8 +33,8 @@ use otdel_db::{
 };
 use otdel_knowledge::{
     draft_knowledge, evaluate_requirements, tables, CoveragePlan, DraftLimits, KnowledgeError,
-    PromptContext, SourceCatalog, SourcePage, StructuredCell, TableContext, TableReading,
-    PROMPT_PROFILE,
+    PromptContext, RunContext, SourceCatalog, SourcePage, StructuredCell, TableContext,
+    TableReading, PROMPT_PROFILE,
 };
 use otdel_llm::{LlmProvider, ProviderDescription};
 use tracing::{info, warn};
@@ -373,12 +373,21 @@ impl KnowledgeWorker {
         // draft that has not been stored yet.
         plan.settle(&drafted.processed, &drafted.deferred);
         let mut coverage = plan.summarise();
-        let requirements = evaluate_requirements(&drafted.draft.snapshot());
-        coverage.requirements = requirements.state;
-        coverage.requirements_missing = requirements.missing.clone();
-
         let new_draft = to_new_draft(&drafted.draft, &structured);
         let uncertainties = collect_uncertainties(&readings, &plan);
+
+        // The requirement check is given the run's own scale and its unsettled readings,
+        // not just the candidates. Both decide whether a declaration of absence may stand:
+        // a live pass over a 44-page catalogue came back `met` on the strength of five
+        // sentences saying there was nothing to find, while holding 123 readings it could
+        // not settle. Those 123 are the counter-evidence, and this is where it arrives.
+        let context = RunContext {
+            pages_processed: usize::try_from(coverage.pages_processed).unwrap_or(0),
+            open_uncertainties: uncertainties.len(),
+        };
+        let requirements = evaluate_requirements(&drafted.draft.snapshot(context));
+        coverage.requirements = requirements.state;
+        coverage.requirements_missing = requirements.missing.clone();
 
         let mut tx = self.db.begin_scoped(bureau_id).await?;
         let still_ours = jobs::heartbeat(

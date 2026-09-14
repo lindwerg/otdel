@@ -13,12 +13,22 @@
 //! it is automatic precisely *because* the rules are mechanical. A version that fails
 //! them is not discarded and not quietly published either: it is stored as `blocked`,
 //! with the rules it failed in words, which is what "честно остаются неполными" means.
+//!
+//! R05 added a rule before all of them: a partner whose materials are knowingly short of
+//! what a passport needs does not publish *itself*. Automatic publication was always
+//! conditional on the rules being able to see everything that matters, and until R05 they
+//! could not see whether the draft underneath them was complete.
 
+use otdel_core::passport::RequirementsState;
 use otdel_core::publication::{ReadinessEntry, ReadinessState};
 use sha2::{Digest, Sha256};
 
 use crate::chunk::normalise;
 use crate::claim::{CandidateClaim, CheckedClaim};
+
+/// Upper bound on the per-material shortfall lines one blocked decision may carry. A
+/// partner with forty materials must not turn one refusal into four hundred lines.
+const MAX_SHORTFALL_LINES: usize = 20;
 
 /// Fingerprint of the candidate set a version was built from.
 ///
@@ -128,17 +138,89 @@ pub enum PublicationDecision {
     Unchanged,
 }
 
+/// What R05 concluded about one material this partner's knowledge is drawn from.
+///
+/// Only the verdict travels here, never the counters: the publication rules ask one
+/// question — "has a person still got to look at this material?" — and a rule that could
+/// see page counts would eventually start weighing them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceReadiness {
+    pub material_filename: String,
+    pub requirements: RequirementsState,
+    /// `name: explanation` lines from the run, shown as-is.
+    pub missing: Vec<String>,
+}
+
+impl SourceReadiness {
+    /// Whether this material is knowingly short of what a passport needs.
+    ///
+    /// `Unknown` is **not** included, and that asymmetry is deliberate: it means the run
+    /// predates the requirement check or never got as far as making it, and blocking on it
+    /// would stop every partner drafted before R05 from ever publishing again. Blocking on
+    /// `Unmet` is blocking on a judgement somebody actually made.
+    fn needs_a_person(&self) -> bool {
+        self.requirements == RequirementsState::Unmet
+    }
+}
+
 /// Decide whether this snapshot may be published.
 ///
 /// `published_fingerprint` is the fingerprint of the version currently published for
-/// this partner, when there is one.
+/// this partner, when there is one. `sources` carries R05's verdict on each material the
+/// candidates came from.
 pub fn decide(
     claims: &[CheckedClaim],
     readiness: &[ReadinessEntry],
+    sources: &[SourceReadiness],
     fingerprint_now: &str,
     published_fingerprint: Option<&str>,
 ) -> PublicationDecision {
     let mut reasons: Vec<String> = Vec::new();
+
+    // Rule 0 — a material whose passport is knowingly incomplete does not publish itself.
+    //
+    // This rule exists because of a live pass that had every other rule's blessing: the
+    // claims were supported, the readiness topics answered, and a version was built and
+    // published from a catalogue whose own run recorded 0 terms, 0 applications and 123
+    // readings it could not settle. `allows_automatic_publication` said no and nothing
+    // consulted it. It does now, and it is checked *first*, so a partner is told the real
+    // reason rather than one of the downstream ones.
+    //
+    // What this does not do: unpublish, replace or retract. A blocked decision leaves the
+    // version that is already current exactly where it is — the owner keeps yesterday's
+    // published answer while today's draft waits for them.
+    let unready: Vec<&SourceReadiness> = sources
+        .iter()
+        .filter(|source| source.needs_a_person())
+        .collect();
+    if !unready.is_empty() {
+        let named: Vec<String> = unready
+            .iter()
+            .map(|source| format!("«{}»", source.material_filename))
+            .collect();
+        reasons.push(format!(
+            "автоматическая публикация остановлена: у {} из {} материалов паспорт собран \
+             не полностью ({}). Это не ошибка разбора — по этим материалам осталось то, \
+             что должен посмотреть человек; уже опубликованная версия не тронута",
+            unready.len(),
+            sources.len(),
+            named.join(", ")
+        ));
+        // The named shortfalls, so the owner sees what to fix rather than only that
+        // something is unfixed. Bounded: a partner with forty materials must not turn
+        // one blocked decision into four hundred lines.
+        reasons.extend(
+            unready
+                .iter()
+                .flat_map(|source| {
+                    source
+                        .missing
+                        .iter()
+                        .map(|line| format!("{}: {line}", source.material_filename))
+                })
+                .take(MAX_SHORTFALL_LINES),
+        );
+    }
 
     // Rule 1 — something has to be supported. A version made entirely of hypotheses,
     // contradictions and unreadable sources would answer nothing and would still look
@@ -226,6 +308,109 @@ mod tests {
             state: ReadinessState::Ready,
             reason: "ok".to_owned(),
         }]
+    }
+
+    fn source(requirements: RequirementsState, missing: &[&str]) -> SourceReadiness {
+        SourceReadiness {
+            material_filename: "catalogue.pdf".to_owned(),
+            requirements,
+            missing: missing.iter().map(|line| (*line).to_owned()).collect(),
+        }
+    }
+
+    /// A partner whose materials R05 judged complete — the precondition every rule below
+    /// rule 0 was written against.
+    fn ready_sources() -> Vec<SourceReadiness> {
+        vec![source(RequirementsState::Met, &[])]
+    }
+
+    #[test]
+    fn a_material_whose_passport_is_incomplete_stops_automatic_publication() {
+        let claims = vec![claim(1, "3.5", ClaimStatus::SourceSupported)];
+        let decision = decide(
+            &claims,
+            &ready(),
+            &[source(
+                RequirementsState::Unmet,
+                &["glossary: заявление не принято", "applications: нет задач"],
+            )],
+            "aa",
+            None,
+        );
+
+        match decision {
+            PublicationDecision::Blocked { reasons } => {
+                // The real reason first, not one of the downstream ones.
+                assert!(reasons[0].contains("паспорт собран"), "{reasons:?}");
+                assert!(reasons[0].contains("catalogue.pdf"), "{reasons:?}");
+                // …and the named shortfalls, so the owner sees what to fix.
+                assert!(
+                    reasons.iter().any(|line| line.contains("glossary:")),
+                    "{reasons:?}"
+                );
+                // Stated in the refusal itself: nothing already published is touched.
+                assert!(reasons[0].contains("не тронута"), "{reasons:?}");
+            }
+            other => panic!("an incomplete passport must not publish itself: {other:?}"),
+        }
+    }
+
+    /// A run nobody judged is not a run that failed.
+    ///
+    /// `unknown` means the pass predates the requirement check or never got as far as
+    /// making it. Blocking on it would stop every partner drafted before R05 from ever
+    /// publishing again, which is a different defect from the one this rule fixes.
+    #[test]
+    fn a_material_nobody_judged_does_not_block_publication() {
+        let claims = vec![claim(1, "3.5", ClaimStatus::SourceSupported)];
+        assert_eq!(
+            decide(
+                &claims,
+                &ready(),
+                &[source(RequirementsState::Unknown, &[])],
+                "aa",
+                None
+            ),
+            PublicationDecision::Publish
+        );
+    }
+
+    /// One incomplete material among several is enough: a partner's published version
+    /// answers as one body of knowledge, and half of it waiting on a person is not a
+    /// state worth publishing around.
+    #[test]
+    fn one_incomplete_material_blocks_even_beside_complete_ones() {
+        let claims = vec![claim(1, "3.5", ClaimStatus::SourceSupported)];
+        let sources = vec![
+            source(RequirementsState::Met, &[]),
+            SourceReadiness {
+                material_filename: "presentation.pdf".to_owned(),
+                requirements: RequirementsState::Unmet,
+                missing: vec!["applications: нет задач применения".to_owned()],
+            },
+        ];
+        match decide(&claims, &ready(), &sources, "aa", None) {
+            PublicationDecision::Blocked { reasons } => {
+                assert!(reasons[0].contains("1 из 2"), "{reasons:?}");
+                assert!(reasons[0].contains("presentation.pdf"), "{reasons:?}");
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+
+    /// Rule 0 runs before rule 3, so a partner who is blocked is told they are blocked
+    /// rather than told nothing has changed.
+    #[test]
+    fn an_incomplete_passport_is_reported_as_blocked_and_not_as_unchanged() {
+        let claims = vec![claim(1, "3.5", ClaimStatus::SourceSupported)];
+        let decision = decide(
+            &claims,
+            &ready(),
+            &[source(RequirementsState::Unmet, &[])],
+            "aa",
+            Some("aa"),
+        );
+        assert!(matches!(decision, PublicationDecision::Blocked { .. }));
     }
 
     #[test]
@@ -330,7 +515,7 @@ mod tests {
     #[test]
     fn a_snapshot_with_nothing_supported_is_blocked_and_says_why() {
         let claims = vec![claim(1, "3.5", ClaimStatus::Hypothesis)];
-        let decision = decide(&claims, &ready(), "aa", None);
+        let decision = decide(&claims, &ready(), &ready_sources(), "aa", None);
         let PublicationDecision::Blocked { reasons } = decision else {
             panic!("a version with nothing supported must not publish");
         };
@@ -349,7 +534,7 @@ mod tests {
             reason: "нет".to_owned(),
         }];
         assert!(matches!(
-            decide(&claims, &blocked, "aa", None),
+            decide(&claims, &blocked, &ready_sources(), "aa", None),
             PublicationDecision::Blocked { .. }
         ));
     }
@@ -358,7 +543,7 @@ mod tests {
     fn a_supported_snapshot_publishes_without_anybody_pressing_anything() {
         let claims = vec![claim(1, "3.5", ClaimStatus::SourceSupported)];
         assert_eq!(
-            decide(&claims, &ready(), "aa", None),
+            decide(&claims, &ready(), &ready_sources(), "aa", None),
             PublicationDecision::Publish
         );
     }
@@ -369,11 +554,11 @@ mod tests {
         // a second published result.
         let claims = vec![claim(1, "3.5", ClaimStatus::SourceSupported)];
         assert_eq!(
-            decide(&claims, &ready(), "aa", Some("aa")),
+            decide(&claims, &ready(), &ready_sources(), "aa", Some("aa")),
             PublicationDecision::Unchanged
         );
         assert_eq!(
-            decide(&claims, &ready(), "bb", Some("aa")),
+            decide(&claims, &ready(), &ready_sources(), "bb", Some("aa")),
             PublicationDecision::Publish
         );
     }
@@ -384,7 +569,7 @@ mod tests {
         // failed the rules, and would never learn which rule.
         let claims = vec![claim(1, "3.5", ClaimStatus::Unknown)];
         assert!(matches!(
-            decide(&claims, &ready(), "aa", Some("aa")),
+            decide(&claims, &ready(), &ready_sources(), "aa", Some("aa")),
             PublicationDecision::Blocked { .. }
         ));
     }

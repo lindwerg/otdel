@@ -407,7 +407,9 @@ export interface ResearchLimits {
  *
  * Present only for the OpenRouter adapter — it is the one whose price depends on a
  * choice. `configured` is what the owner wrote; `effective` is what will really
- * run, because `auto` is not a mystery: for a model with no built-in search it
+ * run. An engine named explicitly resolves to itself: `perplexity` stays
+ * `perplexity`, and never becomes Exa behind the owner's back. Only `auto` is
+ * resolved to something else, because for a model with no built-in search it
  * means Exa, and the tariff follows.
  *
  * Every amount here is the **declared** tariff. What the ledger finally records is
@@ -418,10 +420,26 @@ export interface ResearchEngineState {
   effective: string
   /** `auto` fell back to Exa because the model cannot search by itself. */
   exa_fallback: boolean
+  /** The model that reads the results. A separate choice from the engine that finds them. */
   model: string
   max_results: number
   max_total_results_per_plan: number
-  /** One search call: the engine tariff plus the model tokens it spends. */
+  /**
+   * How many times one request may run the search tool.
+   *
+   * Not the same bound as the result count, and the difference is what money
+   * follows: one search returning three links is one charge, three searches
+   * returning one link each are three.
+   */
+  max_uses_per_request: number
+  /** Characters asked of each result — a bound on tokens, not a source of text. */
+  max_characters_per_result: number
+  /**
+   * Domains the search itself is restricted to. Empty when the owner did not ask
+   * for the filter; the reading allowlist applies either way.
+   */
+  search_domains: string[]
+  /** One search request: the engine tariff × permitted searches, plus model tokens. */
   forecast_micros: number
   search_base_micros: number
   included_results: number

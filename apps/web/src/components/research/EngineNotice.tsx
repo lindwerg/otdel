@@ -10,17 +10,24 @@ interface EngineNoticeProps {
 function tariffLine(engine: ResearchEngineState, currency: string): string {
   const base = formatMicros(engine.search_base_micros, currency)
   const tokens = formatMicros(engine.token_allowance_micros, currency)
+  // A request may run the tool more than once, and every run is charged, so the
+  // forecast says so out loud rather than letting the per-search price read as
+  // the price of the request.
+  const uses =
+    engine.max_uses_per_request > 1
+      ? ` До ${engine.max_uses_per_request} поисков в одном запросе — каждый оплачивается отдельно.`
+      : ' Один поиск на запрос: больше провайдер не выполнит.'
 
   if (engine.search_base_micros === 0) {
-    return `Поиск тарифицируется самим провайдером модели, отдельной цены за запрос нет; заложено ${tokens} на токены.`
+    return `Поиск тарифицируется самим провайдером модели, отдельной цены за запрос нет; заложено ${tokens} на токены.${uses}`
   }
   if (engine.extra_result_micros === 0) {
-    return `${base} за запрос независимо от числа результатов, плюс ${tokens} на токены модели.`
+    return `${base} за поиск независимо от числа результатов, плюс ${tokens} на токены модели.${uses}`
   }
   return (
-    `${base} за запрос, включая ${engine.included_results} результатов; ` +
+    `${base} за поиск, включая ${engine.included_results} результатов; ` +
     `каждый следующий — ${formatMicros(engine.extra_result_micros, currency)}. ` +
-    `Плюс ${tokens} на токены модели.`
+    `Плюс ${tokens} на токены модели.${uses}`
   )
 }
 
@@ -31,12 +38,17 @@ function tariffLine(engine: ResearchEngineState, currency: string): string {
  * owner should be able to answer without starting a plan and reading an invoice
  * afterwards.
  *
- * Two things it refuses to be vague about.
+ * Three things it refuses to be vague about.
  *
  * `auto` is resolved, not repeated. OpenRouter picks the model's own search when
  * the model has one and Exa when it does not, so for `openai/gpt-4o-mini` the
  * honest label is Exa and the honest price is Exa's — saying "auto" and leaving it
- * there would hide a real 0,007 USD per request behind a word.
+ * there would hide a real 0,007 USD per request behind a word. An engine chosen
+ * explicitly, such as `perplexity`, is shown as itself and never as something it
+ * might silently become.
+ *
+ * The number of *searches* is stated, not only the number of results. They are
+ * different bounds and only one of them is what the bill counts.
  *
  * And the forecast is labelled a forecast. The ledger records what the provider
  * reported charging, which is a different number, and the two are never shown as
@@ -73,10 +85,21 @@ export function EngineNotice({ engine, currency }: EngineNoticeProps) {
           </dd>
         </div>
         <div>
-          <dt>прогноз на один поиск</dt>
+          <dt>поисков на запрос</dt>
+          <dd>{engine.max_uses_per_request}</dd>
+        </div>
+        <div>
+          <dt>прогноз на один запрос</dt>
           <dd>{formatMicros(engine.forecast_micros, currency)}</dd>
         </div>
       </dl>
+
+      {engine.search_domains.length > 0 ? (
+        <p className="engine__domains">
+          Поиск ограничен доменами: {engine.search_domains.join(', ')}. Это сужает выдачу
+          движка; список разрешённых для чтения источников действует в любом случае.
+        </p>
+      ) : null}
 
       {engine.exa_fallback ? (
         <p className="engine__fallback" role="status">
@@ -87,8 +110,10 @@ export function EngineNotice({ engine, currency }: EngineNoticeProps) {
       ) : null}
 
       <p className="engine__footnote">
-        {tariffLine(engine, currency)} Это прогноз по объявленному тарифу: в журнал
-        записывается сумма, о которой отчитался провайдер, если он её сообщает.
+        {tariffLine(engine, currency)} Это прогноз по объявленному тарифу — цене из
+        документации провайдера, которая для этого движка ещё не сверялась с реальным
+        счётом. В журнал записывается сумма, о которой отчитался провайдер, если он её
+        сообщает.
         {engine.api_key_inherited
           ? ' Ключ взят из OTDEL_LLM_API_KEY — расходует тот же счёт, что и разбор материалов.'
           : ''}

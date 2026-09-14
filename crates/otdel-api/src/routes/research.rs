@@ -71,17 +71,31 @@ pub struct ResearchLimitsView {
 /// is whatever the provider reports having charged.
 #[derive(Debug, Serialize)]
 pub struct SearchEngineView {
-    /// As configured: `auto`, `exa`, `parallel` or `native`.
+    /// As configured: `auto`, `exa`, `parallel`, `perplexity` or `native`.
     pub configured: String,
-    /// What `auto` resolves to. For a model without built-in search this is `exa`.
+    /// What will really run. An engine named explicitly resolves to itself — there is no
+    /// path from `perplexity` to Exa. Only `auto` resolves to something else, and for a
+    /// model without built-in search that is `exa`.
     pub effective: String,
     /// `true` when `auto` had to fall back to Exa because the model cannot search itself.
+    /// Always `false` for an explicitly chosen engine.
     pub exa_fallback: bool,
-    /// Model that runs the tool. Its tokens are part of the bill.
+    /// Model that runs the tool. Its tokens are part of the bill. A *separate* setting
+    /// from the engine: the engine searches, the model reads what it found.
     pub model: String,
     pub max_results: u32,
     pub max_total_results_per_plan: u32,
-    /// Forecast for one search call: the engine tariff plus the token allowance.
+    /// How many times one request may run the search tool. A result count bounds one
+    /// search; this bounds the number of searches, and each one is charged.
+    pub max_uses_per_request: u32,
+    /// Characters of each result the tool is asked for — a bound on model tokens, not a
+    /// source of text.
+    pub max_characters_per_result: u32,
+    /// Domains the search itself is restricted to, empty when the owner did not ask for
+    /// the filter. The reading allowlist applies in either case.
+    pub search_domains: Vec<String>,
+    /// Forecast for one search request: the engine tariff, multiplied by the permitted
+    /// number of searches, plus the token allowance.
     pub forecast_micros: u64,
     pub search_base_micros: u64,
     pub included_results: u32,
@@ -456,6 +470,9 @@ fn describe_research(state: &AppState) -> ResearchProviderResponse {
             model: openrouter.model.clone(),
             max_results: openrouter.max_results,
             max_total_results_per_plan: openrouter.max_total_results_per_plan,
+            max_uses_per_request: openrouter.max_uses_per_request,
+            max_characters_per_result: openrouter.max_characters_per_result,
+            search_domains: openrouter.domain_filter(&research.allowed_hosts),
             forecast_micros: openrouter.forecast_micros(),
             search_base_micros: openrouter.base_micros,
             included_results: openrouter.included_results,

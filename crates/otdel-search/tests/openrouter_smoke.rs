@@ -1,4 +1,4 @@
-//! One real call to OpenRouter, run by hand and never by CI.
+//! One real call to OpenRouter's Perplexity search, run by hand and never by CI.
 //!
 //! Everything else in this repository is tested without a network. This file exists
 //! because one question cannot be answered that way: *does the request we build actually
@@ -14,16 +14,24 @@
 //! cargo test -p otdel-search --test openrouter_smoke -- --ignored --nocapture
 //! ```
 //!
+//! **Bounds this run holds itself to.** One request. `engine=perplexity`, asserted on the
+//! wire rather than assumed. `max_uses=1`, so the request may run the search tool exactly
+//! once — a result count alone would not stop a model from searching repeatedly, and each
+//! search is a separate charge. Three results. `max_characters` bounded. At OpenRouter's
+//! published Perplexity price of $0.005 per search plus the tokens of a small model, one
+//! run is worth well under a cent, and the test prints the reported figure rather than
+//! asserting the forecast was right.
+//!
 //! What it deliberately does **not** do: it does not fetch any page it finds, does not
-//! store anything, does not touch the database, and does not publish. It asks for three
-//! results on a neutral industry question — no partner is named, because no partner is
-//! involved — and prints the public URLs and a short excerpt so a human can see that the
-//! links are real. The key is never printed, never logged and never put in a URL.
+//! store anything, does not touch the database, and does not publish. It asks a neutral
+//! industry question about a published standard — no partner is named, because no partner
+//! is involved — and prints the public URLs and a short excerpt so a human can see that
+//! the links are real. The key is never printed, never logged and never put in a URL.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use otdel_core::research_config::ResearchSettings;
+use otdel_core::research_config::{ResearchSettings, SearchEngine};
 use otdel_search::{SearchProvider, SearchRequest};
 
 /// A question about a published standard. It names no company and no product.
@@ -38,6 +46,9 @@ fn settings_from_environment() -> ResearchSettings {
         "OTDEL_RESEARCH_ALLOWED_HOSTS",
         "OTDEL_RESEARCH_OPENROUTER_ENGINE",
         "OTDEL_RESEARCH_OPENROUTER_MAX_RESULTS",
+        "OTDEL_RESEARCH_OPENROUTER_MAX_USES",
+        "OTDEL_RESEARCH_OPENROUTER_MAX_CHARACTERS",
+        "OTDEL_RESEARCH_OPENROUTER_DOMAIN_FILTER",
     ] {
         if let Ok(value) = std::env::var(name) {
             source.insert(name.to_owned(), value);
@@ -47,9 +58,22 @@ fn settings_from_environment() -> ResearchSettings {
         "OTDEL_RESEARCH_PROVIDER".to_owned(),
         "openrouter".to_owned(),
     );
+    // The engine this installation chose. Set here rather than left to the environment so
+    // that a forgotten variable cannot turn a Perplexity acceptance run into an Exa one.
+    source.insert(
+        "OTDEL_RESEARCH_OPENROUTER_ENGINE".to_owned(),
+        "perplexity".to_owned(),
+    );
     // Three results, which is the smallest number that still shows a list.
     source
         .entry("OTDEL_RESEARCH_OPENROUTER_MAX_RESULTS".to_owned())
+        .or_insert_with(|| "3".to_owned());
+    // One search per request, on the provider's side.
+    source
+        .entry("OTDEL_RESEARCH_OPENROUTER_MAX_USES".to_owned())
+        .or_insert_with(|| "1".to_owned());
+    source
+        .entry("OTDEL_RESEARCH_OPENROUTER_MAX_TOTAL_RESULTS".to_owned())
         .or_insert_with(|| "3".to_owned());
 
     ResearchSettings::load(&source).expect("the smoke configuration must be valid")
@@ -57,7 +81,7 @@ fn settings_from_environment() -> ResearchSettings {
 
 #[tokio::test]
 #[ignore = "makes one real, paid request to OpenRouter; run by hand with a key present"]
-async fn one_real_bounded_search_against_openrouter() {
+async fn one_real_bounded_perplexity_search_against_openrouter() {
     let settings = settings_from_environment();
     let availability = settings.availability();
     assert!(
@@ -67,14 +91,24 @@ async fn one_real_bounded_search_against_openrouter() {
     );
 
     let engine = settings.openrouter.effective_engine();
+    assert_eq!(
+        engine,
+        SearchEngine::Perplexity,
+        "this acceptance run is about Perplexity; any other engine is a different bill"
+    );
+    assert_eq!(settings.openrouter.max_uses_per_request, 1);
+
     println!(
-        "engine={} (configured {}, exa fallback: {}), model={}, max_results={}, forecast={} micros",
+        "engine={} (configured {}), model={}, max_results={}, max_uses={}, max_characters={}, \
+         forecast={} micros ({})",
         engine.as_str(),
         settings.openrouter.engine.as_str(),
-        settings.openrouter.is_exa_fallback(),
         settings.openrouter.model,
         settings.openrouter.max_results,
+        settings.openrouter.max_uses_per_request,
+        settings.openrouter.max_characters_per_result,
         settings.openrouter.forecast_micros(),
+        settings.costs.currency,
     );
 
     let provider: Arc<dyn SearchProvider> = otdel_search::build_search_provider(&settings);
@@ -92,9 +126,15 @@ async fn one_real_bounded_search_against_openrouter() {
         .await
         .expect("the live search must succeed");
 
+    // Requested and observed are printed as two separate facts. A provider that does not
+    // name the engine it used leaves `observed_engine` empty, and that is reported as
+    // "не сообщён" rather than quietly echoing what we asked for.
     println!(
-        "hits={} duration_ms={} reported_micros={:?} prompt_tokens={:?} completion_tokens={:?} \
-         web_search_requests={:?}",
+        "request_id={:?} requested_engine={:?} observed_engine={:?} hits={} duration_ms={} \
+         reported_micros={:?} prompt_tokens={:?} completion_tokens={:?} web_search_requests={:?}",
+        answer.billing.request_id,
+        answer.billing.engine,
+        answer.billing.observed_engine,
         answer.hits.len(),
         answer.duration.as_millis(),
         answer.billing.reported_micros,
@@ -128,10 +168,30 @@ async fn one_real_bounded_search_against_openrouter() {
             hit.url
         );
     }
+
+    // The call ceiling is the point of `max_uses`: if the provider reports having searched
+    // more than once, the bound did not hold and the forecast was wrong by that factor.
+    if let Some(searches) = answer.billing.search_requests {
+        assert!(
+            searches <= settings.openrouter.max_uses_per_request,
+            "max_uses={} was sent, but the provider reports {searches} searches",
+            settings.openrouter.max_uses_per_request,
+        );
+    }
+
     // The point of the accounting half: a real call reports a real price.
     assert!(
         answer.billing.reported_micros.is_some(),
         "OpenRouter reports `usage.cost`; if this ever stops being true the ledger \
          silently falls back to the declared tariff and the owner should know"
+    );
+    assert_eq!(
+        answer.billing.engine.as_deref(),
+        Some("perplexity"),
+        "the adapter must report the engine it asked for"
+    );
+    assert!(
+        !answer.billing.exa_fallback,
+        "an explicitly chosen engine is never an Exa fallback"
     );
 }

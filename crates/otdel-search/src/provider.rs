@@ -46,9 +46,23 @@ pub struct SearchHit {
 /// the caller decides what to charge.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchBilling {
-    /// Engine that served this request (`exa`, `native`, …), when the adapter knows.
+    /// Engine this system **asked for** (`perplexity`, `exa`, `native`, …).
+    ///
+    /// Known from the configuration alone, so it is never a claim about what the provider
+    /// did. [`Self::observed_engine`] is the other half of that question, and the two are
+    /// deliberately separate fields rather than one hopeful string.
     pub engine: Option<String>,
+    /// Engine the **provider itself named** in its response, when it names one.
+    ///
+    /// `None` means the response carried no such field — not that the wrong engine ran.
+    /// Filling this in from the request would turn "we asked for Perplexity" into "the
+    /// provider confirmed Perplexity", which is a claim nobody made.
+    pub observed_engine: Option<String>,
+    /// The provider's own identifier for this request (OpenRouter's `id`), when present.
+    /// It is what a support ticket or an invoice line is matched against.
+    pub request_id: Option<String>,
     /// `true` when `auto` resolved to Exa because the model has no search of its own.
+    /// Always `false` for an explicitly chosen engine: there is no silent substitution.
     pub exa_fallback: bool,
     /// What the provider says this call cost, in micros. `None` means it said nothing,
     /// and the declared tariff stands.

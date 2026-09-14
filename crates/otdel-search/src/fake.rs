@@ -54,15 +54,29 @@ impl FakeSearchReply {
     }
 
     /// The same, with a cost the provider claims to have charged.
+    ///
+    /// The engine defaults to `exa` because that is what the existing callers script; use
+    /// [`Self::billed_by`] for any other one rather than letting a test quietly assert
+    /// against an engine it did not choose.
     pub fn billed(urls: &[&str], reported_micros: u64) -> Self {
+        Self::billed_by("exa", urls, reported_micros)
+    }
+
+    /// A bill from a named engine.
+    ///
+    /// `engine` is what the adapter *asked for*. `observed_engine` stays empty, like a
+    /// real response that names no engine: a fake that filled it in would let a test pass
+    /// on a confirmation the provider never sends.
+    pub fn billed_by(engine: &str, urls: &[&str], reported_micros: u64) -> Self {
         let Self::Hits(hits) = Self::urls(urls) else {
             unreachable!("urls always builds Hits")
         };
         Self::Billed(
             hits,
             SearchBilling {
-                engine: Some("exa".to_owned()),
+                engine: Some(engine.to_owned()),
                 reported_micros: Some(reported_micros),
+                search_requests: Some(1),
                 ..SearchBilling::default()
             },
         )

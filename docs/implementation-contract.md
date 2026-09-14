@@ -687,7 +687,13 @@ gaps: [GapChange], limitations[], message}`.
   pages_offered, pages_processed, pages_deferred, pages_unreadable, state, notes[],
   requirements, requirements_missing[], prompt_tokens, completion_tokens, cost_micro_usd,
   allows_automatic_publication, resumable_pages[], pages: [PageCoverage],
-  declarations: [Declaration]}`.
+  declarations: [Declaration], passes: [RunPass]}`.
+- `RunPass` = `{id, run_id, material_id, purpose, requests_allowed, requests_made,
+  pages_total, pages_processed, pages_deferred, covered_everything, input_chars,
+  created_at}`; `purpose`: `inventory` | `facts` | `glossary` | `applications` | `inquiry`.
+- R05.2: разбор — пять проходов, каждому отправляется схема только из его секций. `passes`
+  отвечает на вопрос, на который «44 из 44» ответить не может: под что именно читали
+  страницы. `covered_everything` — вход требовательной проверки, а не производная величина.
 - `state`: `unknown` | `complete` | `partial_accounted` | `incomplete`. Значения
   «достаточно хорошо» нет. `unknown` — разбор никто не оценивал, и это не успех.
 - `requirements`: `unknown` | `met` | `unmet`. Три значения, не булево: разбор, который
@@ -720,8 +726,9 @@ gaps: [GapChange], limitations[], message}`.
     чтение и есть техническая неизвестность и повод спросить;
   - `commercial_unknowns` — если в разборе нет ни одного факта вида `commercial`:
     сказать «цена не отсутствует» можно только там, где цена названа;
-  и если оно **несоразмерно объёму**: материал больше 4 разобранных страниц или больше
-  3 изделий одним предложением не закрывается.
+  и если оно **ничем не обосновано**: проход по этой теме не прошёл материал целиком
+  (`passes[].covered_everything = false`). Тогда тема попадает в `requirements_missing`
+  как незакрытый охват, а не как вывод о материале.
 - Отклонённое заявление попадает в `requirements_missing` **под именем своей темы**, с
   причиной отказа вместо общего «не сказано». Разница существенна: «ничего не сказали» и
   «сказали, но этого мало» требуют разных действий.

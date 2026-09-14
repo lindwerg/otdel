@@ -8,7 +8,9 @@
 use otdel_core::extraction::{PageStatus, TextSource};
 use otdel_core::knowledge::QuestionAudience;
 use otdel_knowledge::validate::validate_response;
-use otdel_knowledge::{CandidateDraft, DraftLimits, DraftResponse, SourceCatalog, SourcePage};
+use otdel_knowledge::{
+    CandidateDraft, DraftLimits, DraftResponse, KnownProducts, SourceCatalog, SourcePage,
+};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -28,7 +30,13 @@ fn catalog() -> SourceCatalog {
 
 fn validate(value: Value) -> CandidateDraft {
     let response = DraftResponse::parse(&value).expect("fixture must match the schema");
-    validate_response(&response, &catalog(), &DraftLimits::default(), "b1")
+    validate_response(
+        &response,
+        &catalog(),
+        &DraftLimits::default(),
+        "b1",
+        &KnownProducts::default(),
+    )
 }
 
 fn base_product() -> Value {
@@ -304,7 +312,13 @@ fn a_quotation_whose_source_span_is_too_long_is_refused() {
         }))],
     }))
     .unwrap();
-    let draft = validate_response(&response, &catalog, &DraftLimits::default(), "b1");
+    let draft = validate_response(
+        &response,
+        &catalog,
+        &DraftLimits::default(),
+        "b1",
+        &KnownProducts::default(),
+    );
 
     assert!(draft.facts.is_empty());
     assert!(draft
@@ -387,7 +401,13 @@ fn a_value_that_only_repeats_the_property_name_is_refused() {
         }))],
     }))
     .unwrap();
-    let draft = validate_response(&response, &catalog, &DraftLimits::default(), "b1");
+    let draft = validate_response(
+        &response,
+        &catalog,
+        &DraftLimits::default(),
+        "b1",
+        &KnownProducts::default(),
+    );
 
     assert!(draft.facts.is_empty(), "{:?}", draft.facts);
     assert_eq!(draft.rejected, 1);
@@ -604,7 +624,13 @@ fn oversized_collections_are_capped_and_the_cap_is_reported() {
         ],
     });
     let response = DraftResponse::parse(&value).unwrap();
-    let draft = validate_response(&response, &catalog(), &limits, "b1");
+    let draft = validate_response(
+        &response,
+        &catalog(),
+        &limits,
+        "b1",
+        &KnownProducts::default(),
+    );
 
     assert_eq!(draft.facts.len(), 1);
     assert!(draft
@@ -625,6 +651,7 @@ fn nothing_is_accepted_when_the_catalogue_is_empty() {
         &SourceCatalog::default(),
         &DraftLimits::default(),
         "b1",
+        &KnownProducts::default(),
     );
     assert!(draft.facts.is_empty());
     assert_eq!(draft.products.len(), 1, "the product itself is still named");

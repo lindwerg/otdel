@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use otdel_llm::fake::{FakeProvider, FakeReply};
+use otdel_llm::fake::FakeProvider;
 use otdel_llm::{LlmError, LlmProvider, UnconfiguredProvider};
 use serde_json::{json, Value};
 use support::{TestApp, TestClient};
@@ -131,8 +131,12 @@ fn stored_quote_of(fact: &Value) -> String {
     fact["evidence"][0]["quote"].as_str().unwrap().to_owned()
 }
 
+/// A provider that answers one whole run.
+///
+/// R05.2: a run is five purpose-specific passes, so the omnibus answer a test writes is
+/// sliced into one reply per pass — the same slicing the server applies to the schema.
 fn scripted(value: Value) -> Arc<FakeProvider> {
-    Arc::new(FakeProvider::new(vec![FakeReply::Json(value)]))
+    support::scripted_run(&value)
 }
 
 // --- the happy path ---------------------------------------------------------------------
@@ -166,7 +170,12 @@ async fn a_read_material_becomes_products_facts_terms_and_gaps_with_exact_citati
     assert_eq!(report.jobs_claimed, 1);
     assert_eq!(report.jobs_completed, 1);
     assert_eq!(report.facts_stored, 1);
-    assert_eq!(provider.call_count(), 1, "one bounded call for one page");
+    // R05.2: one bounded call per purpose-specific pass, over the one page.
+    assert_eq!(
+        provider.call_count(),
+        support::PASSES_PER_RUN,
+        "one bounded call per pass"
+    );
 
     // The prompt shows the model the page text under a label, never an identifier.
     let prompt = &provider.prompts()[0];
@@ -187,7 +196,8 @@ async fn a_read_material_becomes_products_facts_terms_and_gaps_with_exact_citati
     assert_eq!(run["material_id"], material_id.to_string());
     assert_eq!(run["facts_accepted"], 1);
     assert_eq!(run["facts_rejected"], 0);
-    assert_eq!(run["requests_made"], 1);
+    // R05.2: five, one per purpose-specific pass over this one page.
+    assert_eq!(run["requests_made"], support::PASSES_PER_RUN);
     assert_eq!(run["provider"], "fake");
     assert_eq!(run["model"], "fake/model-1");
     assert!(run["prompt_profile"]

@@ -257,21 +257,13 @@ pub struct ProcessedPage {
     pub chars_sent: i32,
 }
 
-/// The scale of the pass a declaration is asked to speak for.
+/// R05.2 replaced the scale heuristic that used to live here.
 ///
-/// A declaration is one sentence. The owner is expected to be able to check it by reading
-/// the material — and that is a real, bounded task for a short document and an unbounded
-/// one for a catalogue. Past these sizes a sentence stops being a check anybody will redo
-/// and becomes a rubber stamp, so the honest record is not "cleared" but "nobody has
-/// confirmed this".
+/// The old rule refused a declaration when the material was bigger than a person would
+/// re-read — a number nothing in the data derived. The purpose-specific passes made a
+/// better question available: **did the pass that was supposed to find this actually read
+/// the material?** That is objective, it is recorded, and it scales to any document.
 ///
-/// The two limits are deliberately small. They are not a guess at where a model becomes
-/// unreliable; they are the point past which *a person* will not re-read the document to
-/// disagree, which is the only thing that made a declaration trustworthy in the first
-/// place.
-const MAX_PAGES_ONE_SENTENCE_MAY_SPEAK_FOR: usize = 4;
-const MAX_PRODUCTS_ONE_SENTENCE_MAY_SPEAK_FOR: usize = 3;
-
 /// What a run produced, reduced to the counts the requirement check needs.
 ///
 /// Deliberately counts rather than the rows themselves: the rule must be the same whether
@@ -294,11 +286,19 @@ pub struct DraftSnapshot {
     pub commercial_facts: usize,
     /// Topics the run explicitly declared empty, with words on the record.
     pub declared: Vec<DeclarationTopic>,
-    /// Pages this pass actually processed.
+    /// Pages the run processed for at least one purpose.
     pub pages_processed: usize,
     /// Readings this run could not settle: an ambiguous cell, a unit written nowhere, a
     /// page nobody could read. Each one is something still open in this material.
     pub open_uncertainties: usize,
+    /// R05.2 — the purposes whose pass covered the whole material.
+    ///
+    /// A topic may only be declared empty when its own pass is in here. That is what
+    /// "absence evidenced by page material" means concretely: the glossary pass read
+    /// every page and found no terms, so "this catalogue introduces none" is an
+    /// observation. A glossary pass that never ran has observed nothing, and the topic is
+    /// reported as unresolved coverage instead — never cleared by a sentence.
+    pub purposes_covered: Vec<DeclarationTopic>,
 }
 
 /// The run context a [`DraftSnapshot`] cannot get from the candidates alone.
@@ -307,10 +307,12 @@ pub struct DraftSnapshot {
 /// to the coverage plan and the uncertainties come from R03's table cells. Passing them in
 /// explicitly keeps [`crate::candidate::CandidateDraft::snapshot`] from having to reach
 /// for state it does not own.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunContext {
     pub pages_processed: usize,
     pub open_uncertainties: usize,
+    /// Topics whose purpose-specific pass covered the whole material.
+    pub purposes_covered: Vec<DeclarationTopic>,
 }
 
 /// Why a declaration did not clear its topic — or that it did.
@@ -324,8 +326,9 @@ enum DeclarationVerdict {
     Accepted,
     /// The same run produced something that makes the statement false.
     Contradicted(String),
-    /// Too much material for one sentence to answer for.
-    Disproportionate(String),
+    /// The pass that was supposed to find this never covered the material, so the
+    /// absence rests on nothing that was read.
+    Unevidenced(String),
 }
 
 impl DraftSnapshot {
@@ -355,15 +358,13 @@ impl DraftSnapshot {
         if let Some(reason) = self.contradiction(topic) {
             return DeclarationVerdict::Contradicted(reason);
         }
-        if self.pages_processed > MAX_PAGES_ONE_SENTENCE_MAY_SPEAK_FOR
-            || self.products_total > MAX_PRODUCTS_ONE_SENTENCE_MAY_SPEAK_FOR
-        {
-            return DeclarationVerdict::Disproportionate(format!(
-                "заявление «в материале этого нет» не принято: разобрано страниц {}, \
-                 изделий {} — отсутствие в таком объёме одним предложением не \
-                 подтверждается, нужен человек",
-                self.pages_processed, self.products_total
-            ));
+        if !self.purposes_covered.contains(&topic) {
+            return DeclarationVerdict::Unevidenced(
+                "заявление «в материале этого нет» не принято: проход по теме не прошёл \
+                 материал целиком, поэтому отсутствие ничем не подтверждено. Это не \
+                 вывод о материале, а незакрытый охват — нужен ещё проход или человек"
+                    .to_owned(),
+            );
         }
         DeclarationVerdict::Accepted
     }
@@ -482,8 +483,7 @@ pub fn evaluate_requirements(snapshot: &DraftSnapshot) -> RequirementsOutcome {
         }
         match snapshot.declaration_verdict(topic) {
             DeclarationVerdict::Accepted => {}
-            DeclarationVerdict::Contradicted(reason)
-            | DeclarationVerdict::Disproportionate(reason) => {
+            DeclarationVerdict::Contradicted(reason) | DeclarationVerdict::Unevidenced(reason) => {
                 missing.push(format!("{}: {}", requirement.name, reason));
             }
         }
@@ -736,6 +736,7 @@ mod tests {
             declared: Vec::new(),
             pages_processed: 3,
             open_uncertainties: 0,
+            purposes_covered: DeclarationTopic::ALL.to_vec(),
         }
     }
 
@@ -757,6 +758,8 @@ mod tests {
             declared: Vec::new(),
             pages_processed: 2,
             open_uncertainties: 0,
+            // Every pass read the whole thing, so a declaration here rests on something.
+            purposes_covered: DeclarationTopic::ALL.to_vec(),
         }
     }
 
@@ -854,6 +857,9 @@ mod tests {
             declared: DeclarationTopic::ALL.to_vec(),
             pages_processed: 44,
             open_uncertainties: 123,
+            // The inventory pass covered the material; the four that matter here did not
+            // get through it, which is exactly what the live run's budget did.
+            purposes_covered: Vec::new(),
         }
     }
 
@@ -905,9 +911,10 @@ mod tests {
         assert!(line("questions:").contains("противоречит"));
         // "Nothing commercial is missing" needs something commercial to be present.
         assert!(line("commercial_unknowns:").contains("коммерческого факта"));
-        // Disproportionate: nobody will re-read 44 pages to disagree with one sentence.
-        assert!(line("glossary:").contains("нужен человек"));
-        assert!(line("applications:").contains("44"));
+        // Unevidenced: the glossary and application passes never got through the
+        // material, so their "there is none" rests on pages nobody read.
+        assert!(line("glossary:").contains("охват"));
+        assert!(line("applications:").contains("охват"));
         // None of them reads as "nothing was said": something was said and was refused.
         assert!(!line("glossary:").contains("не сказано"));
     }
@@ -960,28 +967,41 @@ mod tests {
         assert_eq!(evaluate_requirements(&priced).state, RequirementsState::Met);
     }
 
-    /// A small material keeps the escape hatch: the rule limits it, it does not remove it.
+    /// The escape hatch survives, but it now rests on something.
+    ///
+    /// R05.2 replaced "is the material small enough for a person to re-check" with "did
+    /// the pass that was supposed to find this read the material". The first was a guess;
+    /// the second is recorded.
     #[test]
-    fn a_short_material_may_still_say_there_is_none() {
-        let snapshot = DraftSnapshot {
+    fn a_topic_may_be_declared_empty_only_when_its_own_pass_read_the_material() {
+        let covered = DraftSnapshot {
             terms_total: 0,
             applications_total: 0,
             declared: vec![DeclarationTopic::Glossary, DeclarationTopic::Applications],
             ..small()
         };
         assert_eq!(
-            evaluate_requirements(&snapshot).state,
-            RequirementsState::Met
+            evaluate_requirements(&covered).state,
+            RequirementsState::Met,
+            "a pass that read everything and found nothing has made an observation"
         );
 
-        // One page more than a person will re-check, and the same sentences defer.
-        let larger = DraftSnapshot {
-            pages_processed: MAX_PAGES_ONE_SENTENCE_MAY_SPEAK_FOR + 1,
-            ..snapshot
+        // The same two sentences, from passes that never got through the material.
+        let unread = DraftSnapshot {
+            purposes_covered: vec![
+                DeclarationTopic::Questions,
+                DeclarationTopic::CommercialUnknowns,
+                DeclarationTopic::TechnicalUnknowns,
+            ],
+            ..covered
         };
-        let outcome = evaluate_requirements(&larger);
+        let outcome = evaluate_requirements(&unread);
         assert_eq!(outcome.state, RequirementsState::Unmet);
         assert_eq!(outcome.missing.len(), 2, "{:?}", outcome.missing);
+        // Reported as unresolved coverage, not as a verdict about the material.
+        for line in &outcome.missing {
+            assert!(line.contains("охват"), "{line}");
+        }
     }
 
     #[test]

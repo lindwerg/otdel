@@ -175,6 +175,85 @@ pub struct CandidateGap {
     pub nature: GapNature,
 }
 
+/// Products an earlier pass accepted, offered to a later one by a stable label.
+///
+/// R05.2. The passes after the inventory need to say *which* product a fact, a task or a
+/// gap is about. Making them re-declare the products would spend their budget on exactly
+/// the thing that crowded everything else out of the single omnibus request; so the server
+/// hands them a short list instead — `P1 — AP10`, `P2 — AP20` — and they cite the label.
+///
+/// The label is the server's, never the model's. A label the model invents resolves to
+/// nothing and the candidate is attached to no product, which is the same refusal a made-up
+/// source label already gets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KnownProducts {
+    /// `(label, candidate reference, name)`.
+    entries: Vec<(String, String, String)>,
+}
+
+impl KnownProducts {
+    /// Label every product a draft has accepted so far, in a stable order.
+    pub fn from_draft(draft: &CandidateDraft) -> Self {
+        let entries = draft
+            .products
+            .iter()
+            .enumerate()
+            .map(|(index, product)| {
+                (
+                    format!("P{}", index + 1),
+                    product.reference.clone(),
+                    product.name.clone(),
+                )
+            })
+            .collect();
+        Self { entries }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// `(label, name)` pairs for the prompt.
+    pub fn listing(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries
+            .iter()
+            .map(|(label, _, name)| (label.as_str(), name.as_str()))
+    }
+
+    /// The candidate reference a label stands for.
+    ///
+    /// Matched on the label first and on the product's name second — a model that writes
+    /// the name instead of the label has still named something real, and refusing that
+    /// would lose a correct attribution over a formatting slip. An unknown string resolves
+    /// to `None` and the candidate is stored attached to nothing.
+    pub fn resolve(&self, reference: &str) -> Option<String> {
+        let wanted = reference.trim();
+        if let Some((_, candidate, _)) = self
+            .entries
+            .iter()
+            .find(|(label, _, _)| label.eq_ignore_ascii_case(wanted))
+        {
+            return Some(candidate.clone());
+        }
+
+        let folded = normalise_name(wanted);
+        let mut named = self
+            .entries
+            .iter()
+            .filter(|(_, _, name)| normalise_name(name) == folded);
+        let first = named.next()?;
+        // Two products of the same name: naming one of them would be a coin toss.
+        if named.next().is_some() {
+            return None;
+        }
+        Some(first.1.clone())
+    }
+}
+
 /// Everything one run produced, plus an honest account of what it refused.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CandidateDraft {
@@ -261,6 +340,7 @@ impl CandidateDraft {
                 .collect(),
             pages_processed: context.pages_processed,
             open_uncertainties: context.open_uncertainties,
+            purposes_covered: context.purposes_covered.clone(),
         }
     }
 
@@ -281,6 +361,52 @@ impl CandidateDraft {
             return;
         }
         self.declarations.push(declaration);
+    }
+
+    /// Drop declarations the finished draft contradicts.
+    ///
+    /// R05.2 moved this check from the response to the run. When one omnibus request
+    /// produced everything, "there are no terms" beside eleven terms was a contradiction
+    /// visible inside that one response, and [`crate::validate`] caught it there. Now the
+    /// terms arrive from the glossary pass and the declaration from the inquiry pass, so
+    /// no single response contains both — and the only place the two can still be
+    /// compared is here, once every pass has run.
+    ///
+    /// Called at the end of a run. The per-response check stays where it is: it is the
+    /// same rule seen earlier, and catching a contradiction sooner costs nothing.
+    pub fn reconcile_declarations(&mut self) {
+        let contradicted: Vec<DeclarationTopic> = self
+            .declarations
+            .iter()
+            .map(|declaration| declaration.topic)
+            .filter(|topic| self.produced_rows_for(*topic))
+            .collect();
+
+        for topic in contradicted {
+            self.declarations.retain(|kept| kept.topic != topic);
+            self.reject(format!(
+                "заявление «в материале этого нет» по теме «{}» отклонено: разбор в целом \
+                 такие записи всё-таки дал",
+                topic.as_str()
+            ));
+        }
+    }
+
+    /// Did this draft produce anything on the topic a declaration calls empty?
+    fn produced_rows_for(&self, topic: DeclarationTopic) -> bool {
+        match topic {
+            DeclarationTopic::Glossary => !self.terms.is_empty(),
+            DeclarationTopic::Applications => !self.applications.is_empty(),
+            DeclarationTopic::Questions => self.gaps.iter().any(|gap| gap.question.is_some()),
+            DeclarationTopic::CommercialUnknowns => self
+                .gaps
+                .iter()
+                .any(|gap| gap.nature == GapNature::Commercial),
+            DeclarationTopic::TechnicalUnknowns => self
+                .gaps
+                .iter()
+                .any(|gap| gap.nature == GapNature::Technical),
+        }
     }
 
     /// Record one refusal. Repeated reasons are counted once.

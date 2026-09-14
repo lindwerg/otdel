@@ -120,6 +120,35 @@ impl FactOrigin {
     }
 }
 
+/// What one purpose-specific pass of a run covered.
+///
+/// R05.2. A run is five passes now, and this is the record of one of them. The field that
+/// matters is [`Self::covered_everything`]: it is the difference between "the glossary
+/// pass read every page and found no terms" — an observation about the material — and
+/// "nothing ever looked for a term", which establishes nothing and may not be cleared by
+/// a sentence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunPass {
+    pub id: Uuid,
+    pub run_id: Uuid,
+    pub material_id: Uuid,
+    /// `inventory` | `facts` | `glossary` | `applications` | `inquiry`.
+    pub purpose: String,
+    /// The share of the run's budget this pass was given…
+    pub requests_allowed: i32,
+    /// …and what it spent. Both, because "made two requests" and "was allowed two" are
+    /// different findings.
+    pub requests_made: i32,
+    pub pages_total: i32,
+    pub pages_processed: i32,
+    pub pages_deferred: i32,
+    /// Whether this pass saw the whole material. The input to the requirement check,
+    /// stored rather than derived so a reader sees the value the check saw.
+    pub covered_everything: bool,
+    pub input_chars: i32,
+    pub created_at: DateTime<Utc>,
+}
+
 // --- coverage ---------------------------------------------------------------------
 
 /// What became of one page of a material during one understanding run.

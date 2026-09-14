@@ -18,7 +18,7 @@ use otdel_core::passport::{
     AliasRelation, ApplicationDetail, ApplicationDetailKind, DeclarationOrigin, DeclarationTopic,
     GlossarySense, GlossarySynonym, IdentityBasis, IdentityState, KnowledgeDeclaration,
     KnowledgeUncertainty, PageCoverage, PageDisposition, ProductAlias, ProductApplication,
-    ProductIdentityLink, ProductPassport, SynonymRelation, UncertaintyKind,
+    ProductIdentityLink, ProductPassport, RunPass, SynonymRelation, UncertaintyKind,
 };
 use sqlx::postgres::PgRow;
 use sqlx::Row;
@@ -70,6 +70,46 @@ pub async fn page_coverage(tx: &mut ScopedTx, run_id: Uuid) -> DbResult<Vec<Page
                 chars_sent: row.try_get("chars_sent")?,
                 batch_index: row.try_get("batch_index")?,
                 reason: row.try_get("reason")?,
+                created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
+            })
+        })
+        .collect()
+}
+
+/// What each purpose-specific pass of a run covered.
+///
+/// R05.2. Returned with the coverage report and never on its own: "44 of 44 pages
+/// processed" was a true sentence that could not answer «почему 0 терминов», and the whole
+/// point of these rows is that the two questions are now asked together.
+pub async fn run_passes(tx: &mut ScopedTx, run_id: Uuid) -> DbResult<Vec<RunPass>> {
+    let bureau_id = tx.bureau_id();
+    let rows = sqlx::query(
+        "SELECT id, run_id, material_id, purpose, requests_allowed, requests_made, \
+                pages_total, pages_processed, pages_deferred, covered_everything, \
+                input_chars, created_at \
+           FROM otdel.knowledge_run_passes \
+          WHERE bureau_id = $1 AND run_id = $2 \
+          ORDER BY created_at, id",
+    )
+    .bind(bureau_id)
+    .bind(run_id)
+    .fetch_all(tx.conn())
+    .await?;
+
+    rows.iter()
+        .map(|row| {
+            Ok(RunPass {
+                id: row.try_get("id")?,
+                run_id: row.try_get("run_id")?,
+                material_id: row.try_get("material_id")?,
+                purpose: row.try_get("purpose")?,
+                requests_allowed: row.try_get("requests_allowed")?,
+                requests_made: row.try_get("requests_made")?,
+                pages_total: row.try_get("pages_total")?,
+                pages_processed: row.try_get("pages_processed")?,
+                pages_deferred: row.try_get("pages_deferred")?,
+                covered_everything: row.try_get("covered_everything")?,
+                input_chars: row.try_get("input_chars")?,
                 created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
             })
         })

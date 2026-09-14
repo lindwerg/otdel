@@ -34,7 +34,8 @@ const TIMEOUT_RANGE: (u64, u64) = (5, 600);
 const MAX_INPUT_CHARS_RANGE: (u64, u64) = (1_000, 400_000);
 const MAX_OUTPUT_TOKENS_RANGE: (u64, u64) = (256, 32_000);
 const MAX_PAGES_PER_REQUEST_RANGE: (u64, u64) = (1, 50);
-const MAX_REQUESTS_PER_RUN_RANGE: (u64, u64) = (1, 100);
+const MAX_REQUESTS_PER_RUN_RANGE: (u64, u64) = (1, 200);
+const MAX_REQUESTS_PER_PURPOSE_RANGE: (u64, u64) = (1, 40);
 const MIN_REQUEST_INTERVAL_MS_RANGE: (u64, u64) = (0, 60_000);
 const MAX_RESPONSE_BYTES_RANGE: (u64, u64) = (4_096, 8 * 1024 * 1024);
 
@@ -137,8 +138,17 @@ pub struct LlmLimits {
     pub max_input_chars: u32,
     /// Upper bound on source pages put into one request.
     pub max_pages_per_request: u32,
-    /// Upper bound on requests one knowledge run may make.
+    /// Upper bound on requests one knowledge run may make, across every purpose-specific
+    /// pass. The total cap.
     pub max_requests_per_run: u32,
+    /// R05.2 — upper bound on requests **one purpose-specific pass** may make.
+    ///
+    /// The run is five passes (inventory, facts, glossary, applications, inquiry), and
+    /// this is what stops any one of them from spending the material's whole budget. A
+    /// live pass over a technical catalogue returned 51 products, 6 facts and zero terms
+    /// or tasks — not because the material lacked them, but because one omnibus request
+    /// ran out on the cheapest section. Each pass now gets a share it cannot exceed.
+    pub max_requests_per_purpose: u32,
     /// `max_tokens` sent to the provider.
     pub max_output_tokens: u32,
     /// Response body larger than this is refused without being parsed.
@@ -154,7 +164,10 @@ impl Default for LlmLimits {
         Self {
             max_input_chars: 24_000,
             max_pages_per_request: 6,
-            max_requests_per_run: 8,
+            // Five passes over a material of up to ~48 pages: 5 x 8. Raised from 8 with
+            // R05.2, where 8 was one pass's worth and is now the whole run's.
+            max_requests_per_run: 40,
+            max_requests_per_purpose: 8,
             max_output_tokens: 4_000,
             max_response_bytes: 1024 * 1024,
             timeout: Duration::from_secs(120),
@@ -255,6 +268,12 @@ impl LlmSettings {
                 "OTDEL_LLM_MAX_REQUESTS_PER_RUN",
                 u64::from(defaults.limits.max_requests_per_run),
                 MAX_REQUESTS_PER_RUN_RANGE,
+            )?,
+            max_requests_per_purpose: bounded_u32(
+                source,
+                "OTDEL_LLM_MAX_REQUESTS_PER_PURPOSE",
+                u64::from(defaults.limits.max_requests_per_purpose),
+                MAX_REQUESTS_PER_PURPOSE_RANGE,
             )?,
             max_output_tokens: bounded_u32(
                 source,

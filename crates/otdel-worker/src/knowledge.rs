@@ -41,7 +41,10 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::error::WorkerError;
-use crate::knowledge_draft::{collect_uncertainties, page_coverage_rows, to_new_draft};
+use crate::knowledge_draft::{
+    collect_uncertainties, page_coverage_rows, run_pass_rows, to_new_draft,
+    topics_whose_pass_covered_the_material,
+};
 use crate::material_of;
 
 /// Delay before a transient model failure is tried again. Longer than the extraction
@@ -376,14 +379,16 @@ impl KnowledgeWorker {
         let new_draft = to_new_draft(&drafted.draft, &structured);
         let uncertainties = collect_uncertainties(&readings, &plan);
 
-        // The requirement check is given the run's own scale and its unsettled readings,
-        // not just the candidates. Both decide whether a declaration of absence may stand:
-        // a live pass over a 44-page catalogue came back `met` on the strength of five
-        // sentences saying there was nothing to find, while holding 123 readings it could
-        // not settle. Those 123 are the counter-evidence, and this is where it arrives.
+        // The requirement check is given the run's unsettled readings and — R05.2 — which
+        // purpose-specific passes actually got through the material. The second is what
+        // makes "0 terms" answerable: a glossary pass that read every page and found none
+        // has observed something, and one that ran out of budget has not. Without it the
+        // only way to close the topic was a sentence, which is how a self-serving
+        // declaration came to clear a catalogue nobody had examined for terms.
         let context = RunContext {
             pages_processed: usize::try_from(coverage.pages_processed).unwrap_or(0),
             open_uncertainties: uncertainties.len(),
+            purposes_covered: topics_whose_pass_covered_the_material(&drafted.passes),
         };
         let requirements = evaluate_requirements(&drafted.draft.snapshot(context));
         coverage.requirements = requirements.state;
@@ -420,6 +425,17 @@ impl KnowledgeWorker {
             material_id,
             run.id,
             &uncertainties,
+        )
+        .await?;
+        // R05.2: what each purpose-specific pass covered, stored beside the
+        // material-level account. The union answers "was this page read at all"; these
+        // answer "read for what", which is the question «0 терминов» needs.
+        passport::record_run_passes(
+            &mut tx,
+            job.partner_id,
+            material_id,
+            run.id,
+            &run_pass_rows(&drafted.passes, offerable.len()),
         )
         .await?;
         // Derived last, from the candidates that exist after this draft replaced the

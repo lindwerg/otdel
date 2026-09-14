@@ -24,6 +24,8 @@
 use otdel_core::llm_config::LlmLimits;
 use uuid::Uuid;
 
+use crate::candidate::KnownProducts;
+use crate::schema::DraftPurpose;
 use crate::source::{CatalogEntry, SourceCatalog};
 use crate::tables::TableReading;
 
@@ -102,6 +104,20 @@ pub struct PromptBatch {
 /// exactly those for the next pass, and keep [`crate::coverage::CoveragePlan`] able to
 /// state that page 37 is deferred rather than missing.
 pub fn plan_batches(catalog: &SourceCatalog, limits: &LlmLimits) -> (Vec<PromptBatch>, Vec<usize>) {
+    plan_batches_within(catalog, limits, limits.max_requests_per_run.max(1) as usize)
+}
+
+/// The same planning, bounded by a caller-supplied number of requests.
+///
+/// R05.2 needs this because the run is no longer one budget: each purpose-specific pass
+/// gets its own share, and a pass that cannot cover the whole material defers the
+/// remainder *for that purpose*. `allowed == 0` is meaningful and returns no batches at
+/// all — a purpose the run had no budget left for, with every page named as deferred.
+pub fn plan_batches_within(
+    catalog: &SourceCatalog,
+    limits: &LlmLimits,
+    allowed: usize,
+) -> (Vec<PromptBatch>, Vec<usize>) {
     let per_page_budget = per_page_budget(limits);
     let max_pages = limits.max_pages_per_request.max(1) as usize;
     let max_chars = limits.max_input_chars.max(1) as usize;
@@ -134,7 +150,6 @@ pub fn plan_batches(catalog: &SourceCatalog, limits: &LlmLimits) -> (Vec<PromptB
         batches.push(current);
     }
 
-    let allowed = limits.max_requests_per_run.max(1) as usize;
     if batches.len() <= allowed {
         return (batches, Vec::new());
     }
@@ -239,6 +254,8 @@ pub fn user_prompt(
     context: &PromptContext,
     entries: &[&CatalogEntry],
     tables: &TableContext,
+    purpose: DraftPurpose,
+    known: &KnownProducts,
     limits: &LlmLimits,
 ) -> String {
     let budget = per_page_budget(limits);
@@ -292,18 +309,83 @@ pub fn user_prompt(
         }
     }
 
-    out.push_str(
-        "Составь черновик: направления и семейства (categories), изделия и услуги \
-         (products) с их другими написаниями (aliases), точные характеристики с \
-         единицами и условиями (facts), термины (glossary) с их значениями (senses) и \
-         написаниями (synonyms), вопросы и ответы по материалу (qa), пробелы (gaps) и \
-         задачи применения (applications). \
-         Если чего-то в источниках действительно нет — оставь массив пустым и \
-         одновременно скажи об этом словами в declarations: пустой массив сам по себе \
-         ответом не считается.",
-    );
+    // The roster of products an earlier pass accepted. Only for the passes that refer to
+    // one: the inventory pass is the thing that produces them.
+    if purpose.needs_product_context() {
+        if known.is_empty() {
+            out.push_str(
+                "ИЗДЕЛИЯ: на предыдущем проходе по этому материалу изделий не выделено. \
+                 Оставь product_ref пустым (null) — не придумывай изделие, чтобы было к \
+                 чему привязаться.\n\n",
+            );
+        } else {
+            out.push_str(
+                "ИЗДЕЛИЯ, УЖЕ ВЫДЕЛЕННЫЕ ПО ЭТОМУ МАТЕРИАЛУ (ссылайся на них по метке в \
+                 product_ref; заново перечислять их не нужно и не следует):\n",
+            );
+            for (label, name) in known.listing() {
+                out.push_str(&format!("• {label} — {}\n", sanitise_line(name)));
+            }
+            out.push('\n');
+        }
+    }
+
+    out.push_str(purpose_instruction(purpose));
 
     out
+}
+
+/// What this pass, and only this pass, is being asked for.
+///
+/// Each one ends with the same clause about absence, and the clause is doing real work:
+/// the pass may not report nothing without saying why, and it may not say why unless the
+/// pages in front of it support that. «Ничего не нашёл» and «в материале этого нет» are
+/// different answers, and the run records them differently.
+pub fn purpose_instruction(purpose: DraftPurpose) -> &'static str {
+    match purpose {
+        DraftPurpose::Inventory => {
+            "ЗАДАЧА ЭТОГО ЗАПРОСА — ТОЛЬКО СОСТАВ ПРЕДЛОЖЕНИЯ: направления и семейства \
+             (categories), изделия и услуги (products) с кратким описанием и другими \
+             написаниями (aliases). Характеристики, термины, задачи и вопросы у тебя \
+             сейчас не спрашивают — для них будут отдельные запросы, не трать на них \
+             место. Изделие — то, что партнёр поставляет, а не строка таблицы: если \
+             один артикул отличается от другого только размером, это одно изделие."
+        }
+        DraftPurpose::Facts => {
+            "ЗАДАЧА ЭТОГО ЗАПРОСА — ТОЛЬКО ХАРАКТЕРИСТИКИ (facts): что именно материал \
+             утверждает об изделиях — значения, единицы, условия применимости, \
+             ограничения. Если на странице есть разбор таблиц, бери значения оттуда: \
+             там уже указано, к какому изделию и свойству относится число. Изделия \
+             заново не перечисляй. Если по показанным страницам характеристик нет — \
+             верни пустой facts."
+        }
+        DraftPurpose::Glossary => {
+            "ЗАДАЧА ЭТОГО ЗАПРОСА — ТОЛЬКО ТЕРМИНЫ (glossary): слова и обозначения, \
+             которые материал употребляет как специальные и которые покупателю нужно \
+             объяснить — типы креплений, виды покрытий, обозначения серий, единицы и \
+             сокращения. У термина может быть несколько значений в одном материале \
+             (senses) и несколько написаний (synonyms). Не выдумывай отраслевые термины, \
+             которых в показанных фрагментах нет: термин обязан встречаться в цитате. \
+             Если на этих страницах таких слов нет — верни пустой glossary."
+        }
+        DraftPurpose::Applications => {
+            "ЗАДАЧА ЭТОГО ЗАПРОСА — ТОЛЬКО ЗАДАЧИ ПРИМЕНЕНИЯ (applications): для какой \
+             работы материал предлагает изделие, словами покупателя. Под каждой задачей: \
+             parameter — что нужно знать, чтобы выбрать правильно, со значением из \
+             источника; constraint — что ограничивает применение; question — что \
+             материал не решает и надо спросить. Задача обязана быть в цитате: если \
+             материал нигде не говорит, для чего изделие, — это не повод её \
+             придумать, верни пустой applications."
+        }
+        DraftPurpose::Inquiry => {
+            "ЗАДАЧА ЭТОГО ЗАПРОСА — ТОЛЬКО ВОПРОСЫ И ПРОБЕЛЫ: qa — вопросы, на которые \
+             материал прямо отвечает, с цитатой; gaps — чего в материале нет, с \
+             указанием nature и, если уместно, с вопросом и адресатом; declarations — \
+             прямые заявления «в материале этого нет» по темам, которые ты проверил по \
+             показанным страницам. Заявление — про то, что ты видел: если страницы \
+             темы не касаются, заявление не пиши."
+        }
+    }
 }
 
 /// Cut a page's text to the budget, on a character boundary.
@@ -418,6 +500,8 @@ mod tests {
             &context(),
             &entries,
             &TableContext::default(),
+            DraftPurpose::Inventory,
+            &KnownProducts::default(),
             &LlmLimits::default(),
         );
 
@@ -440,6 +524,8 @@ mod tests {
             &context(),
             &entries,
             &TableContext::default(),
+            DraftPurpose::Inventory,
+            &KnownProducts::default(),
             &LlmLimits::default(),
         );
 
@@ -458,6 +544,8 @@ mod tests {
             &context(),
             &entries,
             &TableContext::default(),
+            DraftPurpose::Inventory,
+            &KnownProducts::default(),
             &limits(1_200, 2, 8),
         );
         assert!(prompt.contains("фрагмент обрезан"));
@@ -474,6 +562,8 @@ mod tests {
             &context(),
             &entries,
             &TableContext::default(),
+            DraftPurpose::Inventory,
+            &KnownProducts::default(),
             &LlmLimits::default(),
         );
         assert!(prompt.contains("распознано"));
@@ -526,7 +616,14 @@ mod tests {
         let tables = TableContext::from_readings([(entries[0].page.page_id, &reading)]);
         assert!(!tables.is_empty());
 
-        let prompt = user_prompt(&context(), &entries, &tables, &LlmLimits::default());
+        let prompt = user_prompt(
+            &context(),
+            &entries,
+            &tables,
+            DraftPurpose::Facts,
+            &KnownProducts::default(),
+            &LlmLimits::default(),
+        );
 
         assert!(prompt.contains("РАЗБОР ТАБЛИЦ НА СТРАНИЦЕ 1"));
         assert!(prompt.contains("свойство: Безопасная рабочая нагрузка"));

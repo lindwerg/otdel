@@ -158,6 +158,53 @@
   color: var(--ink);
 }
 
+.coverage__passes {
+  margin-top: 12px;
+}
+
+.coverage__passes h5 {
+  font-size: 0.8125rem;
+  color: var(--muted);
+  margin: 0 0 6px;
+  font-weight: 600;
+}
+
+.coverage__passes ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 0.8125rem;
+}
+
+.coverage__pass {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+/* A pass that did not finish is the reason an empty section is an open question.
+   Marked, never greyed: greying it is how it stops being noticed. */
+.coverage__pass--unfinished {
+  color: var(--warn-strong);
+  border-left: 2px solid var(--warn-strong);
+}
+
+.coverage__pass-name {
+  min-width: 12em;
+  font-weight: 600;
+}
+
+.coverage__pass-requests {
+  font-variant-numeric: tabular-nums;
+}
+
 .coverage__pages {
   margin-top: 12px;
   font-size: 0.8125rem;

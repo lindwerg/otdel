@@ -1591,6 +1591,34 @@ export interface PageCoverage {
   created_at: string
 }
 
+/** Which kind of thing one bounded pass of a run was asking for. */
+export type DraftPurpose = 'inventory' | 'facts' | 'glossary' | 'applications' | 'inquiry'
+
+/**
+ * What one purpose-specific pass covered.
+ *
+ * `covered_everything` is the field that matters: it is the difference between
+ * "the glossary pass read every page and found no terms" — an observation about
+ * the material — and "nothing ever looked for a term", which establishes nothing
+ * and may not be cleared by a declaration.
+ */
+export interface RunPass {
+  id: string
+  run_id: string
+  material_id: string
+  purpose: DraftPurpose
+  /** The share of the run's budget this pass was given… */
+  requests_allowed: number
+  /** …and what it spent. */
+  requests_made: number
+  pages_total: number
+  pages_processed: number
+  pages_deferred: number
+  covered_everything: boolean
+  input_chars: number
+  created_at: string
+}
+
 /** An explicit "there is none", in the run's own words. */
 export interface KnowledgeDeclaration {
   id: string
@@ -1619,6 +1647,8 @@ export interface CoverageReport extends RunCoverage {
   resumable_pages: number[]
   pages: PageCoverage[]
   declarations: KnowledgeDeclaration[]
+  /** R05.2 — what each purpose-specific pass covered. */
+  passes: RunPass[]
 }
 
 /** A recorded surface form of a product. Never a merge. */

@@ -125,6 +125,20 @@ pub struct NewUncertainty {
     pub region_id: Option<Uuid>,
 }
 
+/// What one purpose-specific pass covered, ready to be stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRunPass {
+    /// `inventory` | `facts` | `glossary` | `applications` | `inquiry`.
+    pub purpose: String,
+    pub requests_allowed: i32,
+    pub requests_made: i32,
+    pub pages_total: i32,
+    pub pages_processed: i32,
+    pub pages_deferred: i32,
+    pub covered_everything: bool,
+    pub input_chars: i32,
+}
+
 /// What [`propose_identity_links`] found.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IdentityReport {
@@ -195,6 +209,68 @@ pub async fn record_page_coverage(
         .bind(page.chars_sent)
         .bind(page.batch_index)
         .bind(reason.map(|r| clip(r, 500)))
+        .execute(tx.conn())
+        .await?;
+        written += 1;
+    }
+
+    Ok(written)
+}
+
+/// Replace this run's per-purpose account.
+///
+/// R05.2. Scoped to the run for the same reason the page account is: the run row outlives
+/// a re-draft, so yesterday's passes must not describe today's.
+///
+/// `covered_everything` is written, not derived on read. The requirement check consults it
+/// to decide whether a topic may be declared empty, and a reader looking at the run has to
+/// be able to see the value the check saw — a recomputation is a second opinion, and two
+/// opinions about "did anything look for a term" is exactly one too many.
+pub async fn record_run_passes(
+    tx: &mut ScopedTx,
+    partner_id: Uuid,
+    material_id: Uuid,
+    run_id: Uuid,
+    passes: &[NewRunPass],
+) -> DbResult<u32> {
+    let bureau_id = tx.bureau_id();
+    sqlx::query("DELETE FROM otdel.knowledge_run_passes WHERE bureau_id = $1 AND run_id = $2")
+        .bind(bureau_id)
+        .bind(run_id)
+        .execute(tx.conn())
+        .await?;
+
+    let mut written = 0_u32;
+    for pass in passes {
+        // Defence in depth beside the CHECK: a pass that made no request cannot have
+        // covered anything, and letting that pair through would make "0 terms" clearable
+        // by a sentence all over again.
+        if pass.covered_everything && (pass.requests_made == 0 || pass.pages_deferred > 0) {
+            return Err(DbError::Decode(format!(
+                "refusing to record the `{}` pass as complete: {} requests, {} pages left",
+                pass.purpose, pass.requests_made, pass.pages_deferred
+            )));
+        }
+
+        sqlx::query(
+            "INSERT INTO otdel.knowledge_run_passes \
+                 (bureau_id, partner_id, material_id, run_id, purpose, requests_allowed, \
+                  requests_made, pages_total, pages_processed, pages_deferred, \
+                  covered_everything, input_chars) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        )
+        .bind(bureau_id)
+        .bind(partner_id)
+        .bind(material_id)
+        .bind(run_id)
+        .bind(&pass.purpose)
+        .bind(pass.requests_allowed)
+        .bind(pass.requests_made)
+        .bind(pass.pages_total)
+        .bind(pass.pages_processed)
+        .bind(pass.pages_deferred)
+        .bind(pass.covered_everything)
+        .bind(pass.input_chars)
         .execute(tx.conn())
         .await?;
         written += 1;

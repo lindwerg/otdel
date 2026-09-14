@@ -150,9 +150,8 @@ async fn industry_question(app: &TestApp, client: &TestClient, partner: Uuid) ->
         .expect("the quotable line has a word to use as a value")
         .to_owned();
 
-    let productologist: Arc<dyn LlmProvider> = Arc::new(FakeProvider::new(vec![FakeReply::Json(
-        knowledge_answer(&quote, &value),
-    )]));
+    let productologist: Arc<dyn LlmProvider> =
+        support::scripted_run(&knowledge_answer(&quote, &value));
     let knowledge = app.knowledge_worker(productologist);
     let understood = app.run_knowledge(&knowledge).await;
     assert_eq!(

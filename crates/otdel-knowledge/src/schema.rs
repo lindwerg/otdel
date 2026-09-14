@@ -28,7 +28,10 @@ pub const SCHEMA_NAME: &str = "otdel_product_knowledge_draft";
 /// R05 raises it: the response now carries applications, aliases, senses, synonyms, a
 /// classification on every gap and — the part that matters most — the declarations that
 /// make "there are none" a statement instead of an empty array.
-pub const PROMPT_PROFILE: &str = "productologist/2026-09-14.r05";
+/// R05.2 raises it again: the run is now five purpose-specific passes instead of one
+/// omnibus request, so a draft made by this profile is not comparable with one made by
+/// the previous.
+pub const PROMPT_PROFILE: &str = "productologist/2026-09-14.r05.2";
 
 /// Upper bounds on what one response may contain. Anything beyond is refused (and
 /// counted), never silently truncated into "success".
@@ -375,7 +378,129 @@ fn surface_form_schema(relations: &[&str], description: &str) -> Value {
     })
 }
 
-/// The JSON Schema sent to the provider.
+/// One bounded pass over the material, asking for one kind of thing.
+///
+/// R05.2. A single omnibus request asking for products, facts, terms, tasks, questions and
+/// gaps at once has a failure mode nothing downstream can correct: the model spends the
+/// whole output budget on the cheapest section. A live pass over a technical catalogue
+/// came back with 51 products, 6 facts and **0 terms, 0 applications** — not because the
+/// material lacked them, but because the request was over before it got there.
+///
+/// Splitting the run into purpose-specific passes removes the competition. Each pass is
+/// sent a schema that contains *only* its own sections, so spending an applications pass
+/// on products is not a thing the model can do — `additionalProperties: false` makes the
+/// other sections unrepresentable rather than merely discouraged.
+///
+/// The order is a dependency order, not a preference: everything after [`Self::Inventory`]
+/// may refer to the products it accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftPurpose {
+    /// Directions, families, products and their recorded surface forms.
+    Inventory,
+    /// Characteristics and limitations, with the table context R03 established.
+    Facts,
+    /// Terms, their further readings and their spellings.
+    Glossary,
+    /// Tasks the material says a product serves, with the parameters and constraints
+    /// needed to choose, and the questions it does not settle.
+    Applications,
+    /// Answers the material supports, what it does not say, and the explicit absences.
+    Inquiry,
+}
+
+impl DraftPurpose {
+    /// Every pass, in dependency order.
+    pub const ALL: [Self; 5] = [
+        Self::Inventory,
+        Self::Facts,
+        Self::Glossary,
+        Self::Applications,
+        Self::Inquiry,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inventory => "inventory",
+            Self::Facts => "facts",
+            Self::Glossary => "glossary",
+            Self::Applications => "applications",
+            Self::Inquiry => "inquiry",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "inventory" => Some(Self::Inventory),
+            "facts" => Some(Self::Facts),
+            "glossary" => Some(Self::Glossary),
+            "applications" => Some(Self::Applications),
+            "inquiry" => Some(Self::Inquiry),
+            _ => None,
+        }
+    }
+
+    /// Which top-level sections this pass may return.
+    ///
+    /// Deliberately narrow. A pass that could also return products would be a pass that
+    /// can spend its budget on them, which is the whole defect.
+    pub const fn sections(self) -> &'static [&'static str] {
+        match self {
+            Self::Inventory => &["categories", "products"],
+            Self::Facts => &["facts"],
+            Self::Glossary => &["glossary"],
+            Self::Applications => &["applications"],
+            Self::Inquiry => &["qa", "gaps", "declarations"],
+        }
+    }
+
+    /// Whether this pass needs to be told which products already exist.
+    ///
+    /// Everything except the inventory refers to products by a label the server assigns,
+    /// so no later pass has to re-list them — re-listing is how the budget would be spent
+    /// on products all over again.
+    pub const fn needs_product_context(self) -> bool {
+        !matches!(self, Self::Inventory)
+    }
+
+    /// The schema name reported to the provider, for its logs and ours.
+    pub fn schema_name(self) -> String {
+        format!("{SCHEMA_NAME}_{}", self.as_str())
+    }
+}
+
+/// The JSON Schema for one pass: the full schema, narrowed to that pass's sections.
+///
+/// Narrowed rather than written out per purpose, so a change to how a fact is described
+/// cannot apply to one pass and not another.
+pub fn response_schema_for(purpose: DraftPurpose) -> Value {
+    let full = response_schema();
+    let properties = full
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    let kept: serde_json::Map<String, Value> = purpose
+        .sections()
+        .iter()
+        .filter_map(|name| {
+            properties
+                .get(*name)
+                .map(|schema| ((*name).to_owned(), schema.clone()))
+        })
+        .collect();
+
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        // Required, not merely allowed: a pass that answers with an empty object has not
+        // been asked a question it could dodge.
+        "required": purpose.sections(),
+        "properties": kept,
+    })
+}
+
+/// The JSON Schema of the whole draft. The per-pass schemas are slices of it.
 pub fn response_schema() -> Value {
     json!({
         "type": "object",

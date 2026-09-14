@@ -35,7 +35,7 @@ use crate::candidate::{
     normalise_name, CandidateAlias, CandidateApplication, CandidateApplicationDetail,
     CandidateCategory, CandidateDeclaration, CandidateDraft, CandidateFact, CandidateGap,
     CandidateProduct, CandidateQa, CandidateQuestion, CandidateSense, CandidateSynonym,
-    CandidateTerm, ResolvedEvidence,
+    CandidateTerm, KnownProducts, ResolvedEvidence,
 };
 use crate::measure;
 use crate::quote;
@@ -53,23 +53,28 @@ const MAX_UNIT_CHARS: usize = 40;
 ///
 /// `prefix` namespaces the response-local references (`b1`, `b2`, …) so several
 /// requests of one run can be merged without their `p1`s colliding.
+///
+/// R05.2: `known` carries the products an earlier pass accepted. A pass that is not the
+/// inventory does not re-declare them — it cites the server's label — so `product_ref`
+/// resolves against this response's own products first and against `known` second.
 pub fn validate_response(
     response: &DraftResponse,
     catalog: &SourceCatalog,
     limits: &DraftLimits,
     prefix: &str,
+    known: &KnownProducts,
 ) -> CandidateDraft {
     let mut draft = CandidateDraft::default();
 
     validate_categories(response, limits, prefix, &mut draft);
     validate_products(response, catalog, limits, prefix, &mut draft);
-    validate_facts(response, catalog, limits, prefix, &mut draft);
+    validate_facts(response, catalog, limits, prefix, known, &mut draft);
     validate_terms(response, catalog, limits, &mut draft);
     validate_qa(response, catalog, limits, &mut draft);
-    validate_gaps(response, limits, prefix, &mut draft);
+    validate_gaps(response, limits, prefix, known, &mut draft);
     // After the products, so an application may reference one; before the declarations,
     // so a declaration can be checked against what the response actually produced.
-    validate_applications(response, catalog, limits, prefix, &mut draft);
+    validate_applications(response, catalog, limits, prefix, known, &mut draft);
     validate_declarations(response, limits, &mut draft);
 
     draft
@@ -153,6 +158,7 @@ fn validate_applications(
     catalog: &SourceCatalog,
     limits: &DraftLimits,
     prefix: &str,
+    known: &KnownProducts,
     draft: &mut CandidateDraft,
 ) {
     for (index, application) in response.applications.iter().enumerate() {
@@ -179,7 +185,7 @@ fn validate_applications(
 
         let product_ref = match application.product_ref.as_deref().map(str::trim) {
             Some(reference) if !reference.is_empty() => {
-                match resolve_product(draft, prefix, reference) {
+                match resolve_product(draft, prefix, known, reference) {
                     Some(found) => Some(found),
                     None => {
                         draft.note(format!(
@@ -484,6 +490,7 @@ fn validate_facts(
     catalog: &SourceCatalog,
     limits: &DraftLimits,
     prefix: &str,
+    known: &KnownProducts,
     draft: &mut CandidateDraft,
 ) {
     let mut accepted = 0usize;
@@ -532,7 +539,7 @@ fn validate_facts(
         // addressed either by its draft-local `ref` or by its own name.
         let product_ref = match fact.product_ref.as_deref().map(str::trim) {
             Some(reference) if !reference.is_empty() => {
-                let Some(found) = resolve_product(draft, prefix, reference) else {
+                let Some(found) = resolve_product(draft, prefix, known, reference) else {
                     draft.reject(format!(
                         "факт «{label}» отклонён: изделие «{}» не описано в ответе",
                         short(reference)
@@ -872,6 +879,7 @@ fn validate_gaps(
     response: &DraftResponse,
     limits: &DraftLimits,
     prefix: &str,
+    known: &KnownProducts,
     draft: &mut CandidateDraft,
 ) {
     for (index, gap) in response.gaps.iter().enumerate() {
@@ -896,7 +904,7 @@ fn validate_gaps(
 
         let product_ref = match gap.product_ref.as_deref().map(str::trim) {
             Some(reference) if !reference.is_empty() => {
-                match resolve_product(draft, prefix, reference) {
+                match resolve_product(draft, prefix, known, reference) {
                     Some(found) => Some(found),
                     None => {
                         draft.note(format!(
@@ -1056,7 +1064,12 @@ fn quoted_anywhere(text: &str, evidence: &[ResolvedEvidence]) -> bool {
 ///
 /// An ambiguous name (two products sharing it) resolves to nothing: silently picking
 /// one would attach a property to the wrong product.
-fn resolve_product(draft: &CandidateDraft, prefix: &str, reference: &str) -> Option<String> {
+fn resolve_product(
+    draft: &CandidateDraft,
+    prefix: &str,
+    known: &KnownProducts,
+    reference: &str,
+) -> Option<String> {
     let namespaced = product_ref(prefix, reference);
     if draft
         .products
@@ -1071,11 +1084,17 @@ fn resolve_product(draft: &CandidateDraft, prefix: &str, reference: &str) -> Opt
         .products
         .iter()
         .filter(|product| normalise_name(&product.name) == wanted);
-    let first = matches.next()?;
-    if matches.next().is_some() {
+    if let Some(first) = matches.next() {
+        // Two products of the same name in one response: naming one is a coin toss.
+        if matches.next().is_none() {
+            return Some(first.reference.clone());
+        }
         return None;
     }
-    Some(first.reference.clone())
+
+    // Nothing in this response — which is the normal case for every pass after the
+    // inventory, because those passes are not shown the products to re-declare.
+    known.resolve(reference)
 }
 
 /// The same two spellings for a product's category.

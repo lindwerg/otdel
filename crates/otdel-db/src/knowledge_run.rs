@@ -139,6 +139,7 @@ async fn clear_run_account(tx: &mut ScopedTx, material_id: Uuid) -> DbResult<()>
     let bureau_id = tx.bureau_id();
     for table in [
         "otdel.knowledge_page_coverage",
+        "otdel.knowledge_run_passes",
         "otdel.knowledge_uncertainties",
         "otdel.knowledge_declarations",
     ] {

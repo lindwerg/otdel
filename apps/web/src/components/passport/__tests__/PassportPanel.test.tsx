@@ -71,6 +71,38 @@ function auditedCoverage(overrides: Partial<CoverageReport> = {}): CoverageRepor
       },
     ],
     declarations: [],
+    // R05.2: the glossary pass never finished, which is why an empty glossary is
+    // an open question here and not a finding about the material.
+    passes: [
+      {
+        id: 'pass-1',
+        run_id: 'run-1',
+        material_id: MATERIAL,
+        purpose: 'inventory',
+        requests_allowed: 8,
+        requests_made: 8,
+        pages_total: 36,
+        pages_processed: 36,
+        pages_deferred: 0,
+        covered_everything: true,
+        input_chars: 90_000,
+        created_at: '2026-01-01T10:00:00Z',
+      },
+      {
+        id: 'pass-2',
+        run_id: 'run-1',
+        material_id: MATERIAL,
+        purpose: 'glossary',
+        requests_allowed: 8,
+        requests_made: 2,
+        pages_total: 36,
+        pages_processed: 8,
+        pages_deferred: 28,
+        covered_everything: false,
+        input_chars: 20_000,
+        created_at: '2026-01-01T10:00:00Z',
+      },
+    ],
     ...overrides,
   }
 }

@@ -4,11 +4,13 @@ import type {
   CoverageReport,
   CoverageState,
   DeclarationTopic,
+  DraftPurpose,
   GapNature,
   IdentityBasis,
   IdentityState,
   PageDisposition,
   RequirementsState,
+  RunPass,
   StructuralSource,
   SynonymRelation,
   UncertaintyKind,
@@ -210,4 +212,28 @@ export function splitRequirement(line: string): { name: string; explanation: str
 export function costLine(microUsd: number | null): string | null {
   if (microUsd == null) return null
   return `${(microUsd / 1_000_000).toFixed(4)} $`
+}
+
+const PURPOSE_LABEL: Record<DraftPurpose, string> = {
+  inventory: 'состав предложения',
+  facts: 'характеристики',
+  glossary: 'термины',
+  applications: 'задачи применения',
+  inquiry: 'вопросы и пробелы',
+}
+
+export function purposeLabel(purpose: DraftPurpose): string {
+  return PURPOSE_LABEL[purpose] ?? purpose
+}
+
+/**
+ * One pass in a line: «термины — разобрано 6 из 6» or «…3 из 6, не закончено».
+ *
+ * The denominator again, one level down. A run that says «44 из 44» and a glossary
+ * pass that says «3 из 44» are both true, and only the second explains an empty
+ * glossary — so the pass line never omits its own total either.
+ */
+export function passLine(pass: RunPass): string {
+  const read = `разобрано ${pass.pages_processed} из ${pass.pages_total}`
+  return pass.covered_everything ? read : `${read}, не закончено`
 }

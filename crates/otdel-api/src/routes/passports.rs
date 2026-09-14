@@ -18,7 +18,7 @@ use axum::extract::State;
 use axum::Json;
 use otdel_core::passport::{
     KnowledgeDeclaration, KnowledgeUncertainty, PageCoverage, ProductApplication,
-    ProductIdentityLink, ProductPassport, RunCoverage,
+    ProductIdentityLink, ProductPassport, RunCoverage, RunPass,
 };
 use otdel_db::{knowledge_read, partners, passport_read};
 use serde::{Deserialize, Serialize};
@@ -57,6 +57,12 @@ pub struct CoverageReport {
     pub pages: Vec<PageCoverage>,
     /// The topics this run stated are empty, in its own words.
     pub declarations: Vec<KnowledgeDeclaration>,
+    /// R05.2 — what each purpose-specific pass covered.
+    ///
+    /// Beside the page account rather than instead of it: the first answers "was this page
+    /// read", these answer "read for what". «44 из 44» with an empty glossary is only
+    /// readable when both are on the page.
+    pub passes: Vec<RunPass>,
 }
 
 /// `GET /api/partners/{id}/passports` — every product, assembled for reading.
@@ -114,6 +120,7 @@ pub async fn coverage(
         let pages = passport_read::page_coverage(&mut tx, run.id).await?;
         let declarations =
             passport_read::list_declarations(&mut tx, partner_id, Some(run.id)).await?;
+        let passes = passport_read::run_passes(&mut tx, run.id).await?;
         reports.push(CoverageReport {
             run_id: run.id,
             material_id: run.material_id,
@@ -127,6 +134,7 @@ pub async fn coverage(
                 .collect(),
             pages,
             declarations,
+            passes,
             coverage: run.coverage,
         });
     }
@@ -216,6 +224,7 @@ mod tests {
                 .collect(),
             pages,
             declarations: Vec::new(),
+            passes: Vec::new(),
             coverage,
         }
     }

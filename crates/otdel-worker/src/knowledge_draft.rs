@@ -13,15 +13,17 @@
 //! * [`collect_uncertainties`] gathers what nobody may read as a value, from two sources
 //!   kept apart on purpose — a cell R03 could not settle, and a page nobody could read.
 
-use otdel_core::passport::{FactOrigin, StructuralSource, UncertaintyKind};
+use otdel_core::passport::{DeclarationTopic, FactOrigin, StructuralSource, UncertaintyKind};
 use otdel_db::knowledge::{
     NewCategory, NewDraft, NewEvidence, NewFact, NewGap, NewProduct, NewQa, NewQuestion, NewTerm,
 };
 use otdel_db::passport::{
-    NewAlias, NewApplication, NewApplicationDetail, NewDeclaration, NewPageCoverage, NewSense,
-    NewSynonym, NewUncertainty,
+    NewAlias, NewApplication, NewApplicationDetail, NewDeclaration, NewPageCoverage, NewRunPass,
+    NewSense, NewSynonym, NewUncertainty,
 };
-use otdel_knowledge::{tables, CandidateDraft, CoveragePlan, StructuredCell, TableReading};
+use otdel_knowledge::{
+    tables, CandidateDraft, CoveragePlan, DraftPurpose, PurposePass, StructuredCell, TableReading,
+};
 use uuid::Uuid;
 
 /// Map validated candidates onto the storage layer's input.
@@ -283,6 +285,61 @@ pub(crate) fn evidence(resolved: &otdel_knowledge::ResolvedEvidence) -> NewEvide
         char_start: resolved.char_start,
         char_end: resolved.char_end,
     }
+}
+
+// --- the per-purpose account (R05.2) -------------------------------------------------
+
+/// Which requirement topics a purpose-specific pass is in a position to speak for.
+///
+/// The mapping is one-to-one except for the inquiry pass, which is the one that looks for
+/// questions and for what the material does not say — three topics at once, because they
+/// are three readings of the same search.
+fn topics_of(purpose: DraftPurpose) -> &'static [DeclarationTopic] {
+    match purpose {
+        // The inventory pass establishes products. No topic is declarable from it: a
+        // catalogue with no products is not an observation, it is a failed draft.
+        DraftPurpose::Inventory | DraftPurpose::Facts => &[],
+        DraftPurpose::Glossary => &[DeclarationTopic::Glossary],
+        DraftPurpose::Applications => &[DeclarationTopic::Applications],
+        DraftPurpose::Inquiry => &[
+            DeclarationTopic::Questions,
+            DeclarationTopic::CommercialUnknowns,
+            DeclarationTopic::TechnicalUnknowns,
+        ],
+    }
+}
+
+/// The topics whose own pass got through the whole material.
+///
+/// The requirement check accepts "there is none" only for these. A topic missing from the
+/// list is not a topic the material is silent about — it is a topic nothing looked for,
+/// and the run reports it as unresolved coverage instead.
+pub(crate) fn topics_whose_pass_covered_the_material(
+    passes: &[PurposePass],
+) -> Vec<DeclarationTopic> {
+    passes
+        .iter()
+        .filter(|pass| pass.covered_everything())
+        .flat_map(|pass| topics_of(pass.purpose).iter().copied())
+        .collect()
+}
+
+/// One storable row per pass.
+pub(crate) fn run_pass_rows(passes: &[PurposePass], offerable_pages: usize) -> Vec<NewRunPass> {
+    let total = i32::try_from(offerable_pages).unwrap_or(i32::MAX);
+    passes
+        .iter()
+        .map(|pass| NewRunPass {
+            purpose: pass.purpose.as_str().to_owned(),
+            requests_allowed: i32::try_from(pass.requests_allowed).unwrap_or(i32::MAX),
+            requests_made: i32::try_from(pass.requests_made).unwrap_or(i32::MAX),
+            pages_total: total,
+            pages_processed: i32::try_from(pass.processed.len()).unwrap_or(i32::MAX),
+            pages_deferred: i32::try_from(pass.deferred.len()).unwrap_or(i32::MAX),
+            covered_everything: pass.covered_everything(),
+            input_chars: i32::try_from(pass.input_chars).unwrap_or(i32::MAX),
+        })
+        .collect()
 }
 
 #[cfg(test)]

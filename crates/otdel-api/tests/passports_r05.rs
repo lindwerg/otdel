@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use axum::http::StatusCode;
 use otdel_embed::EmbeddingProvider;
-use otdel_llm::fake::{FakeProvider, FakeReply};
+use otdel_llm::fake::FakeProvider;
 use otdel_llm::{LlmProvider, UnconfiguredProvider};
 use serde_json::{json, Value};
 use support::{TestApp, TestClient};
@@ -116,6 +116,76 @@ fn technical_catalogue() -> Vec<u8> {
         );
     }
     builder.build()
+}
+
+/// Upload the multi-page technical catalogue and read it.
+async fn upload_catalogue(app: &TestApp, client: &TestClient, partner: Uuid) -> Uuid {
+    let response = app
+        .send(client.upload_request(
+            &format!("/api/partners/{partner}/materials"),
+            "technical.pdf",
+            Some("application/pdf"),
+            &technical_catalogue(),
+        ))
+        .await;
+    assert_eq!(response.status, StatusCode::CREATED, "{}", response.text());
+    let material = Uuid::parse_str(response.json()["id"].as_str().unwrap()).unwrap();
+    app.run_worker(&app.extractor()).await;
+    material
+}
+
+/// A draft in which every pass has something real to return.
+///
+/// Written once as an omnibus answer and sliced per pass by `support::scripted_run`, the
+/// same way the server slices the schema — so the fixture reads as "what the model knows"
+/// and no test has to know the pass order.
+fn full_draft_answer(quote: &str, word: &str) -> Value {
+    json!({
+        "categories": [],
+        "products": (1..=4).map(|n| json!({
+            "ref": format!("p{n}"), "category_ref": null, "kind": "product",
+            "name": format!("AP{n}0"), "summary": "профиль монтажный", "aliases": [],
+        })).collect::<Vec<_>>(),
+        "facts": [{
+            // The later passes cite the server's label, never a ref of their own.
+            "product_ref": "P1", "kind": "characteristic",
+            "attribute": "обозначение", "value": word,
+            "unit": null, "conditions": null, "model_context": null,
+            "evidence": [{"source": "S1", "quote": quote}],
+        }],
+        "glossary": [{
+            "term": word, "definition": "несущий элемент системы",
+            "definition_from_source": false,
+            "evidence": [{"source": "S1", "quote": quote}],
+            "senses": [], "synonyms": [],
+        }],
+        "qa": [],
+        "gaps": [{
+            "product_ref": "P1", "topic": "цена",
+            "missing": "цена не указана", "blocks": null,
+            "question": "Какая отпускная цена?", "audience": "partner",
+            "nature": "commercial",
+        }, {
+            "product_ref": "P1", "topic": "нагрузка",
+            "missing": "единица нагрузки не написана", "blocks": null,
+            "question": null, "audience": null, "nature": "technical",
+        }],
+        "applications": [{
+            "product_ref": "P1",
+            "task": "закрепить лоток к перекрытию",
+            "summary": null, "model_context": null,
+            "evidence": [{"source": "S1", "quote": quote}],
+            "details": [{
+                "kind": "parameter", "label": "обозначение",
+                "value": word, "unit": null, "audience": null,
+                "evidence": [{"source": "S1", "quote": quote}],
+            }],
+        }],
+        "declarations": {
+            "glossary": null, "questions": null, "applications": null,
+            "commercial_unknowns": null, "technical_unknowns": null,
+        },
+    })
 }
 
 async fn get(app: &TestApp, client: &TestClient, uri: &str) -> Value {
@@ -312,10 +382,13 @@ fn rich_answer(quote: &str) -> Value {
     })
 }
 
-fn scripted(values: Vec<Value>) -> Arc<FakeProvider> {
-    Arc::new(FakeProvider::new(
-        values.into_iter().map(FakeReply::Json).collect(),
-    ))
+/// A provider that answers one whole run per omnibus answer.
+///
+/// R05.2: a run is five purpose-specific passes. A test still writes "what the model knows
+/// about this material" once and this slices it per pass, the same way the server slices
+/// the schema — so the fixtures stay readable and no test has to know the pass order.
+fn scripted(answers: Vec<Value>) -> Arc<FakeProvider> {
+    support::scripted_runs(&answers)
 }
 
 /// The coverage report of the only run of this partner.
@@ -759,14 +832,11 @@ async fn declaring_every_topic_empty_over_a_real_catalogue_neither_passes_nor_pu
         .iter()
         .map(|line| line.as_str().unwrap().to_owned())
         .collect();
-    // The two the owner called out by name, plus the rest, each under its own topic.
-    for topic in [
-        "glossary:",
-        "applications:",
-        "questions:",
-        "commercial_unknowns:",
-        "technical_unknowns:",
-    ] {
+    // Three topics refused because the run itself disagrees with them. `glossary` and
+    // `applications` are *not* here, and that is the rule working rather than failing:
+    // those two passes read every page of this material, so "we found none" is something
+    // they are in a position to say. The next test is the case where they are not.
+    for topic in ["questions:", "commercial_unknowns:", "technical_unknowns:"] {
         assert!(
             missing.iter().any(|line| line.starts_with(topic)),
             "{topic} is not named in {missing:?}"
@@ -775,10 +845,6 @@ async fn declaring_every_topic_empty_over_a_real_catalogue_neither_passes_nor_pu
     // The refusals explain themselves rather than reading as "nothing was said": a
     // declaration *was* made and was not good enough, which is a different instruction
     // to the owner.
-    assert!(
-        missing.iter().any(|line| line.contains("нужен человек")),
-        "{missing:?}"
-    );
     assert!(
         missing.iter().any(|line| line.contains("противоречит")),
         "the unsettled readings contradict the declarations: {missing:?}"
@@ -851,6 +917,199 @@ async fn declaring_every_topic_empty_over_a_real_catalogue_neither_passes_nor_pu
     // throwing the work away.
     let passports = get(&app, &client, &format!("/api/partners/{partner}/passports")).await;
     assert_eq!(passports["items"].as_array().unwrap().len(), 4);
+}
+
+// --- R05.2: the purpose-specific passes ------------------------------------------------
+
+/// A material that really has terms and applications must end up with them.
+///
+/// The second live run was the gate working and the productologist failing: 51 products,
+/// 6 facts, **0 terms, 0 applications** over a technical catalogue that plainly has both.
+/// One omnibus request asked for everything at once and spent its output budget on the
+/// cheapest section, and nothing downstream could tell that apart from a material with no
+/// terms in it.
+///
+/// The run is five bounded passes now, each with a schema containing only its own
+/// sections. This test gives every pass something real to find and asserts the sections
+/// arrive — and that a draft which genuinely carries them is allowed to publish.
+#[tokio::test]
+async fn a_material_with_terms_and_applications_produces_both_sections_and_may_publish() {
+    let app = TestApp::start_with_env(std::collections::BTreeMap::from([(
+        "OTDEL_MAX_UPLOAD_BYTES".to_owned(),
+        "262144".to_owned(),
+    )]))
+    .await;
+    let client = app.sign_in().await;
+    let partner = app.create_partner(&client, "Партнёр").await;
+
+    let material = upload_catalogue(&app, &client, partner).await;
+    let quote = quotable(&page_text(&app, &client, partner, material).await);
+    let word = word_from(&quote);
+
+    let provider = scripted(vec![full_draft_answer(&quote, &word)]);
+    let report = app
+        .run_knowledge(&app.knowledge_worker(provider.clone()))
+        .await;
+    assert_eq!(report.jobs_completed, 1);
+    // One request per purpose: the material fits a single batch each way.
+    assert_eq!(provider.call_count(), support::PASSES_PER_RUN);
+
+    // Each pass was asked for its own thing, and only its own thing.
+    let prompts = provider.prompts();
+    assert!(
+        prompts[0].contains("ТОЛЬКО СОСТАВ ПРЕДЛОЖЕНИЯ"),
+        "{}",
+        prompts[0]
+    );
+    assert!(
+        prompts[1].contains("ТОЛЬКО ХАРАКТЕРИСТИКИ"),
+        "{}",
+        prompts[1]
+    );
+    assert!(prompts[2].contains("ТОЛЬКО ТЕРМИНЫ"), "{}", prompts[2]);
+    assert!(
+        prompts[3].contains("ТОЛЬКО ЗАДАЧИ ПРИМЕНЕНИЯ"),
+        "{}",
+        prompts[3]
+    );
+    assert!(
+        prompts[4].contains("ТОЛЬКО ВОПРОСЫ И ПРОБЕЛЫ"),
+        "{}",
+        prompts[4]
+    );
+    // …and the later passes were handed the products instead of being asked to re-list
+    // them, which is what kept the budget from going on products a second time.
+    assert!(
+        prompts[1].contains("ИЗДЕЛИЯ, УЖЕ ВЫДЕЛЕННЫЕ"),
+        "{}",
+        prompts[1]
+    );
+    assert!(!prompts[2].contains("ТОЛЬКО СОСТАВ"), "{}", prompts[2]);
+
+    // The sections the live run lost.
+    let glossary = get(
+        &app,
+        &client,
+        &format!("/api/partners/{partner}/knowledge/glossary"),
+    )
+    .await;
+    assert!(
+        !glossary["items"].as_array().unwrap().is_empty(),
+        "the glossary pass produced nothing: {glossary}"
+    );
+
+    let applications = get(
+        &app,
+        &client,
+        &format!("/api/partners/{partner}/applications"),
+    )
+    .await;
+    assert!(
+        !applications["items"].as_array().unwrap().is_empty(),
+        "the applications pass produced nothing: {applications}"
+    );
+
+    // Every pass covered the material, and the draft carries what a passport needs…
+    let coverage = coverage_of(&app, &client, partner).await;
+    assert_eq!(coverage["state"], "complete");
+    assert_eq!(
+        coverage["requirements"], "met",
+        "a genuinely filled draft must be allowed through: {coverage}"
+    );
+    assert_eq!(coverage["allows_automatic_publication"], true);
+
+    // …so this one publishes, which is the other half of the gate being correct.
+    let llm: Arc<dyn LlmProvider> = Arc::new(UnconfiguredProvider::new(
+        &otdel_core::llm_config::LlmSettings::default(),
+    ));
+    let embeddings: Arc<dyn EmbeddingProvider> =
+        otdel_embed::build_provider(&otdel_core::retrieval_config::EmbeddingSettings::default());
+    let validation = app
+        .run_validation(&app.validation_worker(llm, embeddings))
+        .await;
+    assert_eq!(
+        validation.versions_published, 1,
+        "a complete passport must still be publishable"
+    );
+}
+
+/// The same material, with a budget that cannot reach the glossary and application passes.
+///
+/// This is the case the owner named: the absences must be **unresolved coverage under
+/// their own topic**, never a declaration clearing a topic nothing examined.
+#[tokio::test]
+async fn a_topic_whose_pass_never_ran_is_unresolved_coverage_and_not_a_declaration_escape() {
+    let app = TestApp::start_with_env(std::collections::BTreeMap::from([
+        ("OTDEL_MAX_UPLOAD_BYTES".to_owned(), "262144".to_owned()),
+        // One page per request over a six-page material, and six requests for the whole
+        // run: the fair share gives every pass one request, so no pass finishes.
+        ("OTDEL_LLM_MAX_PAGES_PER_REQUEST".to_owned(), "1".to_owned()),
+        ("OTDEL_LLM_MAX_REQUESTS_PER_RUN".to_owned(), "5".to_owned()),
+        (
+            "OTDEL_LLM_MAX_REQUESTS_PER_PURPOSE".to_owned(),
+            "1".to_owned(),
+        ),
+    ]))
+    .await;
+    let client = app.sign_in().await;
+    let partner = app.create_partner(&client, "Партнёр").await;
+
+    let material = upload_catalogue(&app, &client, partner).await;
+    let quote = quotable(&page_text(&app, &client, partner, material).await);
+    let word = word_from(&quote);
+
+    // The model declares every topic empty — the escape the second live run took.
+    let mut answer = full_draft_answer(&quote, &word);
+    answer["glossary"] = json!([]);
+    answer["applications"] = json!([]);
+    answer["declarations"] = json!({
+        "glossary": "терминов в материале нет",
+        "questions": "спрашивать нечего",
+        "applications": "задач применения материал не описывает",
+        "commercial_unknowns": "коммерческих неизвестных не осталось",
+        "technical_unknowns": "технических неизвестных не осталось",
+    });
+
+    let provider = scripted(vec![answer]);
+    let report = app.run_knowledge(&app.knowledge_worker(provider)).await;
+    assert_eq!(report.jobs_completed, 1);
+    assert_eq!(report.runs_below_requirements, 1);
+
+    let coverage = coverage_of(&app, &client, partner).await;
+    assert_eq!(coverage["requirements"], "unmet");
+    assert_eq!(coverage["allows_automatic_publication"], false);
+
+    let missing: Vec<String> = coverage["requirements_missing"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line.as_str().unwrap().to_owned())
+        .collect();
+
+    // Named under their own topics, and named as *coverage* — the run is not claiming the
+    // material has no terms, it is saying nothing finished looking.
+    for topic in ["glossary:", "applications:"] {
+        let line = missing
+            .iter()
+            .find(|line| line.starts_with(topic))
+            .unwrap_or_else(|| panic!("{topic} is not named in {missing:?}"));
+        assert!(
+            line.contains("охват"),
+            "{topic} must read as unresolved coverage, not as a verdict: {line}"
+        );
+    }
+
+    // And the per-pass account backs it up: each pass says how much it actually read.
+    let passes = coverage["passes"].as_array().unwrap();
+    assert_eq!(passes.len(), support::PASSES_PER_RUN, "{coverage}");
+    for pass in passes {
+        assert_eq!(pass["requests_allowed"], 1);
+        assert_eq!(
+            pass["covered_everything"], false,
+            "one request cannot cover six pages: {pass}"
+        );
+        assert!(pass["pages_deferred"].as_i64().unwrap() > 0, "{pass}");
+    }
 }
 
 /// Re-queueing a material drops what the previous pass said about *itself*.

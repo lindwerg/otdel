@@ -1,6 +1,8 @@
 import type { CoverageReport } from '../../api/types'
 import {
   coverageLine,
+  passLine,
+  purposeLabel,
   coverageStateLabel,
   coverageTone,
   costLine,
@@ -88,6 +90,35 @@ export function CoverageCard({ report }: CoverageCardProps) {
                 <span className="coverage__stated">{declaration.stated}</span>
               </li>
             ))}
+          </ul>
+        </section>
+      ) : null}
+
+      {/* R05.2. «44 из 44» is true and cannot explain an empty glossary; these can.
+          Unfinished passes come first, because they are the ones that mean an empty
+          section is an open question rather than a finding about the material. */}
+      {report.passes.length > 0 ? (
+        <section className="coverage__passes">
+          <h5>Что искали по отдельности</h5>
+          <ul>
+            {[...report.passes]
+              .sort((a, b) => Number(a.covered_everything) - Number(b.covered_everything))
+              .map((pass) => (
+                <li
+                  key={pass.id}
+                  className={
+                    pass.covered_everything
+                      ? 'coverage__pass'
+                      : 'coverage__pass coverage__pass--unfinished'
+                  }
+                >
+                  <span className="coverage__pass-name">{purposeLabel(pass.purpose)}</span>
+                  <span className="coverage__pass-count">{passLine(pass)}</span>
+                  <span className="coverage__pass-requests">
+                    запросов {pass.requests_made} из {pass.requests_allowed}
+                  </span>
+                </li>
+              ))}
           </ul>
         </section>
       ) : null}

@@ -28,6 +28,7 @@ use otdel_core::config::Config;
 use otdel_core::secret;
 use otdel_db::Database;
 use otdel_extract::{OcrEngine, PageProcessor, PageRasteriser, ToolAvailability};
+use otdel_llm::fake::{FakeProvider, FakeReply};
 use otdel_llm::LlmProvider;
 use otdel_search::{DocumentFetcher, SearchProvider};
 use otdel_storage::{FilesystemObjectStore, ObjectStore};
@@ -1062,3 +1063,60 @@ impl ResearchOverrides {
         }
     }
 }
+
+// --- R05.2: scripting a five-pass run ---------------------------------------------------
+
+/// Split one omnibus answer into the per-purpose replies a run now asks for.
+///
+/// The run is five bounded passes — inventory, facts, glossary, applications, inquiry —
+/// each sent a schema containing only its own sections. A test still wants to describe
+/// "what the model knows about this material" once, so it writes the whole answer and this
+/// slices it the same way [`otdel_knowledge::schema::response_schema_for`] slices the
+/// schema. One source of truth per fixture, and no suite has to know the pass order.
+///
+/// Sections the answer does not mention come through as the empty object, which is what a
+/// model with nothing to say for that pass would return.
+pub fn purpose_replies(answer: &Value) -> Vec<FakeReply> {
+    // An answer mentioning no known section at all is not a draft — it is the "the model
+    // ignored the schema" case. Slicing it would turn it into five empty objects, which
+    // parse cleanly and would quietly convert a refusal into a success. It goes to every
+    // pass verbatim instead, so each one refuses it the way it would in production.
+    let recognised = otdel_knowledge::DraftPurpose::ALL
+        .into_iter()
+        .flat_map(|purpose| purpose.sections().iter())
+        .any(|section| answer.get(*section).is_some());
+    if !recognised {
+        return otdel_knowledge::DraftPurpose::ALL
+            .into_iter()
+            .map(|_| FakeReply::Json(answer.clone()))
+            .collect();
+    }
+
+    otdel_knowledge::DraftPurpose::ALL
+        .into_iter()
+        .map(|purpose| {
+            let mut slice = serde_json::Map::new();
+            for section in purpose.sections() {
+                if let Some(value) = answer.get(*section) {
+                    slice.insert((*section).to_owned(), value.clone());
+                }
+            }
+            FakeReply::Json(Value::Object(slice))
+        })
+        .collect()
+}
+
+/// A scripted provider that answers one whole run: one reply per purpose.
+pub fn scripted_run(answer: &Value) -> Arc<FakeProvider> {
+    Arc::new(FakeProvider::new(purpose_replies(answer)))
+}
+
+/// The same, for a run over `materials` materials — the replies repeat per material.
+pub fn scripted_runs(answers: &[Value]) -> Arc<FakeProvider> {
+    Arc::new(FakeProvider::new(
+        answers.iter().flat_map(purpose_replies).collect(),
+    ))
+}
+
+/// How many model calls one material's run makes when every pass needs one request.
+pub const PASSES_PER_RUN: usize = otdel_knowledge::DraftPurpose::ALL.len();

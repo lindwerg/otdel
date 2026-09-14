@@ -103,6 +103,112 @@ export interface BoundingBox {
   y1: number
 }
 
+// --- R03: where a fragment was read, and what it means ---------------------
+
+/**
+ * Exactly where on which page something was read — or why that cannot be said.
+ *
+ * A tagged union, flattened on the wire, and it stays a union here on purpose:
+ * `unavailable` carries a `reason` and **no** rectangle. An engine that returns
+ * text without word boxes produces that state, and the interface shows the
+ * reason instead of drawing a box over the whole page, which would look like
+ * evidence and point at nothing.
+ */
+export type SourceSpan =
+  | { page_number: number; bbox: BoundingBox | null; state: 'exact' }
+  | { page_number: number; bbox: null; state: 'unavailable'; reason: string }
+
+/** What a cell *is* within its table. Distinct from the value it may carry. */
+export type CellRole = 'column_header' | 'row_header' | 'data'
+
+/**
+ * How far a cell may be trusted as a value. A category, never a score.
+ *
+ * There is deliberately no confidence number anywhere in this shape: the
+ * extractor has no measurement that would justify one, and an invented `0.87`
+ * is worse than an honest "ambiguous, because the unit is not written anywhere".
+ */
+export type CellUsability = 'usable' | 'ambiguous' | 'unusable'
+
+/** Why a cell is not plainly usable. Every reason is something a person can act on. */
+export type AmbiguityReason =
+  | 'header_is_not_a_value'
+  | 'header_shaped_text'
+  | 'blank_cell'
+  | 'multiple_values_in_one_cell'
+  | 'no_column_header'
+  | 'no_row_context'
+  | 'unit_unresolved'
+  | 'condition_unresolved'
+  | 'context_inherited_from_merged_cell'
+
+export interface CellVerdict {
+  usability: CellUsability
+  /** The server's reasons, in its own order. Shown in words, never as a code. */
+  reasons: AmbiguityReason[]
+}
+
+/**
+ * Where a piece of context was written.
+ *
+ * Kept so an inference is never mistaken for something that stood in the source:
+ * the two `inherited_from_merged_*` origins mean the label was carried across a
+ * blank cell, which is a guess the reader is entitled to see marked.
+ */
+export type ContextOrigin =
+  | 'cell_itself'
+  | 'header_row'
+  | 'inherited_from_merged_header'
+  | 'row_label'
+  | 'inherited_from_merged_row_label'
+  | 'page_heading'
+  | 'footnote'
+
+export interface ContextRef {
+  /** Verbatim, exactly as it stands in the source. */
+  text: string
+  origin: ContextOrigin
+}
+
+/** A unit and where it was written. A unit with no origin cannot exist. */
+export interface UnitRef {
+  unit: string
+  origin: ContextOrigin
+}
+
+/** A condition qualifying a value: a footnote, with the marker that pointed at it. */
+export interface ConditionRef {
+  /** The footnote's verbatim text. */
+  text: string
+  /** The marker as printed in the cell (`*`, `**`, `1)`), when there was one. */
+  marker: string | null
+  span: SourceSpan
+}
+
+/**
+ * Everything needed to say what a cell means — or to conclude that it cannot.
+ *
+ * The fields are deliberately separate. Product identity, property, value, unit
+ * and conditions are different questions with different evidence; collapsing
+ * them into one string is how a column label became a characteristic.
+ */
+export interface StructuralContext {
+  /** Column labels from the outermost header row inwards. Empty when no header
+   *  band could be proven. */
+  column_header_path: ContextRef[]
+  /** The row's own label cells, left to right. */
+  row_header_path: ContextRef[]
+  /** The product or section this cell belongs to. */
+  subject: ContextRef | null
+  /** The property being measured — the innermost column label. */
+  property: ContextRef | null
+  unit: UnitRef | null
+  conditions: ConditionRef[]
+}
+
+/** Whether a drawing on the page was interpreted. `not_attempted` is a state, not a failure. */
+export type DiagramInterpretation = 'none' | 'not_attempted'
+
 export interface MaterialPage {
   id: string
   material_id: string
@@ -127,6 +233,13 @@ export interface MaterialPage {
   extracted_at: string | null
   region_count: number
   table_count: number
+  /** Which reading of the stored original produced this page, when the server
+   *  recorded one. `null` means it did not — never "the current one". */
+  extraction_revision: string | null
+  /** Vector drawings counted on the page. A count, not an interpretation. */
+  drawing_count: number
+  /** `not_attempted` on a page that holds a drawing: nothing here read it. */
+  diagram_interpretation: DiagramInterpretation
 }
 
 export interface TableCell {
@@ -141,6 +254,11 @@ export interface TableCell {
   unit: string | null
   column_header: string | null
   bbox: BoundingBox | null
+  /** A header is a header, and a header is never a value. */
+  role: CellRole
+  verdict: CellVerdict
+  structural_context: StructuralContext
+  span: SourceSpan
 }
 
 export interface PageRegion {
@@ -156,12 +274,50 @@ export interface PageRegion {
   row_count: number | null
   column_count: number | null
   cells: TableCell[]
+  /** Where this region was read, or the stated reason why that is unknown. */
+  span: SourceSpan
 }
 
 export interface PageDetail {
   page: MaterialPage
   text: string | null
   regions: PageRegion[]
+}
+
+/** A region that can be drawn: its span carries coordinates the parser measured. */
+export interface PlacedRegion {
+  region_id: string
+  ordinal: number
+  kind: RegionKind
+  span: SourceSpan
+}
+
+/** A region that cannot be drawn, with the server's own reason. Listed, never drawn. */
+export interface UnplacedRegion {
+  region_id: string
+  ordinal: number
+  kind: RegionKind
+  reason: string
+}
+
+/**
+ * Where the regions of one page sit, in that page's own point coordinates.
+ *
+ * Deliberately not a rendering of the page: phase 1B stores no page images, so
+ * there is nothing to show behind the rectangles and the interface must not
+ * imply otherwise. `width_pt`/`height_pt` are `null` when the page size was not
+ * recorded — then no map can be drawn at all, and the reason is shown instead.
+ */
+export interface PageView {
+  page_number: number
+  width_pt: number | null
+  height_pt: number | null
+  rotation: number
+  /** Authorised link into the stored original, at this page. */
+  original_url: string
+  diagram_interpretation: DiagramInterpretation
+  regions: PlacedRegion[]
+  unplaced: UnplacedRegion[]
 }
 
 // --- Phase 1C: the product knowledge draft ---------------------------------

@@ -138,6 +138,7 @@ impl SourceCatalog {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use otdel_core::extraction_context::DiagramInterpretation;
 
     fn page(number: i32, status: PageStatus, source: TextSource) -> MaterialPage {
         MaterialPage {
@@ -163,6 +164,9 @@ mod tests {
             extracted_at: Some(Utc::now()),
             region_count: 0,
             table_count: 0,
+            extraction_revision: None,
+            drawing_count: 0,
+            diagram_interpretation: DiagramInterpretation::None,
         }
     }
 

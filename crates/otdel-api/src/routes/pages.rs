@@ -13,9 +13,11 @@
 
 use axum::extract::State;
 use axum::Json;
-use otdel_core::extraction::{MaterialPage, PageDetail, PageStatus};
+use otdel_core::extraction::{MaterialPage, PageDetail, PageStatus, RegionKind};
+use otdel_core::extraction_context::{DiagramInterpretation, SourceSpan};
 use otdel_core::{AppError, ErrorCode};
 use otdel_db::{jobs, materials, pages};
+use serde::Serialize;
 use tracing::info;
 use uuid::Uuid;
 
@@ -63,6 +65,108 @@ pub async fn show(
     tx.commit().await?;
 
     detail.map(Json).ok_or_else(page_not_found)
+}
+
+/// A region that can actually be drawn, in the page's own point coordinates.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlacedRegion {
+    pub region_id: Uuid,
+    pub ordinal: i32,
+    pub kind: RegionKind,
+    pub span: SourceSpan,
+}
+
+/// A region that cannot be drawn, and the reason in words. Listed, never drawn.
+#[derive(Debug, Clone, Serialize)]
+pub struct UnplacedRegion {
+    pub region_id: Uuid,
+    pub ordinal: i32,
+    pub kind: RegionKind,
+    pub reason: String,
+}
+
+/// Where the regions of one page sit. Not an image of the page; see [`view`].
+#[derive(Debug, Clone, Serialize)]
+pub struct PageView {
+    pub page_number: i32,
+    /// `None` when the page never declared its size. The interface then draws no map at
+    /// all rather than assuming A4.
+    pub width_pt: Option<f64>,
+    pub height_pt: Option<f64>,
+    pub rotation: i32,
+    pub original_url: String,
+    pub diagram_interpretation: DiagramInterpretation,
+    pub regions: Vec<PlacedRegion>,
+    pub unplaced: Vec<UnplacedRegion>,
+}
+
+/// `GET .../pages/{page_number}/view` — where this page's regions are, for the viewer.
+///
+/// Deliberately *not* a rendering. Phase 1B stores no page images, so there is nothing to
+/// draw behind the rectangles, and the response says as much by shape: it carries the
+/// page's own dimensions, the regions that have real coordinates, and — separately — the
+/// regions that have none, each with the reason. A region whose coordinates are unknown
+/// is listed in `unplaced`; it never receives an invented rectangle, because a highlight
+/// that points at the wrong part of a document is worse than no highlight at all.
+pub async fn view(
+    State(state): State<AppState>,
+    session: Session,
+    ApiPath((partner_id, material_id, page_number)): ApiPath<(Uuid, Uuid, i32)>,
+) -> ApiResult<Json<PageView>> {
+    let page_number = valid_page_number(page_number)?;
+
+    let mut tx = state.db.begin_scoped(session.bureau_id).await?;
+    // Same containment gate as every other page route: the material is resolved inside
+    // the partner before anything about the page is read.
+    if materials::get_in_partner(&mut tx, partner_id, material_id)
+        .await?
+        .is_none()
+    {
+        return Err(material_not_found());
+    }
+    let Some(page) = pages::find_page(&mut tx, material_id, page_number).await? else {
+        tx.commit().await?;
+        return Err(page_not_found());
+    };
+    let regions = pages::regions_for_page(&mut tx, page.id).await?;
+    tx.commit().await?;
+
+    let mut placed = Vec::new();
+    let mut unplaced = Vec::new();
+    for detail in &regions {
+        let region = &detail.region;
+        if region.span.is_highlightable() {
+            placed.push(PlacedRegion {
+                region_id: region.id,
+                ordinal: region.ordinal,
+                kind: region.kind,
+                span: region.span.clone(),
+            });
+        } else {
+            unplaced.push(UnplacedRegion {
+                region_id: region.id,
+                ordinal: region.ordinal,
+                kind: region.kind,
+                reason: region
+                    .span
+                    .geometry
+                    .reason()
+                    .unwrap_or("координаты области не сохранены")
+                    .to_owned(),
+            });
+        }
+    }
+
+    Ok(Json(PageView {
+        page_number: page.page_number,
+        width_pt: page.width_pt,
+        height_pt: page.height_pt,
+        rotation: page.rotation,
+        original_url: crate::routes::materials::original_url(partner_id, material_id, page_number),
+        diagram_interpretation: page.diagram_interpretation,
+        regions: placed,
+        unplaced,
+    }))
 }
 
 /// `POST .../pages/{page_number}/retry` — read this one page again.

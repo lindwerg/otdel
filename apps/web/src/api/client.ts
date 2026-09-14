@@ -14,6 +14,7 @@ import type {
   Material,
   MaterialPage,
   PageDetail,
+  PageView,
   Partner,
   ProductNode,
   ProviderState,
@@ -248,6 +249,24 @@ export function getPage(
 ): Promise<PageDetail> {
   return apiRequest<PageDetail>(
     `${pagesPath(partnerId, materialId)}/${encodeURIComponent(String(pageNumber))}`,
+  )
+}
+
+/**
+ * Where the regions of one page sit, in that page's own coordinates.
+ *
+ * A separate request from `getPage` because it answers a different question —
+ * "where on the sheet", not "what was read" — and because a page whose size was
+ * never recorded still has regions worth listing. It returns no page image:
+ * nothing in this phase renders the document.
+ */
+export function getPageView(
+  partnerId: string,
+  materialId: string,
+  pageNumber: number,
+): Promise<PageView> {
+  return apiRequest<PageView>(
+    `${pagesPath(partnerId, materialId)}/${encodeURIComponent(String(pageNumber))}/view`,
   )
 }
 

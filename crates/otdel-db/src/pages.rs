@@ -16,6 +16,12 @@ use otdel_core::extraction::{
     BoundingBox, CellValueKind, MaterialPage, PageDetail, PageRegion, PageStatus, RegionDetail,
     RegionKind, TableCell, TextSource,
 };
+use otdel_core::extraction_context::{
+    AmbiguityReason, CellRole, CellUsability, CellVerdict, DiagramInterpretation, SourceSpan,
+    StructuralContext,
+};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use sqlx::postgres::PgRow;
 use sqlx::Row;
 use uuid::Uuid;
@@ -26,7 +32,8 @@ use crate::tenancy::ScopedTx;
 const PAGE_COLUMNS: &str = "p.id, p.material_id, p.page_number, p.status, p.text_source, \
      p.char_count, p.word_count, p.image_count, p.width_pt, p.height_pt, p.rotation, \
      p.parser_name, p.parser_version, p.ocr_engine, p.ocr_version, p.ocr_language, \
-     p.duration_ms, p.attempts, p.diagnostic, p.extracted_at";
+     p.duration_ms, p.attempts, p.diagnostic, p.extracted_at, \
+     p.extraction_revision, p.drawing_count, p.diagram_interpretation";
 
 const PAGE_COUNTS: &str = "coalesce(counts.regions, 0) AS region_count, \
      coalesce(counts.tables, 0) AS table_count";
@@ -68,6 +75,12 @@ pub struct PageOutcomeRow {
     pub ocr_language: Option<String>,
     pub duration_ms: Option<i32>,
     pub diagnostic: Option<String>,
+    /// Vector drawing operations on the page. Only ever used to tell a blank page from a
+    /// page carrying a diagram.
+    pub drawing_count: i32,
+    /// Never more than `not_attempted` in this phase: reading the labels around a load
+    /// diagram is not reading the diagram.
+    pub diagram_interpretation: DiagramInterpretation,
 }
 
 /// A structural region to store, with its cells when it is a table.
@@ -92,6 +105,12 @@ pub struct NewCell {
     pub unit: Option<String>,
     pub column_header: Option<String>,
     pub bbox: Option<BoundingBox>,
+    /// What the cell is within the table. A header is never a value.
+    pub role: CellRole,
+    /// Whether it may be read as a value, and why not when it may not.
+    pub verdict: CellVerdict,
+    /// Product, property, unit and conditions, each naming its origin.
+    pub structural_context: StructuralContext,
 }
 
 /// Record the pages of a material. Existing rows keep their outcome — this pass only
@@ -162,9 +181,10 @@ pub async fn record_outcome(
              (bureau_id, partner_id, material_id, page_number, status, text_source, \
               text_content, char_count, word_count, image_count, width_pt, height_pt, \
               rotation, parser_name, parser_version, ocr_engine, ocr_version, ocr_language, \
-              duration_ms, attempts, diagnostic, extracted_at) \
+              duration_ms, attempts, diagnostic, extracted_at, \
+              extraction_revision, drawing_count, diagram_interpretation) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-                 $17, $18, $19, 1, $20, now()) \
+                 $17, $18, $19, 1, $20, now(), gen_random_uuid(), $21, $22) \
          ON CONFLICT (material_id, page_number) DO UPDATE \
             SET status = EXCLUDED.status, \
                 text_source = EXCLUDED.text_source, \
@@ -183,6 +203,12 @@ pub async fn record_outcome(
                 duration_ms = EXCLUDED.duration_ms, \
                 diagnostic = EXCLUDED.diagnostic, \
                 extracted_at = now(), \
+                drawing_count = EXCLUDED.drawing_count, \
+                diagram_interpretation = EXCLUDED.diagram_interpretation, \
+                -- A re-read is a new reading. Minting a fresh identifier here is what
+                -- makes a stored piece of evidence able to notice that the coordinates it
+                -- was checked against have been replaced.
+                extraction_revision = gen_random_uuid(), \
                 attempts = otdel.material_pages.attempts + 1, \
                 updated_at = now() \
          RETURNING id",
@@ -207,6 +233,8 @@ pub async fn record_outcome(
     .bind(outcome.ocr_language.as_deref())
     .bind(outcome.duration_ms)
     .bind(storable_opt(outcome.diagnostic.as_deref()))
+    .bind(outcome.drawing_count)
+    .bind(outcome.diagram_interpretation.as_str())
     .fetch_one(tx.conn())
     .await?;
 
@@ -264,8 +292,11 @@ async fn replace_regions(
             sqlx::query(
                 "INSERT INTO otdel.table_cells \
                      (bureau_id, region_id, row_index, column_index, is_header, raw_text, \
-                      value_kind, unit, column_header, x0, y0, x1, y1) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                      value_kind, unit, column_header, x0, y0, x1, y1, \
+                      role, usability, ambiguity_reasons, column_header_path, \
+                      row_header_path, subject, property, unit_ref, conditions) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, \
+                         $14, $15, $16, $17, $18, $19, $20, $21, $22)",
             )
             .bind(bureau_id)
             .bind(region_id)
@@ -280,6 +311,21 @@ async fn replace_regions(
             .bind(bbox.map(|b| b.y0))
             .bind(bbox.map(|b| b.x1))
             .bind(bbox.map(|b| b.y1))
+            .bind(cell.role.as_str())
+            .bind(cell.verdict.usability.as_str())
+            .bind(
+                cell.verdict
+                    .reasons
+                    .iter()
+                    .map(|reason| reason.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .bind(json(&cell.structural_context.column_header_path)?)
+            .bind(json(&cell.structural_context.row_header_path)?)
+            .bind(json_opt(cell.structural_context.subject.as_ref())?)
+            .bind(json_opt(cell.structural_context.property.as_ref())?)
+            .bind(json_opt(cell.structural_context.unit.as_ref())?)
+            .bind(json(&cell.structural_context.conditions)?)
             .execute(tx.conn())
             .await?;
         }
@@ -391,7 +437,7 @@ pub async fn regions_for_page(tx: &mut ScopedTx, page_id: Uuid) -> DbResult<Vec<
     for row in &region_rows {
         let region = region_from_row(row)?;
         let cells = if region.kind == RegionKind::Table {
-            cells_for_region(tx, region.id).await?
+            cells_for_region(tx, region.id, region.page_number, region.source).await?
         } else {
             Vec::new()
         };
@@ -400,11 +446,18 @@ pub async fn regions_for_page(tx: &mut ScopedTx, page_id: Uuid) -> DbResult<Vec<
     Ok(details)
 }
 
-async fn cells_for_region(tx: &mut ScopedTx, region_id: Uuid) -> DbResult<Vec<TableCell>> {
+async fn cells_for_region(
+    tx: &mut ScopedTx,
+    region_id: Uuid,
+    page_number: i32,
+    source: TextSource,
+) -> DbResult<Vec<TableCell>> {
     let bureau_id = tx.bureau_id();
     let rows = sqlx::query(
         "SELECT id, region_id, row_index, column_index, is_header, raw_text, value_kind, \
-                unit, column_header, x0, y0, x1, y1 \
+                unit, column_header, x0, y0, x1, y1, \
+                role, usability, ambiguity_reasons, column_header_path, \
+                row_header_path, subject, property, unit_ref, conditions \
            FROM otdel.table_cells \
           WHERE bureau_id = $1 AND region_id = $2 \
           ORDER BY row_index, column_index",
@@ -414,7 +467,20 @@ async fn cells_for_region(tx: &mut ScopedTx, region_id: Uuid) -> DbResult<Vec<Ta
     .fetch_all(tx.conn())
     .await?;
 
-    rows.iter().map(cell_from_row).collect()
+    rows.iter()
+        .map(|row| cell_from_row(row, page_number, source))
+        .collect()
+}
+
+/// Why a stored thing has no rectangle. An engine that returns text without word boxes
+/// says so; it never receives a rectangle covering the page, which would look like
+/// evidence and point at nothing.
+fn no_geometry_reason(source: TextSource, blank: bool) -> &'static str {
+    match (source, blank) {
+        (_, true) => "в источнике ячейка пуста — выделять нечего",
+        (TextSource::Ocr, false) => "движок распознавания вернул текст без координат",
+        _ => "разборщик не определил область на странице",
+    }
 }
 
 /// Put a single page back into `pending` so the worker reads it again.
@@ -503,6 +569,13 @@ fn page_from_row(row: &PgRow) -> DbResult<MaterialPage> {
     let text_source: String = row.try_get("text_source")?;
     let text_source = TextSource::parse(&text_source)
         .ok_or_else(|| DbError::Decode(format!("unknown text source `{text_source}`")))?;
+    let diagram_interpretation: String = row.try_get("diagram_interpretation")?;
+    let diagram_interpretation =
+        DiagramInterpretation::parse(&diagram_interpretation).ok_or_else(|| {
+            DbError::Decode(format!(
+                "unknown diagram interpretation `{diagram_interpretation}`"
+            ))
+        })?;
 
     Ok(MaterialPage {
         id: row.try_get("id")?,
@@ -527,6 +600,9 @@ fn page_from_row(row: &PgRow) -> DbResult<MaterialPage> {
         extracted_at: row.try_get::<Option<DateTime<Utc>>, _>("extracted_at")?,
         region_count: i32::try_from(row.try_get::<i64, _>("region_count")?).unwrap_or(i32::MAX),
         table_count: i32::try_from(row.try_get::<i64, _>("table_count")?).unwrap_or(i32::MAX),
+        extraction_revision: row.try_get("extraction_revision")?,
+        drawing_count: row.try_get("drawing_count")?,
+        diagram_interpretation,
     })
 }
 
@@ -538,24 +614,57 @@ fn region_from_row(row: &PgRow) -> DbResult<PageRegion> {
     let source = TextSource::parse(&source)
         .ok_or_else(|| DbError::Decode(format!("unknown region source `{source}`")))?;
 
+    let page_number: i32 = row.try_get("page_number")?;
+    let bbox = bbox_from_row(row)?;
+
     Ok(PageRegion {
         id: row.try_get("id")?,
         page_id: row.try_get("page_id")?,
-        page_number: row.try_get("page_number")?,
+        page_number,
         ordinal: row.try_get("ordinal")?,
         kind,
         text: row.try_get("text_content")?,
         source,
-        bbox: bbox_from_row(row)?,
+        bbox,
         row_count: row.try_get("row_count")?,
         column_count: row.try_get("column_count")?,
+        span: SourceSpan::from_bbox(page_number, bbox, no_geometry_reason(source, false)),
     })
 }
 
-fn cell_from_row(row: &PgRow) -> DbResult<TableCell> {
+fn cell_from_row(row: &PgRow, page_number: i32, source: TextSource) -> DbResult<TableCell> {
     let value_kind: String = row.try_get("value_kind")?;
     let value_kind = CellValueKind::parse(&value_kind)
         .ok_or_else(|| DbError::Decode(format!("unknown cell value kind `{value_kind}`")))?;
+
+    let role: String = row.try_get("role")?;
+    let role = CellRole::parse(&role)
+        .ok_or_else(|| DbError::Decode(format!("unknown cell role `{role}`")))?;
+
+    let usability: String = row.try_get("usability")?;
+    let usability = CellUsability::parse(&usability)
+        .ok_or_else(|| DbError::Decode(format!("unknown cell usability `{usability}`")))?;
+    let stored_reasons: Vec<String> = row.try_get("ambiguity_reasons")?;
+    let mut reasons = Vec::with_capacity(stored_reasons.len());
+    for reason in &stored_reasons {
+        reasons.push(
+            AmbiguityReason::parse(reason)
+                .ok_or_else(|| DbError::Decode(format!("unknown ambiguity reason `{reason}`")))?,
+        );
+    }
+    // Rebuilt from the reasons rather than trusted from the row, so a hand-edited
+    // `usability` can never quietly promote a cell the reasons still disqualify.
+    let verdict = CellVerdict::from_reasons(reasons);
+    if verdict.usability != usability {
+        return Err(DbError::Decode(format!(
+            "stored cell verdict `{}` disagrees with its reasons",
+            usability.as_str()
+        )));
+    }
+
+    let bbox = bbox_from_row(row)?;
+    let raw_text: String = row.try_get("raw_text")?;
+    let blank = raw_text.trim().is_empty();
 
     Ok(TableCell {
         id: row.try_get("id")?,
@@ -563,12 +672,48 @@ fn cell_from_row(row: &PgRow) -> DbResult<TableCell> {
         row_index: row.try_get("row_index")?,
         column_index: row.try_get("column_index")?,
         is_header: row.try_get("is_header")?,
-        raw_text: row.try_get("raw_text")?,
+        raw_text,
         value_kind,
         unit: row.try_get("unit")?,
         column_header: row.try_get("column_header")?,
-        bbox: bbox_from_row(row)?,
+        bbox,
+        role,
+        verdict,
+        structural_context: StructuralContext {
+            column_header_path: from_json(row, "column_header_path")?,
+            row_header_path: from_json(row, "row_header_path")?,
+            subject: from_json_opt(row, "subject")?,
+            property: from_json_opt(row, "property")?,
+            unit: from_json_opt(row, "unit_ref")?,
+            conditions: from_json(row, "conditions")?,
+        },
+        span: SourceSpan::from_bbox(page_number, bbox, no_geometry_reason(source, blank)),
     })
+}
+
+/// Serialise a piece of structural context for storage.
+fn json<T: Serialize>(value: &T) -> DbResult<serde_json::Value> {
+    serde_json::to_value(value).map_err(|error| DbError::Decode(error.to_string()))
+}
+
+fn json_opt<T: Serialize>(value: Option<&T>) -> DbResult<Option<serde_json::Value>> {
+    value.map(json).transpose()
+}
+
+fn from_json<T: DeserializeOwned>(row: &PgRow, column: &str) -> DbResult<T> {
+    let value: serde_json::Value = row.try_get(column)?;
+    serde_json::from_value(value)
+        .map_err(|error| DbError::Decode(format!("column `{column}`: {error}")))
+}
+
+fn from_json_opt<T: DeserializeOwned>(row: &PgRow, column: &str) -> DbResult<Option<T>> {
+    let value: Option<serde_json::Value> = row.try_get(column)?;
+    value
+        .map(|value| {
+            serde_json::from_value(value)
+                .map_err(|error| DbError::Decode(format!("column `{column}`: {error}")))
+        })
+        .transpose()
 }
 
 /// The database stores all four coordinates or none; this mirrors that.

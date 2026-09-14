@@ -6,6 +6,7 @@
 //! stored with `text_source = none` rather than with an empty string.
 
 use otdel_core::extraction::{PageStatus, TextSource};
+use otdel_core::extraction_context::DiagramInterpretation;
 use otdel_db::pages::{NewCell, NewPage, NewRegion, PageOutcomeRow};
 use otdel_extract::{DocumentInventory, ExtractedRegion, PageInventory, PageOutcome};
 
@@ -73,6 +74,8 @@ pub fn outcome_row(
         ocr_language: outcome.ocr.as_ref().map(|stamp| stamp.language.clone()),
         duration_ms: i32::try_from(outcome.duration_ms).ok(),
         diagnostic: outcome.decision.diagnostic.clone(),
+        drawing_count: i32::try_from(outcome.drawing_count).unwrap_or(i32::MAX),
+        diagram_interpretation: diagram_state(outcome.drawing_count),
     };
 
     (row, regions)
@@ -102,9 +105,23 @@ pub fn failed_row(inventory: &PageInventory, reason: &str) -> (PageOutcomeRow, V
             ocr_language: None,
             duration_ms: None,
             diagnostic: Some(reason.chars().take(2000).collect()),
+            // A page that could not be read tells us nothing about its drawings either.
+            drawing_count: 0,
+            diagram_interpretation: DiagramInterpretation::None,
         },
         Vec::new(),
     )
+}
+
+/// A page carrying a drawing is awaiting interpretation; a page without one has nothing
+/// to interpret. There is deliberately no third answer: nothing in this phase understands
+/// a diagram, and recognising the text around one does not change that.
+fn diagram_state(drawing_count: u32) -> DiagramInterpretation {
+    if drawing_count > 0 {
+        DiagramInterpretation::NotAttempted
+    } else {
+        DiagramInterpretation::None
+    }
 }
 
 fn new_region(region: &ExtractedRegion, source: TextSource) -> NewRegion {
@@ -130,6 +147,9 @@ fn new_region(region: &ExtractedRegion, source: TextSource) -> NewRegion {
                         unit: cell.unit.clone(),
                         column_header: cell.column_header.clone(),
                         bbox: cell.bbox,
+                        role: cell.role,
+                        verdict: cell.verdict.clone(),
+                        structural_context: cell.structural_context.clone(),
                     })
                     .collect()
             })
@@ -151,6 +171,10 @@ fn finite(value: f64) -> Option<f64> {
 mod tests {
     use super::*;
     use otdel_core::extraction::{CellValueKind, RegionKind};
+    use otdel_core::extraction_context::{
+        AmbiguityReason, CellRole, CellUsability, CellVerdict, ContextOrigin, ContextRef,
+        StructuralContext, UnitRef,
+    };
     use otdel_extract::{ExtractedCell, ExtractedTable, OcrStamp, PageDecision};
 
     fn inventory() -> PageInventory {
@@ -174,6 +198,7 @@ mod tests {
             parser_version: "0.12",
             ocr: None,
             duration_ms: 12,
+            drawing_count: 0,
         }
     }
 
@@ -251,26 +276,38 @@ mod tests {
             table: Some(ExtractedTable {
                 row_count: 2,
                 column_count: 2,
+                header_rows: 1,
+                label_columns: 1,
                 cells: vec![
                     ExtractedCell {
-                        row_index: 1,
-                        column_index: 1,
-                        is_header: false,
-                        raw_text: "1200".to_owned(),
-                        value_kind: CellValueKind::Number,
                         unit: Some("мм".to_owned()),
                         column_header: Some("Длина, мм".to_owned()),
-                        bbox: None,
+                        structural_context: StructuralContext {
+                            subject: Some(ContextRef::new("BP21", ContextOrigin::RowLabel)),
+                            property: Some(ContextRef::new("Длина, мм", ContextOrigin::HeaderRow)),
+                            unit: Some(UnitRef {
+                                unit: "мм".to_owned(),
+                                origin: ContextOrigin::HeaderRow,
+                            }),
+                            ..StructuralContext::default()
+                        },
+                        ..ExtractedCell::unannotated(
+                            1,
+                            1,
+                            "1200".to_owned(),
+                            CellValueKind::Number,
+                            None,
+                        )
                     },
                     ExtractedCell {
-                        row_index: 1,
-                        column_index: 0,
-                        is_header: false,
-                        raw_text: String::new(),
-                        value_kind: CellValueKind::Empty,
-                        unit: None,
-                        column_header: None,
-                        bbox: None,
+                        verdict: CellVerdict::from_reasons([AmbiguityReason::BlankCell]),
+                        ..ExtractedCell::unannotated(
+                            1,
+                            0,
+                            String::new(),
+                            CellValueKind::Empty,
+                            None,
+                        )
                     },
                 ],
             }),
@@ -289,6 +326,23 @@ mod tests {
         // The blank cell is carried through as blank, not dropped and not zeroed.
         assert_eq!(regions[0].cells[1].raw_text, "");
         assert_eq!(regions[0].cells[1].value_kind, CellValueKind::Empty);
+
+        // And the structural half survives the translation too — it is the half a
+        // consumer needs in order to avoid reading a label as a measurement.
+        let value = &regions[0].cells[0];
+        assert_eq!(
+            value.structural_context.subject.as_ref().unwrap().text,
+            "BP21"
+        );
+        assert_eq!(value.structural_context.unit.as_ref().unwrap().unit, "мм");
+        assert_eq!(value.role, CellRole::Data);
+        assert!(value.verdict.is_candidate_value());
+
+        // The blank cell arrives already disqualified, not merely empty.
+        assert_eq!(
+            regions[0].cells[1].verdict.usability,
+            CellUsability::Unusable
+        );
     }
 
     #[test]

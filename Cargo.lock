@@ -1348,6 +1348,7 @@ dependencies = [
  "log",
  "otdel-core",
  "otdel-publish",
+ "serde",
  "serde_json",
  "sqlx",
  "thiserror",

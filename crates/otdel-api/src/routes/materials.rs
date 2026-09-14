@@ -284,3 +284,17 @@ fn content_disposition(material: &Material) -> Option<HeaderValue> {
     ))
     .ok()
 }
+
+/// The authorised link to a stored original, opened at one page.
+///
+/// Built here rather than in the interface so the path and the `#page=` convention have
+/// exactly one definition. It is a link into the same bureau-scoped download route, not a
+/// pre-signed URL: nothing about it grants access on its own.
+pub fn original_url(partner_id: Uuid, material_id: Uuid, page_number: i32) -> String {
+    let base = format!("/api/partners/{partner_id}/materials/{material_id}/original");
+    if page_number > 0 {
+        format!("{base}#page={page_number}")
+    } else {
+        base
+    }
+}

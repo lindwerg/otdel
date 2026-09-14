@@ -108,7 +108,12 @@ impl PdfDocument {
             reason: sanitise(&error.to_string()),
         })?;
 
-        Ok(assemble(collector))
+        let mut page = assemble(collector);
+        // Geometry first, meaning second: the grid is recovered above, and only then is
+        // each cell attached to its product, property, unit and conditions. The two stay
+        // separable so a wrong grid cannot be mistaken for wrong provenance.
+        crate::table_context::annotate_page(&mut page.regions, page_number as i32);
+        Ok(page)
     }
 }
 

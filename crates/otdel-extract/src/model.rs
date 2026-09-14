@@ -6,6 +6,7 @@
 //! and tested on its own.
 
 use otdel_core::extraction::{BoundingBox, CellValueKind, RegionKind};
+use otdel_core::extraction_context::{CellRole, CellVerdict, StructuralContext};
 
 /// Page-level facts gathered without reading any text: geometry and what the page
 /// contains structurally.
@@ -65,9 +66,15 @@ pub struct ExtractedTable {
     pub row_count: u32,
     pub column_count: u32,
     pub cells: Vec<ExtractedCell>,
+    /// How many leading rows form the header band. `0` means no header could be proven —
+    /// which is a stated gap, not a licence to treat the first row as one.
+    pub header_rows: u32,
+    /// How many leading columns hold the rows' own labels (the product designation, as a
+    /// rule). `0` means none could be proven.
+    pub label_columns: u32,
 }
 
-/// A cell, kept verbatim.
+/// A cell, kept verbatim, with the context that makes it readable as evidence.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtractedCell {
     pub row_index: u32,
@@ -81,6 +88,38 @@ pub struct ExtractedCell {
     pub unit: Option<String>,
     pub column_header: Option<String>,
     pub bbox: Option<BoundingBox>,
+    /// What the cell is within the table. Filled by [`crate::table_context`].
+    pub role: CellRole,
+    /// Whether it may be read as a value, and why not when it may not.
+    pub verdict: CellVerdict,
+    /// Product, property, unit and conditions, each naming its origin.
+    pub structural_context: StructuralContext,
+}
+
+impl ExtractedCell {
+    /// A cell as the grid detector leaves it: verbatim text and geometry, with the
+    /// semantic layer still unset. [`crate::table_context::annotate_page`] fills the rest.
+    pub fn unannotated(
+        row_index: u32,
+        column_index: u32,
+        raw_text: String,
+        value_kind: CellValueKind,
+        bbox: Option<BoundingBox>,
+    ) -> Self {
+        Self {
+            row_index,
+            column_index,
+            is_header: false,
+            raw_text,
+            value_kind,
+            unit: None,
+            column_header: None,
+            bbox,
+            role: CellRole::Data,
+            verdict: CellVerdict::default(),
+            structural_context: StructuralContext::default(),
+        }
+    }
 }
 
 /// Text produced by an OCR engine.

@@ -304,6 +304,8 @@ async fn a_character_the_database_cannot_hold_costs_one_character_not_the_docume
         ocr_language: None,
         duration_ms: Some(3),
         diagnostic: Some("частично\u{0}декодировано".to_owned()),
+        drawing_count: 0,
+        diagram_interpretation: otdel_core::extraction_context::DiagramInterpretation::None,
     };
     let region = pages::NewRegion {
         kind: otdel_core::extraction::RegionKind::Table,
@@ -321,6 +323,14 @@ async fn a_character_the_database_cannot_hold_costs_one_character_not_the_docume
             unit: Some("м\u{0}м".to_owned()),
             column_header: Some("Длина\u{0}".to_owned()),
             bbox: None,
+            role: otdel_core::extraction_context::CellRole::Data,
+            // No column header could be proven for a one-cell grid, so the cell is not a
+            // candidate value — which is also what lets it satisfy the schema's rule that
+            // a usable cell has nothing left to explain.
+            verdict: otdel_core::extraction_context::CellVerdict::from_reasons([
+                otdel_core::extraction_context::AmbiguityReason::NoColumnHeader,
+            ]),
+            structural_context: otdel_core::extraction_context::StructuralContext::default(),
         }],
     };
 

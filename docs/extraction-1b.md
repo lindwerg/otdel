@@ -102,6 +102,63 @@ stays blank instead of becoming a zero, and a range or a designation (`40…60`,
 written in the cell or in that column's header, and the header itself is kept verbatim in
 `column_header`.
 
+## Structural context of a cell (R03)
+
+A verbatim cell turned out not to be enough. In the real catalogue the string
+`безопасная рабочая нагрузка (Н)` — a *column label* — was published as a product
+characteristic, because nothing in a stored cell said "this is a label" and the next phase
+fell back on flat page text, where the product, the unit and the loading scheme are all
+lost.
+
+Every cell therefore also carries three things, alongside (never instead of) its verbatim
+text:
+
+* **`role`** — `column_header`, `row_header` or `data`. A header is a label, and a label
+  is never a value. This is enforced in the schema as well as in the extractor
+  (`table_cells_a_header_is_not_a_value`), so it does not depend on which code path wrote
+  the row.
+* **`structural_context`** — the product (`subject`), the property, the unit, the
+  conditions, and the column/row header paths, **each with its origin**. Multi-row headers
+  are kept apart: `Нагрузка` is the property, `кН` is the dimension. A label carried across
+  a merged cell is marked `inherited_from_merged_header` rather than presented as something
+  that stood there.
+* **`verdict`** — `usable` / `ambiguous` / `unusable`, plus the reasons. Deliberately a
+  category, not a number: the text extractor measures no confidence, and a fabricated
+  `0.87` is worse than "ambiguous, because the unit is written nowhere".
+
+A cell becomes **unusable** when it is a header, reads like a label (`слова (единица)`)
+wherever the grid put it, is blank, holds several values at once (`4860 / 8470 / 12720` —
+one per loading scheme), or has no provable column header or row context. It becomes
+**ambiguous** when the unit is unresolved, a footnote marker points at nothing, or its
+product was inherited across a merged cell — the case that matters for lookalike
+designations such as BP21 and BP21D, which must never borrow each other's rows.
+
+Only a `usable` cell may be offered as a candidate value. The rest stay visible, verbatim
+and explained; nothing is deleted.
+
+### The source span
+
+A region and a cell each carry a `span`: the page number plus either exact coordinates or
+`unavailable` **with the reason in words**. An engine that returns text without word boxes
+produces the latter — never a rectangle covering the page, which would look like evidence
+and point at nothing. `GET .../pages/{n}/view` returns the placed regions and the unplaced
+ones separately, for exactly this reason.
+
+### Diagrams
+
+`diagram_interpretation` is a separate field on the page and is never more than
+`not_attempted`. Recognising the letters around a load diagram is not reading the diagram.
+There is deliberately no value meaning "understood": a phase that really interprets
+drawings has to add one.
+
+### Immutability
+
+Each successful page read mints a fresh `extraction_revision`. Evidence can name the
+revision its coordinates came from, so a later re-read is recognisable as a different
+reading instead of silently replacing the one a fact was checked against. Pages read before
+R03 keep `extraction_revision = null`, which is the honest answer. R02 generalises this to
+a document-level revision line.
+
 ## Retry
 
 Two levels, both idempotent:
@@ -207,3 +264,16 @@ That exercise found **two real defects** the synthetic fixtures could not:
    interpreted. Vision models are a later phase.
 7. **No incremental re-read.** Re-reading a material re-reads every page; only the
    single-page retry is selective.
+8. **The grid, not the context, is the weak link.** On the real load tables the column
+   corridors do not survive: whole rows collapse into one cell and stray digits from the
+   load diagram get columns of their own. The context layer is what keeps that from
+   becoming wrong data — those cells come out `unusable` with a reason — but the values in
+   them are *not recovered*. Measured on the 32-page catalogue: 1705 cells, of which 8
+   usable, 12 ambiguous, 1685 unusable (1357 of them for `no_column_header`). Improving the
+   grid itself is separate work; nothing here compensates for it by guessing.
+9. **Footnotes attach by marker only.** A footnote printed under a table often applies to
+   all of it, but "often" is not evidence, so only `*`-style marker matches are attached. A
+   marker with no matching footnote leaves the value `ambiguous`.
+10. **The viewer is a region map, not a rendering.** Phase 1B stores no page images, so the
+    interface draws rectangles on a page-shaped box and links to the original. It does not
+    show the document's appearance and does not claim to.

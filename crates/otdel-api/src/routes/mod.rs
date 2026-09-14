@@ -81,6 +81,10 @@ pub fn router(state: AppState) -> Router {
             get(pages::show),
         )
         .route(
+            "/partners/{partner_id}/materials/{material_id}/pages/{page_number}/view",
+            get(pages::view),
+        )
+        .route(
             "/partners/{partner_id}/materials/{material_id}/pages/{page_number}/retry",
             post(pages::retry),
         )

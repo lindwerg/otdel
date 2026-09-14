@@ -21,6 +21,7 @@ pub mod config;
 pub mod error;
 pub mod extraction;
 pub mod extraction_config;
+pub mod extraction_context;
 pub mod knowledge;
 pub mod llm_config;
 pub mod media;

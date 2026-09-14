@@ -6,9 +6,10 @@ import type {
   Material,
   MaterialPage,
   PageDetail,
-  PageRegion,
+  PageView,
 } from '../../api/types'
 import { AuthProvider } from '../../auth/AuthContext'
+import { exactSpan, loadTableRegion, unlocatedSpan } from '../../test/extraction'
 import { installMockFetch, jsonResponse } from '../../test/mockFetch'
 import { MaterialPages } from '../MaterialPages'
 
@@ -76,6 +77,9 @@ function page(overrides: Partial<MaterialPage>): MaterialPage {
     extracted_at: '2026-01-01T10:00:01Z',
     region_count: 2,
     table_count: 0,
+    extraction_revision: 'r2',
+    drawing_count: 0,
+    diagram_interpretation: 'none',
     ...overrides,
   }
 }
@@ -89,61 +93,14 @@ const PAGES: MaterialPage[] = [
     char_count: 0,
     image_count: 1,
     region_count: 0,
+    // A page that holds a drawing nobody interpreted — and says so.
+    drawing_count: 2,
+    diagram_interpretation: 'not_attempted',
     diagnostic:
       'страница без текстового слоя, содержит изображений: 1; распознавание недоступно: исполняемый файл `tesseract` не найден',
   }),
   page({ page_number: 3, table_count: 1, region_count: 3 }),
 ]
-
-function tableRegion(): PageRegion {
-  return {
-    id: 'region-table',
-    page_id: 'page-3',
-    page_number: 3,
-    ordinal: 0,
-    kind: 'table',
-    text: 'Profile Length, mm',
-    source: 'text_layer',
-    bbox: { x0: 50, y0: 620, x1: 460, y1: 710 },
-    row_count: 3,
-    column_count: 3,
-    cells: [
-      cell(0, 0, 'Profile', 'text', true),
-      cell(0, 1, 'Length, mm', 'text', true),
-      cell(0, 2, 'Load (kN)', 'text', true),
-      cell(1, 0, 'BP21', 'text'),
-      cell(1, 1, '1200', 'number', false, 'mm', 'Length, mm'),
-      cell(1, 2, '3.5', 'number', false, 'kN', 'Load (kN)'),
-      cell(2, 0, 'BP40', 'text'),
-      cell(2, 1, '2000', 'number', false, 'mm', 'Length, mm'),
-      // The source does not print this load.
-      cell(2, 2, '', 'empty'),
-    ],
-  }
-}
-
-function cell(
-  row: number,
-  column: number,
-  raw: string,
-  kind: 'text' | 'number' | 'empty',
-  header = false,
-  unit: string | null = null,
-  columnHeader: string | null = null,
-) {
-  return {
-    id: `cell-${row}-${column}`,
-    region_id: 'region-table',
-    row_index: row,
-    column_index: column,
-    is_header: header,
-    raw_text: raw,
-    value_kind: kind,
-    unit,
-    column_header: columnHeader,
-    bbox: null,
-  }
-}
 
 function detail(pageNumber: number): PageDetail {
   if (pageNumber === 2) {
@@ -151,8 +108,46 @@ function detail(pageNumber: number): PageDetail {
   }
   return {
     page: PAGES[2],
-    text: 'Profile load table\nProfile Length, mm Load (kN)',
-    regions: [tableRegion()],
+    text: 'Таблица нагрузок\nПрофиль Длина, мм безопасная рабочая нагрузка (Н)',
+    regions: [loadTableRegion()],
+  }
+}
+
+function pageView(pageNumber: number): PageView {
+  if (pageNumber === 2) {
+    return {
+      page_number: 2,
+      width_pt: 595,
+      height_pt: 842,
+      rotation: 0,
+      original_url: `/api/partners/${PARTNER}/materials/${MATERIAL}/original#page=2`,
+      diagram_interpretation: 'not_attempted',
+      regions: [],
+      unplaced: [],
+    }
+  }
+  return {
+    page_number: 3,
+    width_pt: 595,
+    height_pt: 842,
+    rotation: 0,
+    original_url: `/api/partners/${PARTNER}/materials/${MATERIAL}/original#page=3`,
+    diagram_interpretation: 'none',
+    regions: [
+      {
+        region_id: 'region-table',
+        ordinal: 0,
+        kind: 'table',
+        span: exactSpan(3, { x0: 50, y0: 620, x1: 460, y1: 710 }),
+      },
+      {
+        region_id: 'region-ocr-note',
+        ordinal: 1,
+        kind: 'footnote',
+        span: unlocatedSpan(3, 'движок распознавания не возвращает координат слов'),
+      },
+    ],
+    unplaced: [],
   }
 }
 
@@ -165,6 +160,7 @@ function install(handler?: (url: string, method: string) => Response) {
     if (custom) return custom
     if (req.url.includes('/pages/')) {
       const pageNumber = Number(req.url.split('/pages/')[1].split('/')[0])
+      if (req.url.endsWith('/view')) return jsonResponse(200, pageView(pageNumber))
       return jsonResponse(200, detail(pageNumber))
     }
     if (req.url.endsWith('/pages')) {
@@ -267,20 +263,93 @@ describe('MaterialPages', () => {
     await user.click(within(third).getByRole('button', { name: 'Что извлечено' }))
 
     const table = await screen.findByRole('table')
-    expect(within(table).getByRole('columnheader', { name: 'Length, mm' })).toBeTruthy()
+    expect(within(table).getByRole('columnheader', { name: /Длина, мм/ })).toBeTruthy()
 
     const rows = within(table).getAllByRole('row')
     // Header row plus two data rows.
     expect(rows).toHaveLength(3)
 
+    // The row's own label is a header, so only the two measured columns are cells.
     const firstData = within(rows[1]).getAllByRole('cell')
-    expect(firstData[1].textContent).toContain('1200')
-    expect(firstData[1].textContent).toContain('mm')
+    expect(firstData).toHaveLength(2)
+    expect(firstData[0].textContent).toContain('1200')
+    expect(firstData[0].textContent).toContain('мм')
 
     // The load the catalogue does not print stays blank — not 0, not a dash.
+    // Asserted on the value itself: the cell around it now also carries the
+    // product and the property this missing value would have belonged to.
     const secondData = within(rows[2]).getAllByRole('cell')
-    expect(secondData[2].textContent?.trim()).toBe('')
-    expect(secondData[2].textContent).not.toContain('0')
+    const blankLine = secondData[1].querySelector('.cell-line')
+    expect(blankLine?.textContent?.trim()).toBe('')
+    expect(blankLine?.textContent).not.toContain('0')
+    expect(blankLine?.textContent).not.toContain('—')
+  })
+
+  it('never presents a column label as a value of anything', async () => {
+    const user = userEvent.setup()
+    install()
+    renderPanel()
+
+    await waitFor(() => expect(screen.getAllByRole('listitem')).toHaveLength(3))
+    const third = screen.getAllByRole('listitem')[2]
+    await user.click(within(third).getByRole('button', { name: 'Что извлечено' }))
+
+    const table = await screen.findByRole('table')
+    const header = within(table).getByRole('columnheader', {
+      name: /безопасная рабочая нагрузка/,
+    })
+    expect(within(header).getByText(/это заголовок таблицы, а не значение/)).toBeTruthy()
+
+    for (const cell of within(table).getAllByRole('cell')) {
+      expect(cell.textContent).not.toContain('безопасная рабочая нагрузка (Н)')
+    }
+  })
+
+  it('shows a schematic of region positions and never calls it the page', async () => {
+    const user = userEvent.setup()
+    install()
+    renderPanel()
+
+    await waitFor(() => expect(screen.getAllByRole('listitem')).toHaveLength(3))
+    const third = screen.getAllByRole('listitem')[2]
+    await user.click(within(third).getByRole('button', { name: 'Что извлечено' }))
+
+    expect(await screen.findByText(/не изображение страницы/)).toBeTruthy()
+
+    const placed = within(
+      screen.getByRole('list', { name: 'Области с известными координатами' }),
+    ).getAllByRole('listitem')
+    expect(placed).toHaveLength(1)
+    expect(placed[0].dataset.regionId).toBe('region-table')
+
+    // The region whose coordinates the engine never returned is listed with the
+    // server's reason and gets no rectangle.
+    expect(
+      within(screen.getByRole('list', { name: 'Области без координат' })).getByText(
+        /движок распознавания не возвращает координат слов/,
+      ),
+    ).toBeTruthy()
+    expect(document.querySelector('[data-region-id="region-ocr-note"].page-map__region')).toBeNull()
+  })
+
+  it('says that a drawing on the page was not interpreted', async () => {
+    const user = userEvent.setup()
+    install()
+    renderPanel()
+
+    await waitFor(() => expect(screen.getAllByRole('listitem')).toHaveLength(3))
+    const second = screen.getAllByRole('listitem')[1]
+    await user.click(within(second).getByRole('button', { name: 'Что извлечено' }))
+
+    expect(await screen.findByText(/Схема на странице не интерпретирована/)).toBeTruthy()
+    expect(screen.getByText(/не чтение самой схемы/)).toBeTruthy()
+  })
+
+  it('names the reading each page came from', async () => {
+    install()
+    renderPanel()
+
+    await waitFor(() => expect(screen.getAllByText(/ревизия чтения: r2/)).toHaveLength(3))
   })
 
   it('says plainly that no text was stored for an unrecognised page', async () => {

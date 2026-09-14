@@ -22,6 +22,7 @@ pub mod error;
 pub mod model;
 pub mod ocr;
 pub mod pdf;
+pub mod table_context;
 pub mod units;
 
 #[cfg(feature = "fixtures")]
@@ -43,6 +44,7 @@ pub use model::{
 };
 pub use ocr::{Disabled, OcrEngine, PageRasteriser, PopplerRasteriser, TesseractEngine};
 pub use pdf::{PdfDocument, PARSER_NAME, PARSER_VERSION};
+pub use table_context::annotate_page;
 
 /// The reading half must be usable from a blocking task, so the worker can keep the
 /// async scheduler free while a large page is parsed.
@@ -102,6 +104,12 @@ pub struct PageOutcome {
     /// Present only when an engine really ran and produced the text.
     pub ocr: Option<OcrStamp>,
     pub duration_ms: u32,
+    /// Vector drawing operations seen on the page.
+    ///
+    /// Carried so a page with a diagram is *recorded as having one*. Nothing here
+    /// interprets it: the letters around a load diagram are text, and reading them is not
+    /// reading the diagram.
+    pub drawing_count: u32,
 }
 
 /// Turns observations about a page into its stored outcome, running recognition when
@@ -150,6 +158,7 @@ impl PageProcessor {
         permission: &OcrPermission,
     ) -> PageOutcome {
         let started = Instant::now();
+        let drawing_count = text.drawing_ops;
         let verdict = assess::assess_text_layer(&text, inventory, &self.thresholds);
 
         let needs_recognition = matches!(
@@ -185,6 +194,7 @@ impl PageProcessor {
                 parser_version: PARSER_VERSION,
                 ocr: None,
                 duration_ms,
+                drawing_count: text.drawing_ops,
             },
             otdel_core::extraction::TextSource::Ocr => {
                 let recognised = recognised.expect("an `Ocr` source implies recognised text");
@@ -203,6 +213,9 @@ impl PageProcessor {
                         language: recognised.language,
                     }),
                     duration_ms,
+                    // Recognition reads an image of the page; it says nothing about the
+                    // vector drawings the text layer reported.
+                    drawing_count,
                 }
             }
             otdel_core::extraction::TextSource::None => PageOutcome {
@@ -216,6 +229,7 @@ impl PageProcessor {
                 parser_version: PARSER_VERSION,
                 ocr: None,
                 duration_ms,
+                drawing_count,
             },
         }
     }

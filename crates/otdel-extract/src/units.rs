@@ -122,8 +122,8 @@ pub fn trailing_unit(text: &str) -> Option<String> {
 }
 
 /// A unit written in a header as `Длина, мм`, `Длина (мм)` or `Длина [мм]`.
-fn header_unit(header: &str) -> Option<String> {
-    let trimmed = header.trim().trim_end_matches(['.', ':']);
+pub fn header_unit(header: &str) -> Option<String> {
+    let trimmed = header.trim().trim_end_matches(['.', ':', '*']);
 
     for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
         if let Some(end) = trimmed.strip_suffix(close) {
@@ -144,13 +144,66 @@ fn header_unit(header: &str) -> Option<String> {
 }
 
 /// The whole (trimmed) text *is* a unit.
-fn exact_unit(text: &str) -> Option<String> {
+pub fn exact_unit(text: &str) -> Option<String> {
     let trimmed = text.trim();
     UNITS
         .iter()
         .find(|unit| **unit == trimmed)
         .map(|unit| (*unit).to_owned())
 }
+
+/// Does this text read as a *label* rather than a measurement?
+///
+/// The shape that matters is `слова (единица)` — words followed by a dimension in
+/// brackets or after a comma. `безопасная рабочая нагрузка (Н)` is the column label that
+/// was published as a characteristic; wherever a broken grid puts it, it is still a label.
+///
+/// Deliberately narrow. It requires a *written* unit, so an ordinary textual value such as
+/// `оцинкованная сталь` is untouched and stays available as a value.
+pub fn is_header_shaped(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || classify(trimmed) == CellValueKind::Number {
+        return false;
+    }
+    if header_unit(trimmed).is_none() {
+        return false;
+    }
+    // Enough letters to be words, not a designation such as `BP21 (мм)`.
+    trimmed.chars().filter(|ch| ch.is_alphabetic()).count() >= MIN_LABEL_LETTERS
+}
+
+/// Does this cell hold more than one value at once?
+///
+/// The load tables print `4860 / 8470 / 12720` — one number per loading scheme — in a
+/// single cell. Which of the three applies is not stated by the cell, so no single value
+/// may be taken from it.
+pub fn holds_several_values(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || classify(trimmed) == CellValueKind::Number {
+        return false;
+    }
+    number_runs(trimmed) >= 2
+}
+
+/// How many separate runs of digits the text contains.
+fn number_runs(text: &str) -> usize {
+    let mut runs = 0usize;
+    let mut in_run = false;
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            if !in_run {
+                runs += 1;
+                in_run = true;
+            }
+        } else if !NUMBER_SEPARATORS.contains(&ch) {
+            in_run = false;
+        }
+    }
+    runs
+}
+
+/// Below this many letters, a bracketed unit reads as a designation, not a label.
+const MIN_LABEL_LETTERS: usize = 4;
 
 /// Classify a cell's verbatim text. See the module docs: this is a description, not a
 /// conversion.

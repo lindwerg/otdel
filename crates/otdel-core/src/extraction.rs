@@ -19,6 +19,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::extraction_context::{
+    CellRole, CellVerdict, DiagramInterpretation, SourceSpan, StructuralContext,
+};
+
 /// Outcome of reading one page. Stored per page; the material status is derived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -240,6 +244,21 @@ pub struct MaterialPage {
     pub extracted_at: Option<DateTime<Utc>>,
     pub region_count: i32,
     pub table_count: i32,
+
+    /// Identifier of the reading that produced the current regions and cells.
+    ///
+    /// A fresh value is minted every time the page is read, so a stored piece of evidence
+    /// can name the revision its coordinates came from and a later re-read is recognisable
+    /// as a different one rather than silently replacing it. `None` for a page that has
+    /// only been inventoried. (R02 generalises this to a document-level revision line;
+    /// this is the per-page anchor the source evidence needs now.)
+    pub extraction_revision: Option<Uuid>,
+    /// Vector drawing operations seen on the page. Used only to tell a blank page from a
+    /// page carrying a diagram.
+    pub drawing_count: i32,
+    /// How far the page's drawings have been understood — never more than `not_attempted`
+    /// in this phase. Recognising labels around a load diagram is not reading the diagram.
+    pub diagram_interpretation: DiagramInterpretation,
 }
 
 /// A structural region of a page, with its source coordinates when they are known.
@@ -256,9 +275,18 @@ pub struct PageRegion {
     /// Table shape; `None` for every non-table region.
     pub row_count: Option<i32>,
     pub column_count: Option<i32>,
+    /// Where this region is on the page, or the stated reason it cannot be placed. A
+    /// region read by an engine that returns no word boxes is `unavailable` with that
+    /// reason — never a rectangle covering the page.
+    pub span: SourceSpan,
 }
 
 /// One cell of an extracted table.
+///
+/// The first group of fields is the verbatim record of what stood in the source and is
+/// never derived from anything. The second group — `role`, `verdict`, `structural_context`
+/// and `span` — is what makes the cell *usable as evidence*: see
+/// [`crate::extraction_context`] for why a verbatim cell on its own was not enough.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableCell {
     pub id: Uuid,
@@ -274,6 +302,15 @@ pub struct TableCell {
     /// Verbatim header text of this column, when the table has a header row.
     pub column_header: Option<String>,
     pub bbox: Option<BoundingBox>,
+
+    /// What this cell is within the table. A header is never a value.
+    pub role: CellRole,
+    /// Whether this cell may be read as a value at all, and why not when it may not.
+    pub verdict: CellVerdict,
+    /// Product, property, unit and conditions, each with its origin.
+    pub structural_context: StructuralContext,
+    /// Where on the page this cell was read, or why that cannot be said.
+    pub span: SourceSpan,
 }
 
 /// Everything needed to render one page with its evidence.

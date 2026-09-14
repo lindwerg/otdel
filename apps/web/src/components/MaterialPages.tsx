@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
-import { getPage, originalMaterialUrl, retryPage } from '../api/client'
-import type { Material, MaterialPage, PageDetail } from '../api/types'
+import { getPage, getPageView, originalMaterialUrl, retryPage } from '../api/client'
+import type { Material, MaterialPage, PageDetail, PageView } from '../api/types'
 import { useAuth } from '../auth/AuthContext'
 import {
+  diagramInterpretationNote,
   extractionCountsLine,
   extractionToolsLine,
   pageStatusPresentation,
@@ -11,6 +12,7 @@ import {
 } from '../lib/format'
 import { usePages } from '../hooks/usePages'
 import { PageRegions } from './PageRegions'
+import { PageSourceMap } from './PageSourceMap'
 import { StatusMessage } from './StatusMessage'
 
 interface MaterialPagesProps {
@@ -23,10 +25,28 @@ function pageFacts(page: MaterialPage): string[] {
   const facts: string[] = [textSourceLabel(page.text_source)]
   if (page.char_count > 0) facts.push(`${page.char_count} симв.`)
   if (page.image_count > 0) facts.push(`изображений: ${page.image_count}`)
+  if (page.drawing_count > 0) facts.push(`рисунков: ${page.drawing_count}`)
   if (page.table_count > 0) facts.push(`таблиц: ${page.table_count}`)
   if (page.ocr_engine) facts.push(`движок: ${page.ocr_engine}`)
+  // Which reading produced this page, next to the tools that produced it: two
+  // pages of the same document may come from different readings, and a fact
+  // without its revision cannot be told apart from a stale one.
+  if (page.extraction_revision) facts.push(`ревизия чтения: ${page.extraction_revision}`)
   if (page.attempts > 1) facts.push(`попыток чтения: ${page.attempts}`)
   return facts
+}
+
+/**
+ * What was done with a drawing on this page — which is nothing, and it says so.
+ *
+ * Silence here would be read as "the drawing was understood": a diagram is the
+ * one thing on a technical page that a reader most expects to have been
+ * interpreted, and nothing in this phase interprets one.
+ */
+function DiagramNote({ page }: { page: MaterialPage }) {
+  const note = diagramInterpretationNote(page.diagram_interpretation, page.drawing_count)
+  if (!note) return null
+  return <StatusMessage tone="warn">{note}</StatusMessage>
 }
 
 export function MaterialPages({ material, onPageChanged }: MaterialPagesProps) {
@@ -35,6 +55,9 @@ export function MaterialPages({ material, onPageChanged }: MaterialPagesProps) {
   const [openPage, setOpenPage] = useState<number | null>(null)
   const [detail, setDetail] = useState<PageDetail | null>(null)
   const [detailError, setDetailError] = useState<string | null>(null)
+  const [pageView, setPageView] = useState<PageView | null>(null)
+  const [viewError, setViewError] = useState<string | null>(null)
+  const [highlightedRegionId, setHighlightedRegionId] = useState<string | null>(null)
   const [busyPage, setBusyPage] = useState<number | null>(null)
   const [pageErrors, setPageErrors] = useState<Record<number, string>>({})
 
@@ -49,19 +72,47 @@ export function MaterialPages({ material, onPageChanged }: MaterialPagesProps) {
     hadPending.current = pending
   }, [pages, onPageChanged])
 
+  function closeDetail() {
+    setOpenPage(null)
+    setDetail(null)
+    setPageView(null)
+    setHighlightedRegionId(null)
+  }
+
   async function toggleDetail(pageNumber: number) {
     if (openPage === pageNumber) {
-      setOpenPage(null)
-      setDetail(null)
+      closeDetail()
       return
     }
     setOpenPage(pageNumber)
     setDetail(null)
     setDetailError(null)
-    try {
-      setDetail(await runRead(() => getPage(material.partner_id, material.id, pageNumber)))
-    } catch (err) {
+    setPageView(null)
+    setViewError(null)
+    setHighlightedRegionId(null)
+
+    // Two independent questions — what was read, and where it sits — asked at
+    // once. `allSettled`, because a page map that cannot be built is not a
+    // reason to withhold the text: each half reports its own outcome.
+    const [detailResult, viewResult] = await Promise.allSettled([
+      runRead(() => getPage(material.partner_id, material.id, pageNumber)),
+      runRead(() => getPageView(material.partner_id, material.id, pageNumber)),
+    ])
+
+    if (detailResult.status === 'fulfilled') {
+      setDetail(detailResult.value)
+    } else {
+      const err: unknown = detailResult.reason
       setDetailError(err instanceof Error ? err.message : 'Не удалось открыть страницу.')
+    }
+
+    if (viewResult.status === 'fulfilled') {
+      setPageView(viewResult.value)
+    } else {
+      const err: unknown = viewResult.reason
+      setViewError(
+        err instanceof Error ? err.message : 'Не удалось получить схему областей страницы.',
+      )
     }
   }
 
@@ -78,8 +129,7 @@ export function MaterialPages({ material, onPageChanged }: MaterialPagesProps) {
       )
       upsert(updated)
       if (openPage === page.page_number) {
-        setOpenPage(null)
-        setDetail(null)
+        closeDetail()
       }
       onPageChanged()
     } catch (err) {
@@ -185,6 +235,8 @@ export function MaterialPages({ material, onPageChanged }: MaterialPagesProps) {
                     ) : null}
                     {detail ? (
                       <>
+                        <DiagramNote page={detail.page} />
+
                         {detail.text ? (
                           <details className="page-text">
                             <summary>Текст страницы</summary>
@@ -195,7 +247,32 @@ export function MaterialPages({ material, onPageChanged }: MaterialPagesProps) {
                             Текста для этой страницы не сохранено — система не выдумывает его.
                           </p>
                         )}
-                        <PageRegions regions={detail.regions} />
+
+                        {viewError ? (
+                          <p className="page-note">
+                            Схему областей получить не удалось: {viewError} Ниже — то, что
+                            известно о самих областях.
+                          </p>
+                        ) : null}
+                        {pageView ? (
+                          <PageSourceMap
+                            view={pageView}
+                            highlightedRegionId={highlightedRegionId}
+                          />
+                        ) : null}
+
+                        <PageRegions
+                          regions={detail.regions}
+                          highlightedRegionId={highlightedRegionId}
+                          onHighlight={
+                            pageView
+                              ? (regionId) =>
+                                  setHighlightedRegionId((current) =>
+                                    current === regionId ? null : regionId,
+                                  )
+                              : undefined
+                          }
+                        />
                       </>
                     ) : null}
                   </div>

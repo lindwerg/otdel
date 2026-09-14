@@ -27,6 +27,13 @@ const COLUMN_GAP_RATIO: f64 = 1.2;
 const ROW_GAP_RATIO: f64 = 3.0;
 /// Resource limit: a "table" larger than this is not stored as a grid.
 const MAX_TABLE_CELLS: usize = 4_000;
+/// A header band deeper than this is not a header; catalogues use one or two rows, three
+/// at the outside.
+const MAX_HEADER_ROWS: usize = 3;
+/// Likewise for the rows' own label columns: a designation and at most one qualifier.
+const MAX_LABEL_COLUMNS: usize = 2;
+/// A header label longer than this is prose that drifted into the grid.
+const MAX_HEADER_LABEL_CHARS: usize = 60;
 
 /// A table found in a consecutive range of lines.
 #[derive(Debug, Clone, PartialEq)]
@@ -189,23 +196,12 @@ fn build_table(
         return None;
     }
 
-    let header_row = detect_header_row(&grid);
-    let headers: Vec<Option<String>> = (0..column_count)
-        .map(|column| {
-            if !header_row {
-                return None;
-            }
-            grid[0][column]
-                .as_ref()
-                .map(|(text, _, _)| text.trim().to_owned())
-                .filter(|text| !text.is_empty())
-        })
-        .collect();
+    let header_rows = detect_header_band(&grid);
+    let label_columns = detect_label_columns(&grid, header_rows);
 
     let mut cells = Vec::with_capacity(row_count * column_count);
     for (row_index, row) in grid.iter().enumerate() {
         let line = &lines[row_index];
-        let is_header = header_row && row_index == 0;
         for (column_index, cell) in row.iter().enumerate() {
             let (raw_text, bbox) = match cell {
                 Some((text, x0, x1)) => (
@@ -214,22 +210,14 @@ fn build_table(
                 ),
                 None => (String::new(), None),
             };
-            let column_header = if is_header {
-                None
-            } else {
-                headers[column_index].clone()
-            };
-            let unit = units::detect_unit(&raw_text, column_header.as_deref());
-            cells.push(ExtractedCell {
-                row_index: row_index as u32,
-                column_index: column_index as u32,
-                is_header,
-                value_kind: units::classify(&raw_text),
+            let value_kind = units::classify(&raw_text);
+            cells.push(ExtractedCell::unannotated(
+                row_index as u32,
+                column_index as u32,
                 raw_text,
-                unit,
-                column_header,
+                value_kind,
                 bbox,
-            });
+            ));
         }
     }
 
@@ -244,6 +232,8 @@ fn build_table(
             row_count: row_count as u32,
             column_count: column_count as u32,
             cells,
+            header_rows: header_rows as u32,
+            label_columns: label_columns as u32,
         },
         bbox,
     ))
@@ -278,33 +268,61 @@ fn distance((x0, x1): (f64, f64), x: f64) -> f64 {
     }
 }
 
-/// Is the first row a header?
+/// How many leading rows form the header band — `0` when none could be proven.
 ///
-/// Two conditions, both needed, and both learned from a real catalogue:
+/// A catalogue header is often two rows (`Нагрузка` over `кН`), and the second row is
+/// what carries the unit. Reading only the first row is why a value could end up with a
+/// property but no dimension.
+///
+/// The band grows downwards only while every row still reads as labels, and stops one row
+/// short of consuming the table: a grid that is *all* header has no data, which means the
+/// test was wrong and nothing should be promoted.
+fn detect_header_band(grid: &[Vec<Cell>]) -> usize {
+    let mut rows = 0usize;
+    while rows < MAX_HEADER_ROWS && rows + 1 < grid.len() && is_label_row(&grid[rows], rows == 0) {
+        rows += 1;
+    }
+    rows
+}
+
+/// Does this row read as labels rather than measurements?
+///
+/// Three conditions, all learned from the real catalogue:
 ///
 /// * **no cell reads as a number.** A row that starts with `250` is the first length of
 ///   a load table, not a label for the rows beneath it;
 /// * **the cells read like words.** `– / 238 / 395` is not a number, but it is not a
 ///   label either — a row of such values was being promoted to a header and then
 ///   attached as `column_header` to every value below it, which is precisely the kind of
-///   invented provenance this phase must not produce.
-fn detect_header_row(grid: &[Vec<Cell>]) -> bool {
+///   invented provenance this phase must not produce;
+/// * **the first row must span the table.** Continuation rows may be sparse, because a
+///   merged header leaves blanks under the label it spans, but the row that *opens* the
+///   band has to fill at least two columns or it is not a header row at all.
+fn is_label_row(row: &[Cell], is_first: bool) -> bool {
     use otdel_core::extraction::CellValueKind;
 
-    let Some(first) = grid.first() else {
-        return false;
-    };
-    let filled: Vec<&String> = first
+    let filled: Vec<&String> = row
         .iter()
         .filter_map(|cell| cell.as_ref().map(|(text, _, _)| text))
         .filter(|text| !text.trim().is_empty())
         .collect();
-    if filled.len() < MIN_TABLE_COLUMNS {
+
+    let minimum = if is_first { MIN_TABLE_COLUMNS } else { 1 };
+    if filled.len() < minimum {
         return false;
     }
     if filled
         .iter()
         .any(|text| units::classify(text) == CellValueKind::Number)
+    {
+        return false;
+    }
+    // A label is short. A continuation row of long strings is prose that drifted into the
+    // grid, not a second header row.
+    if !is_first
+        && filled
+            .iter()
+            .any(|text| text.chars().count() > MAX_HEADER_LABEL_CHARS)
     {
         return false;
     }
@@ -314,6 +332,48 @@ fn detect_header_row(grid: &[Vec<Cell>]) -> bool {
         .filter(|text| text.chars().any(char::is_alphabetic))
         .count();
     wordy * 2 >= filled.len()
+}
+
+/// How many leading columns hold the rows' own labels — `0` when none could be proven.
+///
+/// The test is the same kind as the one for columns: a label column is one in which **no
+/// data row holds a number**. A column of lengths is not a label column however textual
+/// one of its cells happens to look, and a designation column stays a designation column
+/// even where a row leaves it blank.
+fn detect_label_columns(grid: &[Vec<Cell>], header_rows: usize) -> usize {
+    use otdel_core::extraction::CellValueKind;
+
+    let column_count = grid.first().map_or(0, Vec::len);
+    if column_count < MIN_TABLE_COLUMNS || header_rows >= grid.len() {
+        return 0;
+    }
+    let data_rows = &grid[header_rows..];
+
+    let mut columns = 0usize;
+    // Never claim every column as a label column: that would leave no values at all.
+    while columns < MAX_LABEL_COLUMNS && columns + 1 < column_count {
+        let column = columns;
+        let mut any_text = false;
+        let mut all_non_numeric = true;
+        for row in data_rows {
+            let Some((text, _, _)) = &row[column] else {
+                continue;
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            any_text = true;
+            if units::classify(text) == CellValueKind::Number {
+                all_non_numeric = false;
+                break;
+            }
+        }
+        if !any_text || !all_non_numeric {
+            break;
+        }
+        columns += 1;
+    }
+    columns
 }
 
 #[cfg(test)]
@@ -385,16 +445,22 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(cell(0, 0).raw_text, "Профиль");
-        assert!(cell(0, 0).is_header);
         assert_eq!(cell(1, 0).raw_text, "BP21");
         assert_eq!(cell(1, 1).raw_text, "1200");
         assert_eq!(cell(3, 2).raw_text, "6,0");
+
+        // The bands the semantic layer needs are proven here, on geometry alone.
+        assert_eq!(table.header_rows, 1, "one header row");
+        assert_eq!(table.label_columns, 1, "the designation column");
     }
 
+    /// This module recovers geometry only; units and headers are attached by
+    /// [`crate::table_context`]. The pipeline runs both, so the test does too.
     #[test]
     fn units_and_headers_survive_into_every_body_cell() {
         let lines = build_lines(&sample_table());
-        let table = &detect_tables(&lines)[0].table;
+        let mut table = detect_tables(&lines)[0].table.clone();
+        crate::table_context::annotate_table_for_tests(&mut table);
 
         let length = table
             .cells
@@ -423,6 +489,8 @@ mod tests {
             .unwrap();
         assert_eq!(profile.unit, None);
         assert_eq!(profile.value_kind, CellValueKind::Text);
+        // And it is the row's label, not a measurement.
+        assert!(profile.role.is_header());
     }
 
     #[test]

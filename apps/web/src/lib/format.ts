@@ -1,8 +1,12 @@
 import type {
+  AmbiguityReason,
   AnswerState,
+  CellUsability,
   ChangeCounts,
   ChangeKind,
   ClaimStatus,
+  ContextOrigin,
+  DiagramInterpretation,
   EventActor,
   EventKind,
   ExtractionSummary,
@@ -20,9 +24,11 @@ import type {
   RefreshState,
   RefreshStepKind,
   RefreshStepOutcome,
+  RegionKind,
   ResearchPlanStatus,
   SearchMode,
   SearchState,
+  SourceSpan,
   SourceState,
   SourceStatus,
   TextSource,
@@ -218,6 +224,145 @@ export function extractionToolsLine(summary: ExtractionSummary): string | null {
     parts.push(`распознавание: ${summary.ocr_version ?? summary.ocr_engine}`)
   }
   return parts.length > 0 ? parts.join(' · ') : null
+}
+
+// --- R03: structural source evidence ---------------------------------------
+
+const REGION_KIND_LABEL: Record<RegionKind, string> = {
+  heading: 'Заголовок',
+  paragraph: 'Абзац',
+  footnote: 'Сноска',
+  table: 'Таблица',
+}
+
+export function regionKindLabel(kind: RegionKind): string {
+  return REGION_KIND_LABEL[kind] ?? kind
+}
+
+/**
+ * Why a cell is not plainly usable, in words.
+ *
+ * The wording repeats what the server means rather than paraphrasing it: the
+ * first entry is the one that closes the reported defect — a column label such
+ * as «безопасная рабочая нагрузка (Н)» is a heading and never a measurement.
+ * A code like `header_is_not_a_value` shown to a person explains nothing.
+ */
+const AMBIGUITY_REASON_LABEL: Record<AmbiguityReason, string> = {
+  header_is_not_a_value: 'это заголовок таблицы, а не значение',
+  header_shaped_text: 'текст выглядит как подпись столбца, а не как величина',
+  blank_cell: 'в источнике ячейка пуста',
+  multiple_values_in_one_cell:
+    'в ячейке несколько значений сразу — какое применимо, из неё не следует',
+  no_column_header: 'для столбца не удалось доказать заголовок',
+  no_row_context: 'строка не привязана к изделию',
+  unit_unresolved: 'единица измерения нигде не написана',
+  condition_unresolved: 'сноска указана, но её текст не найден на странице',
+  context_inherited_from_merged_cell:
+    'контекст перенесён из объединённой ячейки — это предположение',
+}
+
+export function reasonLabel(reason: AmbiguityReason): string {
+  return AMBIGUITY_REASON_LABEL[reason] ?? reason
+}
+
+/**
+ * Verdicts on a cell.
+ *
+ * `unusable` is worded as «не значение» and not as an error: a table heading is
+ * a perfectly good heading, it simply may never be offered as a measurement.
+ * `ambiguous` says what is missing rather than implying a degree of confidence —
+ * there is no such number anywhere in this contract.
+ */
+const CELL_USABILITY: Record<CellUsability, StatusPresentation> = {
+  usable: {
+    label: 'значение с полным контекстом',
+    defaultHint: 'Изделие, характеристика, величина и единица названы источником.',
+    tone: 'success',
+  },
+  ambiguous: {
+    label: 'неоднозначно — не готовое значение',
+    defaultHint: 'Чего-то не хватает или что-то домыслено; причины названы рядом.',
+    tone: 'warn',
+  },
+  unusable: {
+    label: 'не значение',
+    defaultHint: 'Эту ячейку нельзя предлагать как величину. Причины названы рядом.',
+    tone: 'warn',
+  },
+}
+
+export function cellUsabilityPresentation(usability: CellUsability): StatusPresentation {
+  return CELL_USABILITY[usability] ?? { label: usability, defaultHint: '', tone: 'neutral' }
+}
+
+/**
+ * Where a piece of context was written.
+ *
+ * Both `inherited_*` labels say «перенесено из объединённой ячейки» on purpose:
+ * that context was carried across a blank cell instead of read in place, and for
+ * lookalike designations (BP21 и BP21D) the difference is the whole question.
+ */
+const CONTEXT_ORIGIN_LABEL: Record<ContextOrigin, string> = {
+  cell_itself: 'написано в самой ячейке',
+  header_row: 'написано в заголовке столбца',
+  inherited_from_merged_header: 'перенесено из объединённой ячейки заголовка',
+  row_label: 'написано в подписи строки',
+  inherited_from_merged_row_label: 'перенесено из объединённой ячейки подписи строки',
+  page_heading: 'написано в заголовке на странице',
+  footnote: 'написано в сноске',
+}
+
+export function contextOriginLabel(origin: ContextOrigin): string {
+  return CONTEXT_ORIGIN_LABEL[origin] ?? origin
+}
+
+/** Was this carried across a blank cell rather than read where it stands? */
+export function isInferredOrigin(origin: ContextOrigin): boolean {
+  return (
+    origin === 'inherited_from_merged_header' ||
+    origin === 'inherited_from_merged_row_label'
+  )
+}
+
+/**
+ * Can this span be drawn on a page map at all?
+ *
+ * Both halves are required: a span may declare `exact` and still carry no
+ * rectangle, and a rectangle is never invented to fill the gap.
+ */
+export function isHighlightableSpan(span: SourceSpan): boolean {
+  return span.state === 'exact' && span.bbox !== null
+}
+
+/**
+ * Why a span cannot be drawn, in the server's own words when it gave them.
+ *
+ * `null` for a span that *can* be drawn. The fallback sentence is used only for
+ * the one shape the contract does not explain: `exact` without a rectangle.
+ */
+export function spanUnavailableReason(span: SourceSpan): string | null {
+  if (span.state === 'unavailable') return span.reason
+  if (span.bbox === null) return 'координаты области не сохранены'
+  return null
+}
+
+/**
+ * What was done with a drawing on the page.
+ *
+ * `not_attempted` is a state, not a failure, and the sentence says the two
+ * things that are easy to assume otherwise: nobody read the drawing, and
+ * recognised text of its labels is not a reading of the drawing.
+ */
+export function diagramInterpretationNote(
+  interpretation: DiagramInterpretation,
+  drawingCount: number,
+): string | null {
+  if (interpretation !== 'not_attempted') return null
+  const counted = drawingCount > 0 ? ` Рисунков на странице: ${drawingCount}.` : ''
+  return (
+    `Схема на странице не интерпретирована: система её не читала.${counted} ` +
+    'Распознанные подписи — это текст рядом с рисунком, а не чтение самой схемы.'
+  )
 }
 
 // --- Phase 1C: the product draft -------------------------------------------

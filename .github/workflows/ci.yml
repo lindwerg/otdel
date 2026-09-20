@@ -54,7 +54,7 @@ jobs:
       # dtolnay/rust-toolchain, pinned to a full commit SHA (not a mutable branch).
       # The version itself comes from RUST_VERSION above and matches rust-toolchain.toml.
       - name: Install the Rust toolchain
-        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable branch
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable branch
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
@@ -111,7 +111,7 @@ jobs:
           persist-credentials: false
 
       - name: Install the Rust toolchain
-        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable branch
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable branch
         with:
           toolchain: ${{ env.RUST_VERSION }}
 

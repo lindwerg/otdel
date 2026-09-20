@@ -61,7 +61,7 @@ jobs:
 
       # actions/cache v4, pinned to a full commit SHA.
       - name: Cache cargo registry and target directory
-        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -116,7 +116,7 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
 
       - name: Cache cargo registry and target directory
-        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4
         with:
           path: |
             ~/.cargo/registry
